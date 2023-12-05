@@ -9,19 +9,18 @@ project "LunaEGUI"
 
     includedirs{
         "src", 
-        "../vendor/imgui", 
-        "../vendor/glfw/include", 
+        "../vendor/imgui",
+        "../vendor/glfw/include"
         "../vendor/stb_image",
         
         "%{IncludeDir.VulkanSDK}"
-        "%{IncludeDir.glm}",
+        "%{IncludeDir.glm}"
     }
 
     links
     {
         "ImGUI",
-        "GLFW",
-
+        "glfw",
         "%{Library.VulkanSDK}",
     }
 
@@ -30,10 +29,21 @@ project "LunaEGUI"
 
     filter "system:windows"
         systemversion "latest"
+        defines {"LUNA_PLATFORM_WINDOWS"}
 
-        defines
-        {
-            "LUNA_PLATFORM_WINDOWS",
-            "LUNA_BUILD_DLL",
-            "GLFW_INCLUDE_NONE",
-        }
+    filter "configurations:Debug"
+        defines {"LUNA_DEBUG"}
+        runtime "Debug"
+        symbols "On"
+
+    filter "configurations:Release"
+        defines {"LUNA_RELEASE"}
+        runtime "Release"
+        optimize "On"
+        symbols "On"
+
+    filter "configurations:Dist"
+        defines {"LUNA_DIST"}
+        runtime "Release"
+        optimize "On"
+        symbols "Off"
