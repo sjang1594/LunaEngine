@@ -11,16 +11,15 @@ project "LunaEApp"
    {
       "../vendor/imgui",
       "../vendor/glfw/include",
-
-      "../Walnut/src",
-
+      "../"
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",
    }
 
     links
     {
-        "LunaEGUI"
+      "ImGUI",
+      "LunaEGUI"
     }
 
    targetdir ("../bin/" .. outputdir .. "/%{prj.name}")
