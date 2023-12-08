@@ -2,7 +2,7 @@ project "LunaEGUI"
     kind "StaticLib"
     language "C++"
     cppdialect "C++17"
-    targetder "bin/%{cfg.buildcfg}"
+    targetdir "bin/%{cfg.buildcfg}"
     staticruntime "off"
 
     files{"src/**.h", "src/**.cpp"}
@@ -10,10 +10,10 @@ project "LunaEGUI"
     includedirs{
         "src", 
         "../vendor/imgui",
-        "../vendor/glfw/include"
+        "../vendor/glfw/include",
         "../vendor/stb_image",
         
-        "%{IncludeDir.VulkanSDK}"
+        "%{IncludeDir.VulkanSDK}",
         "%{IncludeDir.glm}"
     }
 
