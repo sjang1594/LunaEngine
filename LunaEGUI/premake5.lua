@@ -5,14 +5,16 @@ project "LunaEGUI"
     targetdir "bin/%{cfg.buildcfg}"
     staticruntime "off"
 
-    files{"src/**.h", "src/**.cpp"}
+    files{"./src/**.h", "./src/**.cpp", 
+          "./Imgui/*.cpp", "./Imgui/*.embed"}
+    -- files{"./imgui"}
 
     includedirs{
-        "src", 
+        "./src",
         "../vendor/imgui",
         "../vendor/glfw/include",
         "../vendor/stb_image",
-        
+
         "%{IncludeDir.VulkanSDK}",
         "%{IncludeDir.glm}"
     }
