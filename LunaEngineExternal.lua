@@ -14,4 +14,5 @@ group ""
 
 group "Core"
 include "LunaEGUI"
+include "LunaEAPP"
 group ""
