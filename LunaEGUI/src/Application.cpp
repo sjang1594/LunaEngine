@@ -537,6 +537,54 @@ namespace Luna
 		ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 		ImGuiIO& io = ImGui::GetIO();
 
+		// Main Loop
+		while (!glfwWindowShouldClose(m_WindowsHandle) && m_running)
+		{
+			// Poll and handle events (inputs, window resize, etc)
+			glfwPollEvents();
+		}
+
+		for (auto& layer : m_LayerStack)
+			layer->OnUpdate(m_TimeStep);
+
+		// Resize swap chain
+		if (g_SwapChainRebuild)
+		{
+			int width, height;
+			glfwGetFramebufferSize(m_WindowsHandle, &width, &height);
+			if (width > 0 && height > 0)
+			{
+				ImGui_ImplVulkan_SetMinImageCount(g_MinImageCount);
+				ImGui_ImplVulkanH_CreateOrResizeWindow(g_Instance, g_PhysicalDevice, g_Device,
+					&g_MainWindowData, g_QueueFamily, g_Allocator, width, height, g_MinImageCount);
+
+				g_MainWindowData.FrameIndex = 0;
+
+				// Clear allocated command buffers from here since entire pool is destroyed
+				s_AllocatedCommandBuffers.clear();
+				s_AllocatedCommandBuffers.resize(g_MainWindowData.ImageCount);
+
+				g_SwapChainRebuild = false;
+			}
+		}
+
+		 // Start the Dear ImGui Frame 
+		ImGui_ImplVulkan_NewFrame();
+		ImGui_ImplGlfw_NewFrame();
+		ImGui::NewFrame();
+
+		{
+			static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_None;
+
+			// ImguiWindowFlags_NoDocking flag to make the parent window not dockable into,
+			// because it would be confusing to have two docking targets within each others, 
+			ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDocking;
+			if (m_menubarCallback)
+				window_flags |= ImGuiWindowFlags_MenuBar;
+
+			const ImGuiViewport* viewport = ImGui::GetMainViewport();
+
+		}
 	}
 
 	void Application::Close()
