@@ -381,6 +381,84 @@ namespace Luna
 		s_Instance = nullptr;
 	}
 
+	Application& Application::Get()
+	{
+		return *s_Instance;
+	}
+
+	VkInstance Application::GetInstance()
+	{
+		return g_Instance;
+	}
+
+	VkPhysicalDevice Application::GetPhysicalDevice()
+	{
+		return g_PhysicalDevice;
+	}
+
+	VkDevice Application::GetDevice()
+	{
+		return g_Device;
+	}
+
+	VkCommandBuffer Application::GetCommandBuffer(bool begin)
+	{
+		ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;
+
+		// Use any command queue
+		VkCommandPool command_pool = wd->Frames[wd->FrameIndex].CommandPool;
+
+		VkCommandBufferAllocateInfo cmdBufAllocateInfo = {};
+		cmdBufAllocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		cmdBufAllocateInfo.commandPool = command_pool;
+		cmdBufAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		cmdBufAllocateInfo.commandBufferCount = 1;
+
+		VkCommandBuffer& command_buffer = s_AllocatedCommandBuffers[wd->FrameIndex].emplace_back();
+		auto err = vkAllocateCommandBuffers(g_Device, &cmdBufAllocateInfo, &command_buffer);
+
+		VkCommandBufferBeginInfo begin_info = {};
+		begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		err = vkBeginCommandBuffer(command_buffer, &begin_info);
+		check_vk_result(err);
+
+		return command_buffer;
+	}
+
+	void Application::FlushCommandBuffer(VkCommandBuffer commandBuffer)
+	{
+		const uint64_t DEFAULT_FENCE_TIMEOUT = 100000000000;
+
+		VkSubmitInfo end_info = {};
+		end_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		end_info.commandBufferCount = 1;
+		end_info.pCommandBuffers = &commandBuffer;
+		auto err = vkEndCommandBuffer(commandBuffer);
+		check_vk_result(err);
+
+		// Create fence to ensure that the command buffer has finished executing
+		VkFenceCreateInfo fenceCreateInfo = {};
+		fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fenceCreateInfo.flags = 0;
+		VkFence fence;
+		err = vkCreateFence(g_Device, &fenceCreateInfo, nullptr, &fence);
+		check_vk_result(err);
+
+		err = vkQueueSubmit(g_Queue, 1, &end_info, fence);
+		check_vk_result(err);
+
+		err = vkWaitForFences(g_Device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT);
+		check_vk_result(err);
+
+		vkDestroyFence(g_Device, fence, nullptr);
+	}
+
+	void Application::SubmitResourceFree(std::function<void()>&& func)
+	{
+		s_ResourceFreeQueue[s_CurrentFrameIndex].emplace_back(func);
+	}
+
 	void Application::Init()
 	{
 		// Setup GLFW window
@@ -592,5 +670,10 @@ namespace Luna
 
 	}
 
+
+	Application* CreateApplication(int argc, char** argv)
+	{
+		return nullptr;
+	}
 
 }

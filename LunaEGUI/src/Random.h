@@ -13,7 +13,7 @@ namespace Luna {
 
 		static uint32_t Uint()
 		{
-			return s_Distribution(s_RandomEngine)
+			return s_Distribution(s_RandomEngine);
 		}
 
 		static uint32_t UInt(uint32_t min, uint32_t max)

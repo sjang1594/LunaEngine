@@ -11,15 +11,14 @@ project "LunaEApp"
    {
       "../vendor/imgui",
       "../vendor/glfw/include",
-      "../vendor/stb_image",
 
+      "../LunaEGUI/src",
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",
    }
 
     links
     {
-      "ImGUI",
       "LunaEGUI"
     }
 

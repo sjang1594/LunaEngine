@@ -50,7 +50,7 @@ namespace Luna {
 		static VkPhysicalDevice GetPhysicalDevice();
 		static VkDevice GetDevice();
 	
-		static VkCommandBuffer GetcommandBuffer(bool begin);
+		static VkCommandBuffer GetCommandBuffer(bool begin);
 		static void FlushCommandBuffer(VkCommandBuffer commandBuffer);
 		static void SubmitResourceFree(std::function<void()>&& func);
 	
@@ -61,7 +61,10 @@ namespace Luna {
 	private:
 		ApplicationSpec						m_spec;
 		GLFWwindow*							m_WindowsHandle = nullptr;
+		
 		bool								m_running = false;
+		
+		// Time Stamp 
 		float								m_TimeStep = 0.0f;
 		float								m_LastFrameTime = 0.0f;
 
