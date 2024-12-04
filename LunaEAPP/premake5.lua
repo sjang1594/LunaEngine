@@ -11,8 +11,8 @@ project "LunaEApp"
    {
       "../vendor/imgui",
       "../vendor/glfw/include",
-
       "../LunaEGUI/src",
+        
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",
    }

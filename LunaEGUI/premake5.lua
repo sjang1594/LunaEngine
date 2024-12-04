@@ -10,6 +10,7 @@ project "LunaEGUI"
         "src",
         "../vendor/imgui",
         "../vendor/glfw/include",
+        "../vendor/stb_image",
     
         "%{IncludeDir.VulkanSDK}",
         "%{IncludeDir.glm}"
@@ -17,7 +18,7 @@ project "LunaEGUI"
 
     links
     {
-        "ImGUI",
+        "imgui",
         "glfw",
         "%{Library.Vulkan}",
     }
