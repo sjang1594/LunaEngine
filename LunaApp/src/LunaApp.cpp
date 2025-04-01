@@ -1,7 +1,7 @@
 
 #include <imgui.h>
-#include <Layer.h>
-#include <Application.cpp>
+#include <LunaEngine/Layer.h>
+#include <LunaEngine/Application.h>
 
 class ExampleLayer : public Luna::Layer
 {
@@ -18,7 +18,7 @@ public:
 
 Luna::Application* Luna::CreateApplication(int argc, char** argv)
 {
-    Luna::ApplicationSpec spec;
+    Luna::ApplicationSpecification spec;
     spec.Name = "LunaApp";
     
     Luna::Application* app = new Luna::Application(spec);

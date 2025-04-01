@@ -1,5 +1,5 @@
-project "LunaEApp"
-   kind "ConsoleApp"
+project "LunaEngine"
+   kind "StaticLib"
    language "C++"
    cppdialect "C++17"
    targetdir "bin/%{cfg.buildcfg}"
@@ -9,40 +9,43 @@ project "LunaEApp"
 
    includedirs
    {
+      "src",
+
       "../vendor/imgui",
       "../vendor/glfw/include",
-      "../LunaEGUI/src",
-        
+      "../vendor/stb_image",
+
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",
    }
 
-    links
-    {
-      "LunaEGUI"
-    }
+   links
+   {
+      "ImGui",
+      "GLFW",
+      "%{Library.Vulkan}"
+   }
 
-   targetdir ("../bin/" .. outputdir .. "/%{prj.name}")
-   objdir ("../bin-int/" .. outputdir .. "/%{prj.name}")
+   targetdir ("bin/" .. outputdir .. "/%{prj.name}")
+   objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
 
    filter "system:windows"
       systemversion "latest"
-      defines { "LUNA_PLATFORM_WINDOWS" }
+      defines { "WL_PLATFORM_WINDOWS" }
 
    filter "configurations:Debug"
-      defines { "LUNA_DEBUG" }
+      defines { "WL_DEBUG" }
       runtime "Debug"
       symbols "On"
 
    filter "configurations:Release"
-      defines { "LUNA_RELEASE" }
+      defines { "WL_RELEASE" }
       runtime "Release"
       optimize "On"
       symbols "On"
 
    filter "configurations:Dist"
-      kind "WindowedApp"
-      defines { "LUNA_DIST" }
+      defines { "WL_DIST" }
       runtime "Release"
       optimize "On"
       symbols "Off"

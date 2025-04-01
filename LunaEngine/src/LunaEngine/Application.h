@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Layer.h"
+
 #include <string>
 #include <vector>
 #include <memory>
@@ -7,71 +9,68 @@
 
 #include "imgui.h"
 #include "vulkan/vulkan.h"
-#include "Layer.h" 
 
 void check_vk_result(VkResult err);
-
 struct GLFWwindow;
+extern bool g_ApplicationRunning;
 
 namespace Luna {
-	struct ApplicationSpec
+	struct ApplicationSpecification
 	{
-		std::string Name = "LunaEngine App";
-		uint32_t app_width = 1600;
-		uint32_t app_height = 900;
+		std::string Name = "LunaEngine";
+		uint32_t Width = 1600;
+		uint32_t Height = 900;
 	};
 
 	class Application
 	{
 	public:
-		Application(const ApplicationSpec& applicationSpec = ApplicationSpec());
+		Application(const ApplicationSpecification& applicationSpecification = ApplicationSpecification());
 		~Application();
 
 		static Application& Get();
 
 		void Run();
-		void SetMenubarCallback(const std::function<void()>& menubarCallback) {}
-
+		void SetMenubarCallback(const std::function<void()>& menubarCallback) { m_MenubarCallback = menubarCallback; }
+		
 		template<typename T>
 		void PushLayer()
 		{
-			static_assert(std::is_base_of<Layer, T>::value, "Pushed type is not subclass of Layer");
+			static_assert(std::is_base_of<Layer, T>::value, "Pushed type is not subclass of Layer!");
 			m_LayerStack.emplace_back(std::make_shared<T>())->OnAttach();
 		}
 
 		void PushLayer(const std::shared_ptr<Layer>& layer) { m_LayerStack.emplace_back(layer); layer->OnAttach(); }
-		
+
 		void Close();
-		float GetTime() { return m_TimeStep; }
-	
-		GLFWwindow* GetWindowHandle() const { return m_WindowsHandle; }
-		
+
+		float GetTime();
+		GLFWwindow* GetWindowHandle() const { return m_WindowHandle; }
+
 		static VkInstance GetInstance();
 		static VkPhysicalDevice GetPhysicalDevice();
 		static VkDevice GetDevice();
-	
+
 		static VkCommandBuffer GetCommandBuffer(bool begin);
 		static void FlushCommandBuffer(VkCommandBuffer commandBuffer);
+
 		static void SubmitResourceFree(std::function<void()>&& func);
-	
 	private:
 		void Init();
-		void ShutDown();
-
+		void Shutdown();
 	private:
-		ApplicationSpec						m_spec;
-		GLFWwindow*							m_WindowsHandle = nullptr;
-		
-		bool								m_running = false;
-		
-		// Time Stamp 
-		float								m_TimeStep = 0.0f;
-		float								m_LastFrameTime = 0.0f;
+		ApplicationSpecification m_Specification;
+		GLFWwindow* m_WindowHandle = nullptr;
+		bool m_Running = false;
+
+		float m_TimeStep = 0.0f;
+		float m_FrameTime = 0.0f;
+		float m_LastFrameTime = 0.0f;
 
 		std::vector<std::shared_ptr<Layer>> m_LayerStack;
-		std::function<void()>				m_menubarCallback;
+		std::function<void()> m_MenubarCallback;
 	};
 
+	// Implemented by CLIENT
 	Application* CreateApplication(int argc, char** argv);
 }
-

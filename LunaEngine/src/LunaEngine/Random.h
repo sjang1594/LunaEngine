@@ -1,5 +1,7 @@
 #pragma once
+
 #include <random>
+
 #include <glm/glm.hpp>
 
 namespace Luna {
@@ -11,7 +13,7 @@ namespace Luna {
 			s_RandomEngine.seed(std::random_device()());
 		}
 
-		static uint32_t Uint()
+		static uint32_t UInt()
 		{
 			return s_Distribution(s_RandomEngine);
 		}
@@ -40,10 +42,9 @@ namespace Luna {
 		{
 			return glm::normalize(Vec3(-1.0f, 1.0f));
 		}
-
 	private:
 		static std::mt19937 s_RandomEngine;
 		static std::uniform_int_distribution<std::mt19937::result_type> s_Distribution;
 	};
-}
 
+}
