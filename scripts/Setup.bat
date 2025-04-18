@@ -1,6 +1,15 @@
 @echo off
+echo =====================================
+echo    LunaEngine Setup Script
+echo =====================================
 
-pushd ..
-vendor\bin\premake5.exe vs2022
-popd
+git submodule update --init --recursive
+if errorlevel 1 (
+    echo Failed to update main submodules.
+    pause
+    exit /b 1
+)
+
+cd ../..
+echo Setup complete!
 pause

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <random>
-
 #include <glm/glm.hpp>
 
 namespace Luna {
@@ -25,7 +24,7 @@ namespace Luna {
 
 		static float Float()
 		{
-			return (float)s_Distribution(s_RandomEngine) / (float)std::numeric_limits<uint32_t>::max();
+			return static_cast<float>(s_Distribution(s_RandomEngine)) / static_cast<float>(std::numeric_limits<uint32_t>::max());
 		}
 
 		static glm::vec3 Vec3()
@@ -46,5 +45,4 @@ namespace Luna {
 		static std::mt19937 s_RandomEngine;
 		static std::uniform_int_distribution<std::mt19937::result_type> s_Distribution;
 	};
-
 }

@@ -1,17 +1,19 @@
-[submodule "LunaEngine/vendor/imgui/src"]
-	path = LunaEngine/vendor/imgui/src
-	url = https://github.com/ocornut/imgui
-	branch = docking
 [submodule "vendor/imgui"]
 	path = vendor/imgui
-	url = https://github.com/TheCherno/imgui
+	url = https://github.com/ocornut/imgui
 	branch = docking
-[submodule "vendor/glfw"]
-	path = vendor/glfw
-	url = https://github.com/sjang1594/glfw
 [submodule "vendor/glm"]
 	path = vendor/glm
 	url = https://github.com/g-truc/glm
-[submodule "vendor/GLFW"]
-	path = vendor/GLFW
-	url = https://github.com/sjang1594/GLFW
+[submodule "vendor/glfw"]
+	path = vendor/glfw
+	url = https://github.com/glfw/glfw
+[submodule "vendor/dxheaders"]
+	path = vendor/dxheaders
+	url = https://github.com/microsoft/DirectX-Headers
+[submodule "vendor/d3d12ma"]
+	path = vendor/d3d12ma
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator
+[submodule "vendor/volk"]
+	path = vendor/volk
+	url = https://github.com/zeux/volk

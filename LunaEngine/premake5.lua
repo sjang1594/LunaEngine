@@ -11,19 +11,42 @@ project "LunaEngine"
    {
       "src",
 
-      "../vendor/imgui",
       "../vendor/glfw/include",
+      "../vendor/glm",
+      "../vendor/imgui",
+      "../vendor/imgui/backends",
       "../vendor/stb_image",
 
+      -- Vulkan
+      "../vendor/volk",
       "%{IncludeDir.VulkanSDK}",
-      "%{IncludeDir.glm}",
+
+      -- DirectX
+      "../vendor/dxheaders/include",
+      "../vendor/d3d12ma/include",
+      "../vendor/dxc/include"
+   }
+
+   libdirs 
+   {
+      "../vendor/dxc/lib/x64"
    }
 
    links
    {
-      "ImGui",
       "GLFW",
-      "%{Library.Vulkan}"
+      "ImGui",
+      "vulkan-1",       -- Vulkan runtime
+      "d3d12",
+      "dxgi",
+      "dxguid",
+      "dxcompiler"      -- DXC for HLSL shader compiling
+   }
+
+   defines 
+   {
+      "GLFW_INCLUDE_NONE",
+      "VOLK_IMPLEMENTATION"
    }
 
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
@@ -32,6 +55,9 @@ project "LunaEngine"
    filter "system:windows"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
+
+   filter "action:vs*"
+      buildoptions { "-XnoInstalledDir" } -- Disable vcpkg default include/lib injection
 
    filter "configurations:Debug"
       defines { "WL_DEBUG" }
