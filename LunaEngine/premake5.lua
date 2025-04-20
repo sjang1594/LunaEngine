@@ -5,7 +5,12 @@ project "LunaEngine"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
 
-   files { "src/**.h", "src/**.cpp" }
+   files { 
+      "src/**.h", 
+      "src/**.cpp",
+      "Renderer/**.h",
+      "Renderer/**.cpp"
+   }
 
    includedirs
    {
@@ -36,16 +41,15 @@ project "LunaEngine"
    {
       "GLFW",
       "ImGui",
-      "vulkan-1",       -- Vulkan runtime
       "d3d12",
       "dxgi",
       "dxguid",
-      "dxcompiler"      -- DXC for HLSL shader compiling
+      "dxcompiler",      -- DXC for HLSL shader compiling
+      "%{Library.Vulkan}",
    }
 
    defines 
    {
-      "GLFW_INCLUDE_NONE",
       "VOLK_IMPLEMENTATION"
    }
 
@@ -55,9 +59,6 @@ project "LunaEngine"
    filter "system:windows"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
-
-   filter "action:vs*"
-      buildoptions { "-XnoInstalledDir" } -- Disable vcpkg default include/lib injection
 
    filter "configurations:Debug"
       defines { "WL_DEBUG" }

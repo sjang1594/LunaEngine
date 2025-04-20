@@ -33,9 +33,6 @@ project "LunaApp"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
 
-   filter "action:vs*"
-      buildoptions { "-XnoInstalledDir" } -- Disable vcpkg default include/lib injection
-
    filter "configurations:Debug"
       defines { "WL_DEBUG" }
       runtime "Debug"

@@ -1,6 +1,9 @@
 -- LunaExternal.lua
 
 VULKAN_SDK = os.getenv("VULKAN_SDK")
+if not VULKAN_SDK then 
+   error("VULKAN_SDK environment variable not set! Please Make sure you Download SDK: https://vulkan.lunarg.com/sdk/home#windows")
+end 
 
 IncludeDir = {}
 IncludeDir["VulkanSDK"] = "%{VULKAN_SDK}/Include"
