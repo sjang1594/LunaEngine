@@ -1,0 +1,28 @@
+#pragma once 
+
+#include <cstdint>
+
+namespace Luna {
+    class IRenderBackend 
+    {
+    public:
+        virtual ~IRenderBackend() = default;
+
+        // Window Handler (GLFWindow*) 
+        virtual void Init(void * windowHandler) = 0;
+
+        // Frame start
+        virtual void BeginFrame() = 0;
+
+        // Frame Draw (submit queue)
+        virtual void DrawFrame() = 0;
+
+        // Frame End (etc: Present)
+        virtual void EndFrame() = 0;
+
+        virtual void Resize(uint32_t width, uint32_t height) = 0;
+
+        // [DEBUG]
+        virtual void const char* GetBackendName() const = 0;
+    };
+}
