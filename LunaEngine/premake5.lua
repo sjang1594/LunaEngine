@@ -5,11 +5,15 @@ project "LunaEngine"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
 
+   targetdir ("bin/" .. outputdir .. "/%{prj.name}")
+   objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
+
+   pchheader "LunaPCH.h"
+   pchsource "src/LunaEngine/LunaPCH.cpp"
+
    files { 
       "src/**.h", 
       "src/**.cpp",
-      "Renderer/**.h",
-      "Renderer/**.cpp"
    }
 
    includedirs
@@ -50,11 +54,9 @@ project "LunaEngine"
 
    defines 
    {
-      "VOLK_IMPLEMENTATION"
+      "VOLK_IMPLEMENTATION",
+      "D3D12_ENABLE_DEBUG_LAYER"
    }
-
-   targetdir ("bin/" .. outputdir .. "/%{prj.name}")
-   objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
 
    filter "system:windows"
       systemversion "latest"
