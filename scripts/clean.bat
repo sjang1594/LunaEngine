@@ -1,33 +1,22 @@
 @echo off
-setlocal enabledelayedexpansion
-
-echo.
 echo ============================
 echo   Cleaning LunaEngine...
 echo ============================
 
+cd /d "%~dp0\.."
+
+REM LunaApp
+if exist LunaApp\bin rd /s /q LunaApp\bin
+if exist LunaApp\bin-int rd /s /q LunaApp\bin-int
+
+REM LunaEngine
+if exist LunaEngine\bin rd /s /q LunaEngine\bin
+if exist LunaEngine\bin-int rd /s /q LunaEngine\bin-int
+
 REM
-set DIRS=bin bin-int
-
-for %%D in (%DIRS%) do (
-    if exist %%D (
-        echo Removing folder: %%D
-        rmdir /s /q %%D
-    ) else (
-        echo Skipping (not found): %%D
-    )
+for /r %%i in (*.sln *.vcxproj *.vcxproj.filters *.vcxproj.user) do (
+    del /f /q "%%i"
 )
 
-REM 
-set EXTENSIONS=*.sln *.vcxproj *.vcxproj.filters *.vcxproj.user
-
-for %%E in (%EXTENSIONS%) do (
-    for /r %%F in (%%E) do (
-        echo Deleting file: %%F
-        del /q "%%F"
-    )
-)
-
-echo.
-echo Clean complete!
+echo Clean Complete
 pause

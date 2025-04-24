@@ -26,14 +26,14 @@ project "LunaEngine"
       "../vendor/imgui/backends",
       "../vendor/stb_image",
 
-      -- Vulkan
-      "../vendor/volk",
-      "%{IncludeDir.VulkanSDK}",
-
       -- DirectX
       "../vendor/dxheaders/include",
       "../vendor/d3d12ma/include",
-      "../vendor/dxc/include"
+      "../vendor/dxc/include",
+
+      -- Vulkan
+      "../vendor/volk",
+      "%{IncludeDir.VulkanSDK}",
    }
 
    libdirs 

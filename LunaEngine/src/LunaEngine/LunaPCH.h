@@ -1,6 +1,6 @@
 #pragma once
 
-// include
+// STL
 #include <windows.h>
 #include <tchar.h>
 #include <memory>
@@ -10,20 +10,32 @@
 #include <list>
 #include <map>
 #include <iostream>
+#include <cstdint>
+#include <functional>
 using namespace std;
 
 // DX12
-#include <d3d12.h>
-#include <d3dcompiler.h>
-#include <dxgi.h>
+#include <directx/d3d12.h>
+#include <directx/d3d12sdklayers.h>
+#include <directx/d3dx12_core.h>
+#include <directx/d3dx12_barriers.h>
+#include <directx/d3dcommon.h>
+
+// Vulkan
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <vulkan/vulkan.h>
+
+// Math
 #include <DirectXMath.h>
 #include <DirectXPackedVector.h>
 #include <DirectXColors.h>
-#include <dxgi1_6.h>
-#include <d3d12sdklayers.h>
 
+// Window
 #include <wrl.h>
-
+#include <windows.h>
+#include <d3dcompiler.h>
+#include <dxgi1_6.h>
 
 using namespace DirectX;
 using namespace DirectX::PackedVector;
@@ -44,6 +56,7 @@ using Vec2		= XMFLOAT2;
 using Vec3		= XMFLOAT3;
 using Vec4		= XMFLOAT4;
 using Matrix	= XMMATRIX;
+
 
 enum
 {
