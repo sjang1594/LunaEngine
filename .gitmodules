@@ -1,7 +1,3 @@
-[submodule "vendor/imgui"]
-	path = vendor/imgui
-	url = https://github.com/ocornut/imgui
-	branch = docking
 [submodule "vendor/glm"]
 	path = vendor/glm
 	url = https://github.com/g-truc/glm
@@ -17,3 +13,6 @@
 [submodule "vendor/volk"]
 	path = vendor/volk
 	url = https://github.com/zeux/volk
+[submodule "vendor/imgui"]
+	path = vendor/imgui
+	url = https://github.com/sjang1594/imgui.git
