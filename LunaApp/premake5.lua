@@ -11,6 +11,9 @@ project "LunaApp"
    {
       "../vendor/imgui",
       "../vendor/glfw/include",
+      "../vendor/imgui/backends",
+      "../vendor/dxheaders/include",            
+      "../vendor/dxheaders/include/directx",    
       "../LunaEngine/src",
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",

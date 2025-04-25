@@ -1,3 +1,4 @@
+#include "LunaPCH.h"
 #include "EntryPoint.h"
 
 #if defined(WL_PLATFORM_WINDOWS)

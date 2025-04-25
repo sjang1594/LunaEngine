@@ -1,18 +1,22 @@
 #pragma once
 
-#include "../IRenderBackend.h"
-#include "LunaEngine/LunaPCH.h"
+#include <LunaEngine/Renderer/IRenderBackend.h>
 
+struct GLFWwindow;
 namespace Luna {
 class DX12Backend : public IRenderBackend {
  public:
   DX12Backend();
   ~DX12Backend() override;
 
-  bool Init(void* windowHandler, const uint32_t& width,
-            const uint32_t& height) override;
+  bool Init(void* windowHandler, uint32_t width,
+            uint32_t height) override;
   void BeginFrame() override;
+  void InitImGui(void* windowHandler) override;
+  void StartImGui() override;
+  void RenderImGui() override;
   void DrawFrame() override;
+  void ShutdownImGui() override;
   void EndFrame() override;
   void Resize(uint32_t width, uint32_t height) override;
   const char* GetBackendName() const override;
@@ -21,9 +25,7 @@ class DX12Backend : public IRenderBackend {
   ComPtr<ID3D12Device> GetDevice() { return _device; }
   ComPtr<ID3D12CommandQueue> GetCommandQueue() { return _commandQueue; }
   ComPtr<IDXGISwapChain> GetSwapChain() { return _swapChain; }
-  ComPtr<ID3D12Resource> GetRenderTarget(int32 index) {
-    return _renderTargets[index];
-  }
+  ComPtr<ID3D12Resource> GetRenderTarget(int32 index);
   uint32 GetCurrentBackBufferIndex() { return _backbufferIndex; }
   ComPtr<ID3D12Resource> GetCurrentBackBufferResource() {
     return _renderTargets[_backbufferIndex];
@@ -40,6 +42,7 @@ class DX12Backend : public IRenderBackend {
   void WaitSync();
   bool CreateSwapChain();
   bool CreateDescriptorHeap();
+  bool CreateImGuiDescriptorHeap();
   void SetResolution(const uint32_t& width, const uint32_t& height);
 
  private:
@@ -76,6 +79,7 @@ class DX12Backend : public IRenderBackend {
 
   // Descriptor Heap
   ComPtr<ID3D12DescriptorHeap> _rtvHeap;
+  ComPtr<ID3D12DescriptorHeap> _imguiSrvHeap;
   UINT _rtvHeapSize = 0;
   D3D12_CPU_DESCRIPTOR_HANDLE _rtvHandle[SWAP_CHAIN_BUFFER_COUNT];
 };

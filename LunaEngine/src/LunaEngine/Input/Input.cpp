@@ -1,7 +1,6 @@
+#include "LunaPCH.h"
 #include "Input.h"
-
-#include "LunaEngine/Application.h"
-
+#include <LunaEngine/Application/Application.h>
 #include <GLFW/glfw3.h>
 
 namespace Luna {

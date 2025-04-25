@@ -1,3 +1,4 @@
+#include "LunaPCH.h"
 #include "Random.h"
 
 namespace Luna {

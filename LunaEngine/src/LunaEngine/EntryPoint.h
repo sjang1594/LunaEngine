@@ -1,6 +1,7 @@
 #pragma once
 #if defined(WL_PLATFORM_WINDOWS)
-#include <LunaEngine/Application.h>
+#include "LunaEngine/Application/Application.h"
+
 bool g_ApplicationRunning = true;
 
 namespace Luna {

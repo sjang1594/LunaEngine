@@ -4,36 +4,40 @@ project "LunaEngine"
    cppdialect "C++17"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
-
+   
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
    objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
 
    pchheader "LunaPCH.h"
    pchsource "src/LunaEngine/LunaPCH.cpp"
 
-   files { 
+   files {
       "src/**.h", 
       "src/**.cpp",
+      "../vendor/imgui/backends/imgui_impl_dx12.cpp",
+      "../vendor/imgui/backends/imgui_impl_glfw.cpp"
    }
 
    includedirs
    {
-      "src",
-
-      "../vendor/glfw/include",
-      "../vendor/glm",
-      "../vendor/imgui",
-      "../vendor/imgui/backends",
-      "../vendor/stb_image",
-
       -- DirectX
       "../vendor/dxheaders/include",
+      "../vendor/dxheaders/include/directxs",
       "../vendor/d3d12ma/include",
       "../vendor/dxc/include",
 
       -- Vulkan
       "../vendor/volk",
       "%{IncludeDir.VulkanSDK}",
+
+      "../vendor/glfw/include",
+      "../vendor/glm",
+      "../vendor/imgui",
+      "../vendor/imgui/backends",
+      "../vendor/stb_image",
+      
+      "src",
+      "src/LunaEngine"
    }
 
    libdirs 
@@ -55,7 +59,9 @@ project "LunaEngine"
    defines 
    {
       "VOLK_IMPLEMENTATION",
-      "D3D12_ENABLE_DEBUG_LAYER"
+      "VK_NO_PROTOTYPES",
+      "D3D12_ENABLE_DEBUG_LAYER",
+      "_GLFW_WIN32"
    }
 
    filter "system:windows"
