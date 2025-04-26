@@ -6,8 +6,8 @@ struct GLFWwindow;
 namespace Luna {
 class DX12Backend : public IRenderBackend {
  public:
-  DX12Backend();
-  ~DX12Backend() override;
+  DX12Backend() = default;
+  ~DX12Backend() override {};
 
   bool Init(void* windowHandler, uint32_t width,
             uint32_t height) override;
@@ -35,6 +35,7 @@ class DX12Backend : public IRenderBackend {
   D3D12_CPU_DESCRIPTOR_HANDLE GetBackBufferView();
 
  private:
+  bool CheckIfImGuiData();
   void CreateDebugLayer();
   bool CreateFactoryAndAdapter();
   bool CreateDevice();

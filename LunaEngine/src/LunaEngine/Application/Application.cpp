@@ -54,17 +54,16 @@ void Application::Run() {
 
     RenderContext::BeginFrame();
     RenderContext::StartImGuiFrame();
- 
 
     if (ImGui::BeginMainMenuBar()) {
       if (_menubarCallBack) _menubarCallBack();
       ImGui::EndMainMenuBar();
     }
-    
+    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+
     for (auto& layer : _layerStack) layer->OnUpdate(_frameTime);
     for (auto& layer : _layerStack) layer->OnUIRender();
 
-    ImGui::Render();
     RenderContext::RenderImGui();
     RenderContext::DrawFrame();
     RenderContext::EndFrame();

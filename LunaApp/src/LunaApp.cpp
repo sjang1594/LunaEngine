@@ -5,9 +5,6 @@ namespace Luna {
 class ExampleLayer : public Luna::Layer {
  public:
   virtual void OnUIRender() override {
-    ImGui::Begin("Hello");
-    ImGui::Button("Button");
-    ImGui::End();
   }
 };
 

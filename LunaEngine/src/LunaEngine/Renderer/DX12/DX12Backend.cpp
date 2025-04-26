@@ -1,10 +1,6 @@
 #include "LunaPCH.h"
 #include "DX12Backend.h"
 
-Luna::DX12Backend::DX12Backend() {}
-
-Luna::DX12Backend::~DX12Backend() {}
-
 bool Luna::DX12Backend::Init(void *windowHandler, uint32_t width,
                              uint32_t height) {
   _mainWindow = static_cast<HWND>(windowHandler);
@@ -23,6 +19,16 @@ bool Luna::DX12Backend::Init(void *windowHandler, uint32_t width,
   if (!CreateImGuiDescriptorHeap()) return false;
 
   std::cout << "Initialization is Successed" << endl;
+  return true;
+}
+
+bool Luna::DX12Backend::CheckIfImGuiData() 
+{ 
+  auto *drawData = ImGui::GetDrawData();
+  if (!drawData) {
+    std::cout << "[ImGui] DrawData is null. Nothing to render.\n";
+    return false;
+  }
   return true;
 }
 
@@ -258,7 +264,8 @@ void Luna::DX12Backend::InitImGui(void *windowHandler) {
   }
   ImGui::CreateContext();
   ImGuiIO &io = ImGui::GetIO();
-  (void)io;
+  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
   ImGui::StyleColorsDark();
 
   ImGui_ImplGlfw_InitForOther(window, true);
@@ -281,11 +288,13 @@ void Luna::DX12Backend::StartImGui(){
 }
 
 void Luna::DX12Backend::RenderImGui() {
-  auto* drawData = ImGui::GetDrawData();
-  if (!drawData) {
-    std::cout << "[ImGui] DrawData is null. Nothing to render.\n";
-    return;
-  }
+  ImGui::Render();
+#if defined(_DEBUG)
+  if (!CheckIfImGuiData())
+      return
+#endif
+
+  ImGui::Render();
 
   if (!_imguiSrvHeap) {
     std::cout << "[ImGui] DescriptorHeap is null!\n";
@@ -294,6 +303,11 @@ void Luna::DX12Backend::RenderImGui() {
   ID3D12DescriptorHeap* heaps[] = { _imguiSrvHeap.Get() };
   _commandList->SetDescriptorHeaps(_countof(heaps), heaps);
   ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
+
+  if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+    ImGui::UpdatePlatformWindows();
+    ImGui::RenderPlatformWindowsDefault();  
+  }
 }
 
 void Luna::DX12Backend::DrawFrame() {}
