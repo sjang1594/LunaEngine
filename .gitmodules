@@ -16,3 +16,7 @@
 [submodule "vendor/imgui"]
 	path = vendor/imgui
 	url = https://github.com/sjang1594/imgui.git
+[submodule "vendor/DirectXMath"]
+	path = vendor/DirectXMath
+	url = https://github.com/microsoft/DirectXMath.git
+	branch = main
