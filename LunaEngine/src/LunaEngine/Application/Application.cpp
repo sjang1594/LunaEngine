@@ -46,17 +46,24 @@ void Application::Init() {
 
 void Application::Run() {
   _running = true;
-  while (!glfwWindowShouldClose(_windowHandle) && _running) {
-    float time = GetTime();
+  while (ShouldContiueRunning()) {
+    glfwPollEvents();
+      float time = GetTime();
     _frameTime = time - _lastFrameTime;
     _lastFrameTime = time;
 
-    glfwPollEvents();
     RenderContext::BeginFrame();
     RenderContext::StartImGuiFrame();
+ 
+
+    if (ImGui::BeginMainMenuBar()) {
+      if (_menubarCallBack) _menubarCallBack();
+      ImGui::EndMainMenuBar();
+    }
+    
     for (auto& layer : _layerStack) layer->OnUpdate(_frameTime);
     for (auto& layer : _layerStack) layer->OnUIRender();
-    if (_menubarCallBack) _menubarCallBack();
+
     ImGui::Render();
     RenderContext::RenderImGui();
     RenderContext::DrawFrame();
@@ -74,7 +81,16 @@ void Application::Shutdown() {
   glfwTerminate();
 }
 
-void Application::Close() { _running = false; }
+bool Application::ShouldContiueRunning() const {
+  return _running && !glfwWindowShouldClose(_windowHandle);
+}
+
+void Application::Close() 
+{
+    std::cout << "[Application] Close() called" << std::endl;
+    _running = false; 
+    glfwSetWindowShouldClose(_windowHandle, GLFW_TRUE);
+}
 
 void Application::SetMenubarCallback(
     const std::function<void()>& menubarCallback) {

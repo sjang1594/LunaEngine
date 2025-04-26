@@ -25,6 +25,7 @@ class Application {
  private:
   void Init();
   void Shutdown();
+  bool ShouldContiueRunning() const;
 
  private:
   ApplicationSpecification _specification;
