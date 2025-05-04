@@ -1,5 +1,6 @@
 #include "LunaPCH.h"
 #include "DX12Backend.h"
+#include "DX12Pipeline.h"
 
 bool Luna::DX12Backend::Init(void *windowHandler, uint32_t width,
                              uint32_t height) {
@@ -7,7 +8,7 @@ bool Luna::DX12Backend::Init(void *windowHandler, uint32_t width,
   _screenViewport = {
       0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0.0f, 1.0f};
 
-  _scissorRect = CD3DX12_RECT(0, 0, width, height);
+  _scissorRect = CD3DX12_RECT(0, 0, width, height);  // NOLINT(bugprone-narrowing-conversions)
 
   SetResolution(width, height);
   CreateDebugLayer();
@@ -15,10 +16,12 @@ bool Luna::DX12Backend::Init(void *windowHandler, uint32_t width,
   if (!CreateDevice()) return false;
   if (!CreateCommandQueueAndFenceEvent()) return false;
   if (!CreateSwapChain()) return false;
-  if (!CreateDescriptorHeap()) return false;
-  if (!CreateImGuiDescriptorHeap()) return false;
+  if (!CreateRenderTarget()) return false;
+  if (!CreateImGuiRenderTarget()) return false;
+  std::cout << "DX12 Initialization is Successful" << endl;
 
-  std::cout << "Initialization is Successed" << endl;
+  _trianglePipeline = std::make_unique<DX12Pipeline>();
+  _trianglePipeline->Initialize(_device, L"Shaders/triangle.vert.hlsl", L"Shaders/triangle.frag.hlsl");
   return true;
 }
 
@@ -33,7 +36,7 @@ bool Luna::DX12Backend::CheckIfImGuiData()
 }
 
 void Luna::DX12Backend::CreateDebugLayer() {
-#if defined(_DEBUG)
+#if defined(_DEBUG) || defined(DEBUG)
   if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&_debugController)))) {
     _debugController->EnableDebugLayer();
   }
@@ -42,11 +45,12 @@ void Luna::DX12Backend::CreateDebugLayer() {
 
 bool Luna::DX12Backend::CreateFactoryAndAdapter() {
   UINT flags = 0;
-#if defined(_DEBUG)
+  
+#if defined(_DEBUG) || defined(DEBUG)
   flags |= DXGI_CREATE_FACTORY_DEBUG;
 #endif
 
-  HRESULT hr = CreateDXGIFactory2(flags, IID_PPV_ARGS(&_dxgiFactory));
+  HRESULT hr = CreateDXGIFactory2(flags, IID_PPV_ARGS(&_mdxgiFactory));
   if (FAILED(hr)) {
     std::cout << "Create DXGIFactory2 Failed" << std::endl;
     return false;
@@ -54,7 +58,7 @@ bool Luna::DX12Backend::CreateFactoryAndAdapter() {
 
   for (UINT i = 0;; ++i) {
     ComPtr<IDXGIAdapter1> candidate;
-    if (_dxgiFactory->EnumAdapters1(i, candidate.GetAddressOf()) ==
+    if (_mdxgiFactory->EnumAdapters1(i, candidate.GetAddressOf()) ==
         DXGI_ERROR_NOT_FOUND)
       break;
 
@@ -82,14 +86,15 @@ bool Luna::DX12Backend::CreateDevice() {
     return false;
   }
 
-#if defined(_DEBUG)
-  ComPtr<ID3D12InfoQueue> infoQueue;
-  if (SUCCEEDED(_device->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
-    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
-    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
-  }
-#endif
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msQualityLevels;
+  msQualityLevels.Format = mBackBufferFormat;
+  msQualityLevels.SampleCount = 4;
+  msQualityLevels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+  msQualityLevels.NumQualityLevels = 0;
+  ThrowIfFailed(_device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+    &msQualityLevels, sizeof(msQualityLevels)));
+  m4xMsaaQuality = msQualityLevels.NumQualityLevels;
+  assert(m4xMsaaQuality > 0 && "Unexpected MSAA quality level.");
   return true;
 }
 
@@ -145,45 +150,57 @@ void Luna::DX12Backend::WaitSync() {
 
 bool Luna::DX12Backend::CreateSwapChain() {
   _swapChain.Reset();
-  DXGI_SWAP_CHAIN_DESC1 scDesc = {};
-  scDesc.Width = static_cast<UINT>(_screenWidth);
-  scDesc.Height = static_cast<UINT>(_screenHeight);
-  scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  scDesc.BufferCount = SWAP_CHAIN_BUFFER_COUNT;
-  scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-  scDesc.SampleDesc.Count = 1;  // MultiSampling = OFF
-  scDesc.SampleDesc.Quality = 0;
+  DXGI_SWAP_CHAIN_DESC1 scDesc1 = {};
+  scDesc1.Width = static_cast<UINT>(_screenWidth);
+  scDesc1.Height = static_cast<UINT>(_screenHeight);
+  scDesc1.Format = mBackBufferFormat;
+  scDesc1.Stereo = FALSE;
+  scDesc1.SampleDesc.Count = m4xMsaaQuality ? 4 : 1;
+  scDesc1.SampleDesc.Quality = m4xMsaaQuality ? (m4xMsaaQuality - 1) : 0;
+  scDesc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  scDesc1.BufferCount = SWAP_CHAIN_BUFFER_COUNT;
+  scDesc1.Scaling = DXGI_SCALING_STRETCH;
+  scDesc1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  scDesc1.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+  scDesc1.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+
+  DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc = {};
+  fsDesc.RefreshRate.Numerator = 60;
+  fsDesc.RefreshRate.Denominator = 1;
+  fsDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+  fsDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+  fsDesc.Windowed = TRUE;
 
   ComPtr<IDXGISwapChain1> tempSwapChain1;
-  HRESULT hr = _dxgiFactory->CreateSwapChainForHwnd(
-      _commandQueue.Get(), _mainWindow, &scDesc, nullptr, nullptr,
-      &tempSwapChain1);
+  HRESULT hr = _mdxgiFactory->CreateSwapChainForHwnd(
+      _commandQueue.Get(), _mainWindow, &scDesc1, &fsDesc, nullptr, &tempSwapChain1);
   if (FAILED(hr)) {
-    std::cout << "Failed to create SwapChain" << std::endl;
+    std::cerr << "Failed to create SwapChainForHwnd: " << std::hex << hr << std::endl;
     return false;
   }
 
   hr = tempSwapChain1.As(&_swapChain);
   if (FAILED(hr)) {
-    std::cout << "Failed to cast SwapChain1 to SwapChain4" << std::endl;
+    std::cerr << "Failed to cast SwapChain1 to SwapChain4: " << std::hex << hr << std::endl;
     return false;
   }
 
-  for (int i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i) {
+  for (UINT i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i) {
     ComPtr<ID3D12Resource> buffer;
-    HRESULT hr = _swapChain->GetBuffer(i, IID_PPV_ARGS(&buffer));
+    hr = _swapChain->GetBuffer(i, IID_PPV_ARGS(&buffer));
     if (FAILED(hr)) {
-      std::cerr << "Swap Chain Buffer " << i << " Failed to Catch: " << std::hex << hr << std::endl;
+      std::cerr << "Failed to get buffer " << i << ": " << std::hex << hr << std::endl;
       return false;
     }
-    std::cout << "Swap Chain Buffer" << i << " Success" << std::endl;
+
+    _rtvBuffer[i] = buffer; // 배열 또는 vector에 저장
+    std::cout << "Swap Chain Buffer " << i << " acquired" << std::endl;
   }
-  
+
   return true;
 }
 
-bool Luna::DX12Backend::CreateDescriptorHeap() {
+bool Luna::DX12Backend::CreateRenderTarget() {
   D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
   heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   heapDesc.NumDescriptors = SWAP_CHAIN_BUFFER_COUNT;
@@ -193,36 +210,36 @@ bool Luna::DX12Backend::CreateDescriptorHeap() {
       _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_rtvHeap));
 
   if (FAILED(hr)) {
-    std::cout << "Failed to Create RenderTarget - DescriptorHeap" << std::endl;
+    std::cout << "Failed to Create RenderTarget" << std::endl;
     return false;
   }
 
-  _rtvHeapSize =
+  UINT _rtvHeapSize =
       _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
   D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapBegin =
       _rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
   for (int i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i) {
-    _swapChain->GetBuffer(i, IID_PPV_ARGS(&_renderTargets[i]));
+    _swapChain->GetBuffer(i, IID_PPV_ARGS(&_rtvBuffer[i]));
     _rtvHandle[i].ptr = rtvHeapBegin.ptr + i * _rtvHeapSize;
-    _device->CreateRenderTargetView(_renderTargets[i].Get(), nullptr,
+    _device->CreateRenderTargetView(_rtvBuffer[i].Get(), nullptr,
                                     _rtvHandle[i]);
   }
   return true;
 }
 
-bool Luna::DX12Backend::CreateImGuiDescriptorHeap() {
+bool Luna::DX12Backend::CreateImGuiRenderTarget() {
   D3D12_DESCRIPTOR_HEAP_DESC imguiHeapDesc = {};
   imguiHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   imguiHeapDesc.NumDescriptors = 1;
   imguiHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
   HRESULT hr = _device->CreateDescriptorHeap(&imguiHeapDesc,
-                                             IID_PPV_ARGS(&_imguiSrvHeap));
+                                             IID_PPV_ARGS(&_imGuiSrvHeap));
 
   if (FAILED(hr)) {
-    std::cout << "Failed to Create IMGUI - Descriptor Heap" << std::endl;
+    std::cout << "Failed to Create RenderTarget for IMGUI" << std::endl;
     return false;
   }
   return true;
@@ -271,9 +288,9 @@ void Luna::DX12Backend::InitImGui(void *windowHandler) {
   ImGui_ImplGlfw_InitForOther(window, true);
   if (!ImGui_ImplDX12_Init(
           _device.Get(), SWAP_CHAIN_BUFFER_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
-          _imguiSrvHeap.Get(),
-          _imguiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
-          _imguiSrvHeap->GetGPUDescriptorHandleForHeapStart())) {
+          _imGuiSrvHeap.Get(),
+          _imGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+          _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart())) {
     std::cout << "ImGui_ImplDX12_Init failed!" << std::endl;
     return;
   }
@@ -295,12 +312,7 @@ void Luna::DX12Backend::RenderImGui() {
 #endif
 
   ImGui::Render();
-
-  if (!_imguiSrvHeap) {
-    std::cout << "[ImGui] DescriptorHeap is null!\n";
-    return;
-  }
-  ID3D12DescriptorHeap* heaps[] = { _imguiSrvHeap.Get() };
+  ID3D12DescriptorHeap* heaps[] = { _imGuiSrvHeap.Get() };
   _commandList->SetDescriptorHeaps(_countof(heaps), heaps);
   ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
 
@@ -310,7 +322,13 @@ void Luna::DX12Backend::RenderImGui() {
   }
 }
 
-void Luna::DX12Backend::DrawFrame() {}
+void Luna::DX12Backend::DrawFrame() {
+  _commandList->SetGraphicsRootSignature(_trianglePipeline->GetRootSignature().Get());
+  _commandList->SetPipelineState(_trianglePipeline->GetPipelineState().Get());
+  _commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  _commandList->IASetVertexBuffers(0, 1, &_vertexBufferView);
+  _commandList->DrawInstanced(3, 1, 0, 0);
+}
 
 void Luna::DX12Backend::ShutdownImGui() {
   ImGui_ImplDX12_Shutdown();
@@ -336,46 +354,6 @@ void Luna::DX12Backend::EndFrame() {
 }
 
 void Luna::DX12Backend::Resize(uint32_t width, uint32_t height) {
-  if (width == 0 || height == 0 || !_swapChain) return;
-
-  WaitSync();
-
-  for (int i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i) {
-    _renderTargets[i].Reset();
-  }
-
-  DXGI_SWAP_CHAIN_DESC desc = {};
-  _swapChain->GetDesc(&desc);
-
-  HRESULT hr = _swapChain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, width, height,
-                                         desc.BufferDesc.Format, desc.Flags);
-
-  if (FAILED(hr)) {
-    std::cout << "Resize Buffer Failed!" << std::endl;
-    return;
-  }
-  
-  _backbufferIndex = _swapChain->GetCurrentBackBufferIndex();
-  D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapBegin =
-      _rtvHeap->GetCPUDescriptorHandleForHeapStart();
-
-  for (UINT i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i) {
-    _swapChain->GetBuffer(i, IID_PPV_ARGS(&_renderTargets[i]));
-    _rtvHandle[i].ptr = rtvHeapBegin.ptr + i * _rtvHeapSize;
-
-    _device->CreateRenderTargetView(_renderTargets[i].Get(), nullptr,
-                                    _rtvHandle[i]);
-  }
-
-  SetResolution(width, height);
-  _screenViewport.Width = static_cast<float>(_screenWidth);
-  _screenViewport.Height = static_cast<float>(_screenHeight);
-  _scissorRect.right = static_cast<LONG>(_screenWidth);
-  _scissorRect.bottom = static_cast<LONG>(_screenHeight);
-}
-
-ComPtr<ID3D12Resource> Luna::DX12Backend::GetRenderTarget(int32 index) {
-  return _renderTargets[index];
 }
 
 const char *Luna::DX12Backend::GetBackendName() const { return "DirectX 12"; }

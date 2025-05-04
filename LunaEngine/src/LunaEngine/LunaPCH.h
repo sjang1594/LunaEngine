@@ -12,6 +12,8 @@
 #include <iostream>
 #include <cstdint>
 #include <functional>
+#include <exception>
+
 using namespace std;
 
 #include <vulkan/vulkan.h>
@@ -22,10 +24,9 @@ using namespace std;
 #include <directx/d3dx12_core.h>
 #include <directx/d3dx12_barriers.h>
 #include <directx/d3dcommon.h>
-
+#include <directx/d3dx12_root_signature.h>
 // ImGUI
 #include <imgui.h>
-// #include "backends/imgui_impl_vulkan.cpp"
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_dx12.h>
 
@@ -76,3 +77,12 @@ struct WindowInfo
 	int32	height;     // Height
 	bool	windowed;   //
 };
+
+inline void ThrowIfFailed(HRESULT hr)
+{
+	if (FAILED(hr))
+	{
+		// Set a breakpoint on this line to catch DirectX API errors
+		throw std::exception();
+	}
+}

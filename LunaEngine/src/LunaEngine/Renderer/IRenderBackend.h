@@ -4,11 +4,12 @@
 
 namespace Luna {
 class IRenderBackend {
- public:
+public:
   virtual ~IRenderBackend() = default;
 
   // Window Handler (GLFWindow*)
-  virtual bool Init(void* windowHandler, uint32_t width,
+  virtual bool Init(void* windowHandler,
+                    uint32_t width,
                     uint32_t height) = 0;
 
   // Frame start
@@ -30,7 +31,6 @@ class IRenderBackend {
 
   virtual void ShutdownImGui() = 0;
 
-  // [DEBUG]
   virtual const char* GetBackendName() const = 0;
 };
 }  // namespace Luna

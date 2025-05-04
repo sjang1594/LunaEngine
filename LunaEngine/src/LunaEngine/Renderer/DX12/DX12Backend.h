@@ -2,12 +2,15 @@
 
 #include <LunaEngine/Renderer/IRenderBackend.h>
 
+namespace Luna {
+class DX12Pipeline;
+}
 struct GLFWwindow;
 namespace Luna {
 class DX12Backend : public IRenderBackend {
  public:
   DX12Backend() = default;
-  ~DX12Backend() override {};
+  ~DX12Backend() override = default;
 
   bool Init(void* windowHandler, uint32_t width,
             uint32_t height) override;
@@ -21,17 +24,17 @@ class DX12Backend : public IRenderBackend {
   void Resize(uint32_t width, uint32_t height) override;
   const char* GetBackendName() const override;
 
-  ComPtr<IDXGIFactory> GetDXGIFactory() { return _dxgiFactory; }
-  ComPtr<ID3D12Device> GetDevice() { return _device; }
-  ComPtr<ID3D12CommandQueue> GetCommandQueue() { return _commandQueue; }
-  ComPtr<IDXGISwapChain> GetSwapChain() { return _swapChain; }
-  ComPtr<ID3D12Resource> GetRenderTarget(int32 index);
-  uint32 GetCurrentBackBufferIndex() { return _backbufferIndex; }
-  ComPtr<ID3D12Resource> GetCurrentBackBufferResource() {
-    return _renderTargets[_backbufferIndex];
+  ComPtr<IDXGIFactory> GetDXGIFactory() const { return _mdxgiFactory; }
+  ComPtr<ID3D12Device> GetDevice() const { return _device; }
+  ComPtr<ID3D12CommandQueue> GetCommandQueue() const { return _commandQueue; }
+    ComPtr<ID3D12GraphicsCommandList> GetCommandList() const { return _commandList; }
+  ComPtr<IDXGISwapChain> GetSwapChain() const { return _swapChain; }
+  ComPtr<ID3D12Resource> GetRenderTarget(int32 index) const { return _rtvBuffer[index]; }
+  uint32 GetCurrentBackBufferIndex() const { return _backbufferIndex; }
+  ComPtr<ID3D12Resource> GetCurrentBackBufferResource() const {
+    return _rtvBuffer[_backbufferIndex];
   }
-
-  D3D12_CPU_DESCRIPTOR_HANDLE GetRTV(int32 index) { return _rtvHandle[index]; }
+  D3D12_CPU_DESCRIPTOR_HANDLE GetRTV(int32 index) const { return _rtvHandle[index]; }
   D3D12_CPU_DESCRIPTOR_HANDLE GetBackBufferView();
 
  private:
@@ -42,8 +45,8 @@ class DX12Backend : public IRenderBackend {
   bool CreateCommandQueueAndFenceEvent();
   void WaitSync();
   bool CreateSwapChain();
-  bool CreateDescriptorHeap();
-  bool CreateImGuiDescriptorHeap();
+  bool CreateRenderTarget();
+  bool CreateImGuiRenderTarget();
   void SetResolution(const uint32_t& width, const uint32_t& height);
 
  private:
@@ -60,10 +63,13 @@ class DX12Backend : public IRenderBackend {
 #if defined(_DEBUG)
   ComPtr<ID3D12Debug> _debugController;
 #endif
-
-  ComPtr<IDXGIFactory6> _dxgiFactory;
+  
+  ComPtr<IDXGIFactory6> _mdxgiFactory;
   ComPtr<IDXGIAdapter1> _adapter;
   ComPtr<ID3D12Device> _device;
+  UINT m4xMsaaQuality  = 0;
+
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msQualityLevels;
 
   // CommandQueue
   ComPtr<ID3D12CommandQueue> _commandQueue;
@@ -75,13 +81,18 @@ class DX12Backend : public IRenderBackend {
 
   // Swap Chain
   ComPtr<IDXGISwapChain4> _swapChain;
-  ComPtr<ID3D12Resource> _renderTargets[SWAP_CHAIN_BUFFER_COUNT];
+  DXGI_FORMAT mBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  ComPtr<ID3D12Resource> _rtvBuffer[SWAP_CHAIN_BUFFER_COUNT];
   UINT _backbufferIndex = 0;
 
   // Descriptor Heap
   ComPtr<ID3D12DescriptorHeap> _rtvHeap;
-  ComPtr<ID3D12DescriptorHeap> _imguiSrvHeap;
-  UINT _rtvHeapSize = 0;
+  ComPtr<ID3D12DescriptorHeap> _imGuiSrvHeap;
   D3D12_CPU_DESCRIPTOR_HANDLE _rtvHandle[SWAP_CHAIN_BUFFER_COUNT];
+
+  // Vertex Buffer
+  ComPtr<ID3D12Resource> _vertexBuffer;
+  D3D12_VERTEX_BUFFER_VIEW _vertexBufferView;
+  std::unique_ptr<DX12Pipeline> _trianglePipeline;
 };
 }  // namespace Luna
