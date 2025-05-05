@@ -4,17 +4,18 @@
 
 bool g_ApplicationRunning = true;
 
-namespace Luna {
-    // Forward declaration
-    class Application;
-    extern Application* CreateApplication(int argc, char** argv);
-    int Main(int argc, char** argv);
-}
+namespace Luna
+{
+// Forward declaration
+class Application;
+extern Application *CreateApplication(int argc, char **argv);
+int Main(int argc, char **argv);
+} // namespace Luna
 
 #ifdef WL_DIST
 #include <Windows.h>
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, PSTR cmdLine, int cmdShow);
 #else
-int main(int argc, char** argv);
+int main(int argc, char **argv);
 #endif
 #endif // WL_PLATFORM_WINDOWS

@@ -1,105 +1,131 @@
 #include "LunaPCH.h"
 #include "LunaEngine/Application/Application.h"
-#include "LunaEngine/Renderer/RenderContext.h"
+#include "LunaEngine/Renderer/IRenderContext.h"
 
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 
-namespace Luna {
-Application::Application(
-    const ApplicationSpecification& applicationSpecification = {})
-    : _specification(applicationSpecification) {
-  Init();
+namespace Luna
+{
+Application::Application(const ApplicationSpecification &applicationSpecification = {})
+    : _specification(applicationSpecification)
+{
+    Init();
 }
 
-Application::~Application() { Shutdown(); }
-
-Application& Luna::Application::Get() {
-  static Application instance;
-  return instance;
+Application::~Application()
+{
+    Shutdown();
 }
 
-void Application::Init() {
-  if (!glfwInit()) {
-    return;
-  }
-
-  glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  _windowHandle =
-      glfwCreateWindow(_specification.width, _specification.height,
-                       _specification.Name.c_str(), nullptr, nullptr);
-
-  if (!_windowHandle) {
-    std::cerr << "Failed to create GLFW window!" << std::endl;
-    glfwTerminate();
-    return;
-  }
-
-  HWND hwnd = glfwGetWin32Window(_windowHandle);
-  RenderContext::Initialize(_specification.backend, hwnd, _specification.width,
-                            _specification.height);
-
-  RenderContext::InitImGui(_windowHandle);
-
-  _lastFrameTime = GetTime();
+Application &Luna::Application::Get()
+{
+    static Application instance;
+    return instance;
 }
 
-void Application::Run() {
-  _running = true;
-  while (ShouldContiueRunning()) {
-    glfwPollEvents();
-      float time = GetTime();
-    _frameTime = time - _lastFrameTime;
-    _lastFrameTime = time;
-
-    RenderContext::BeginFrame();
-    RenderContext::StartImGuiFrame();
-
-    if (ImGui::BeginMainMenuBar()) {
-      if (_menubarCallBack) _menubarCallBack();
-      ImGui::EndMainMenuBar();
+void Application::Init()
+{
+    if (!glfwInit())
+    {
+        return;
     }
-    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
 
-    for (auto& layer : _layerStack) layer->OnUpdate(_frameTime);
-    for (auto& layer : _layerStack) layer->OnUIRender();
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    _windowHandle = glfwCreateWindow(_specification.width, _specification.height,
+                                     _specification.Name.c_str(), nullptr, nullptr);
 
-    RenderContext::RenderImGui();
-    RenderContext::DrawFrame();
-    RenderContext::EndFrame();
-  }
+    if (!_windowHandle)
+    {
+        std::cerr << "Failed to create GLFW window!" << std::endl;
+        glfwTerminate();
+        return;
+    }
 
-  Shutdown();
+    HWND hwnd = glfwGetWin32Window(_windowHandle);
+    IRenderContext::Initialize(_specification.backend, hwnd, _specification.width,
+                              _specification.height);
+
+    IRenderContext::InitImGui(_windowHandle);
+
+    _lastFrameTime = GetTime();
 }
 
-void Application::Shutdown() {
-  for (auto& layer : _layerStack) layer->OnDetach();
-  RenderContext::ShutdownImGui();
-  RenderContext::Shutdown();
-  glfwDestroyWindow(_windowHandle);
-  glfwTerminate();
+void Application::Run()
+{
+    _running = true;
+    while (ShouldContiueRunning())
+    {
+        glfwPollEvents();
+        float time = GetTime();
+        _frameTime = time - _lastFrameTime;
+        _lastFrameTime = time;
+
+        IRenderContext::BeginFrame();
+        IRenderContext::StartImGuiFrame();
+
+        if (ImGui::BeginMainMenuBar())
+        {
+            if (_menubarCallBack)
+                _menubarCallBack();
+            ImGui::EndMainMenuBar();
+        }
+        std::cout << "[Log] StartImGuiFrame" << std::endl;
+        std::cout << "[Log] RenderImGui" << std::endl;
+        
+        ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+
+        std::cout << "[Debug] g.FrameCount = " << ImGui::GetFrameCount() << std::endl;
+        for (auto &layer : _layerStack)
+            layer->OnUpdate(_frameTime);
+        for (auto &layer : _layerStack)
+            layer->OnUIRender();
+
+        IRenderContext::DrawFrame();
+        
+        IRenderContext::RenderImGui();
+        
+        IRenderContext::EndFrame();
+    }
+
+    Shutdown();
 }
 
-bool Application::ShouldContiueRunning() const {
-  return _running && !glfwWindowShouldClose(_windowHandle);
+void Application::Shutdown()
+{
+    for (auto &layer : _layerStack)
+        layer->OnDetach();
+    IRenderContext::ShutdownImGui();
+    IRenderContext::Shutdown();
+    glfwDestroyWindow(_windowHandle);
+    glfwTerminate();
 }
 
-void Application::Close() 
+bool Application::ShouldContiueRunning() const
+{
+    return _running && !glfwWindowShouldClose(_windowHandle);
+}
+
+void Application::Close()
 {
     std::cout << "[Application] Close() called" << std::endl;
-    _running = false; 
+    _running = false;
     glfwSetWindowShouldClose(_windowHandle, GLFW_TRUE);
 }
 
-void Application::SetMenubarCallback(
-    const std::function<void()>& menubarCallback) {
-  _menubarCallBack = menubarCallback;
+void Application::SetMenubarCallback(const std::function<void()> &menubarCallback)
+{
+    _menubarCallBack = menubarCallback;
 }
 
-void Application::PushLayer(const std::shared_ptr<Layer>& layer) {
-  _layerStack.emplace_back(layer);
-  layer->OnAttach();
+void Application::PushLayer(const std::shared_ptr<Layer> &layer)
+{
+    _layerStack.emplace_back(layer);
+    layer->OnAttach();
 }
 
-float Application::GetTime() const { return static_cast<float>(glfwGetTime()); }
-}  // namespace Luna
+float Application::GetTime() const
+{
+    return static_cast<float>(glfwGetTime());
+}
+} // namespace Luna

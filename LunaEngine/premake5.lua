@@ -10,10 +10,16 @@ project "LunaEngine"
 
    pchheader "LunaPCH.h"
    pchsource "src/LunaEngine/LunaPCH.cpp"
-
+   
+   local shader_dir = path.getabsolute("../LunaEngine/src/LunaEngine/Shaders"):gsub("\\", "/")
+   defines {
+      'SHADER_ROOT_PATH="' .. shader_dir .. '"'
+  }
+   
    files {
       "src/**.h", 
       "src/**.cpp",
+      "src/LunaEngine/Shaders/*.hlsl",
       "../vendor/imgui/backends/imgui_impl_dx12.cpp",
       "../vendor/imgui/backends/imgui_impl_glfw.cpp"
    }
@@ -64,6 +70,9 @@ project "LunaEngine"
       "_GLFW_WIN32"
    }
 
+   filter { "files:**.hlsl" }
+      buildaction "None"
+   
    filter "system:windows"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }

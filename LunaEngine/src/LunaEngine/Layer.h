@@ -2,15 +2,23 @@
 
 namespace Luna
 {
-	class Layer
-	{
-	public:
-		virtual ~Layer() = default;
+class Layer
+{
+  public:
+    virtual ~Layer() = default;
 
-		virtual void OnAttach() {}
-		virtual void OnDetach() {}
+    virtual void OnAttach()
+    {
+    }
+    virtual void OnDetach()
+    {
+    }
 
-		virtual void OnUpdate(float dt) {}
-		virtual void OnUIRender() {}
-	};
-}
+    virtual void OnUpdate(float dt)
+    {
+    }
+    virtual void OnUIRender()
+    {
+    }
+};
+} // namespace Luna
