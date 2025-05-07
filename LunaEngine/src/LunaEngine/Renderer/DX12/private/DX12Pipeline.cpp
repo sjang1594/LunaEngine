@@ -11,15 +11,13 @@ bool DX12Pipeline::Initialize(const ComPtr<ID3D12Device> &device, const std::wst
                               const std::wstring &psPath, const PipelineStateDesc &desc)
 {
     _desc = desc;
-    ComPtr<ID3DBlob> vsBlob;
-    ComPtr<ID3DBlob> psBlob;
     
     std::wstring vsFullPath = GetShaderFullPath(vsPath);
     std::wstring psFullPath = GetShaderFullPath(psPath);
     
-    if (!LoadShader(vsFullPath, "vs_5_0", vsBlob))
+    if (!LoadShader(vsFullPath, "vs_5_0", _vsBlob))
         return false;
-    if (!LoadShader(psFullPath, "ps_5_0", psBlob))
+    if (!LoadShader(psFullPath, "ps_5_0", _psBlob))
         return false;
     
     if (!CreateRootSignature(device))
@@ -27,7 +25,7 @@ bool DX12Pipeline::Initialize(const ComPtr<ID3D12Device> &device, const std::wst
         cout << "Failed to create root signature" << endl;
         return false;
     }
-    if (!CreatePipelineState(device, vsBlob, psBlob))
+    if (!CreatePipelineState(device, _vsBlob, _psBlob))
     {
         cout << "Failed to create pipeline state" << endl;
         return false;
@@ -58,15 +56,23 @@ bool DX12Pipeline::LoadShader(const std::wstring &path, const std::string &targe
 
 bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
 {
+    // constant buffer
+    CD3DX12_ROOT_PARAMETER param[2];
+    param[0].InitAsConstantBufferView(0); // 0 -> b0
+    param[1].InitAsConstantBufferView(1); // 1 -> b1
+    
     CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
-    rootSignatureDesc.Init(0, nullptr, 0, nullptr,
+    rootSignatureDesc.Init(2, param, 0, nullptr,
                            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
     ComPtr<ID3DBlob> serializedRootSignature;
     ComPtr<ID3DBlob> errorBlob;
 
-    HRESULT hr = D3D12SerializeRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                             &serializedRootSignature, &errorBlob);
+    HRESULT hr = D3D12SerializeRootSignature(
+        &rootSignatureDesc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        &serializedRootSignature,
+        &errorBlob);
 
     if (FAILED(hr))
     {
