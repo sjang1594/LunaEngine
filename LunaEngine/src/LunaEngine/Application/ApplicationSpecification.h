@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <filesystem>
 
 namespace Luna
 {
@@ -14,5 +15,6 @@ struct ApplicationSpecification
     std::string Name;
     uint32_t width, height;
     RenderBackendType backend;
+    std::filesystem::path iconPath;
 };
 } // namespace Luna

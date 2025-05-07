@@ -36,6 +36,17 @@ project "LunaApp"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
 
+   filter "system:macosx"
+      systemversion "latest"
+      defines { "WL_PLATFORM_MACOS" }
+
+      files {
+         "src/Platform/MacOS/**.mm",
+         "src/Platform/MacOS/**.h"
+      }
+
+      links { "Cocoa", "Metal", "QuartzCore" }
+
    filter "configurations:Debug"
       defines { "WL_DEBUG" }
       runtime "Debug"

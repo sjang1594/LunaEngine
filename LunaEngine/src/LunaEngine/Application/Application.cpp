@@ -1,6 +1,7 @@
 #include "LunaPCH.h"
 #include "LunaEngine/Application/Application.h"
 #include "LunaEngine/Renderer/IRenderContext.h"
+#include "LunaEngine/Platform/Window/WindowGLFW.h"
 
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
@@ -34,12 +35,17 @@ void Application::Init()
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     _windowHandle = glfwCreateWindow(_specification.width, _specification.height,
                                      _specification.Name.c_str(), nullptr, nullptr);
-
+    
     if (!_windowHandle)
     {
         std::cerr << "Failed to create GLFW window!" << std::endl;
         glfwTerminate();
         return;
+    }
+
+    if (!_specification.iconPath.empty())
+    {
+        SetWindowsIcon(_windowHandle, _specification.iconPath.generic_string());
     }
 
     HWND hwnd = glfwGetWin32Window(_windowHandle);
@@ -53,7 +59,7 @@ void Application::Init()
 void Application::Run()
 {
     _running = true;
-    while (ShouldContiueRunning())
+    while (ShouldContinueRunning())
     {
         glfwPollEvents();
         float time = GetTime();
@@ -98,7 +104,7 @@ void Application::Shutdown()
     glfwTerminate();
 }
 
-bool Application::ShouldContiueRunning() const
+bool Application::ShouldContinueRunning() const
 {
     return _running && !glfwWindowShouldClose(_windowHandle);
 }

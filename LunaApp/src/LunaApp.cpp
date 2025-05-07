@@ -4,7 +4,7 @@
 namespace Luna
 {
 
-class ExampleLayer : public Luna::Layer
+class ExampleLayer : public Layer
 {
   public:
     virtual void OnUIRender() override
@@ -12,15 +12,16 @@ class ExampleLayer : public Luna::Layer
     }
 };
 
-Luna::Application *Luna::CreateApplication(int argc, char **argv)
+Application *Luna::CreateApplication(int argc, char **argv)
 {
-    Luna::ApplicationSpecification spec;
+    ApplicationSpecification spec;
     spec.Name = "LunaApp";
     spec.width = 1600;
     spec.height = 900;
     spec.backend = RenderBackendType::DirectX12;
+    spec.iconPath = "Resources/icon.png";
 
-    Luna::Application *app = new Luna::Application(spec);
+    Application *app = new Application(spec);
     app->PushLayer(std::make_shared<ExampleLayer>());
     app->SetMenubarCallback([app]() {
         if (ImGui::BeginMenu("File"))

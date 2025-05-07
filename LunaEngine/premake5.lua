@@ -77,6 +77,33 @@ project "LunaEngine"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
 
+      includedirs {
+         "../vendor/dxheaders/include",
+         "../vendor/dxheaders/include/directxs",
+         "../vendor/d3d12ma/include",
+         "../vendor/dxc/include"
+      }
+
+      libdirs {
+         "../vendor/dxc/lib/x64"
+      }
+
+      links {
+         "d3d12", "dxgi", "dxguid", "dxcompiler",
+         "GLFW", "ImGui", "%{Library.Vulkan}"
+      }
+
+   filter "system:macosx"
+      systemversion "latest"
+      defines { "WL_PLATFORM_MACOS" }
+
+      files {
+         "src/LunaEngine/Platform/MacOS/**.mm",
+         "src/LunaEngine/Platform/MacOS/**.h"
+      }
+
+      links { "Metal", "Cocoa", "QuartzCore" }
+
    filter "configurations:Debug"
       defines { "WL_DEBUG" }
       runtime "Debug"

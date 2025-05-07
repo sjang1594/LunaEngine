@@ -1,9 +1,8 @@
-#pragma
+#pragma once
 #include "LunaEngine/Application/ApplicationSpecification.h"
 #include "LunaEngine/Layer.h"
 #include <functional>
 #include <memory>
-#include <string>
 
 struct GLFWwindow;
 namespace Luna
@@ -30,7 +29,7 @@ class Application
   private:
     void Init();
     void Shutdown();
-    bool ShouldContiueRunning() const;
+    bool ShouldContinueRunning() const;
 
   private:
     ApplicationSpecification _specification;
