@@ -47,7 +47,6 @@ void Application::Init()
                               _specification.height);
 
     IRenderContext::InitImGui(_windowHandle);
-
     _lastFrameTime = GetTime();
 }
 
@@ -70,19 +69,17 @@ void Application::Run()
                 _menubarCallBack();
             ImGui::EndMainMenuBar();
         }
-        std::cout << "[Log] StartImGuiFrame" << std::endl;
-        std::cout << "[Log] RenderImGui" << std::endl;
         
-        ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+        ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::DockSpaceOverViewport(ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+        ImGui::PopStyleColor();
 
-        std::cout << "[Debug] g.FrameCount = " << ImGui::GetFrameCount() << std::endl;
         for (auto &layer : _layerStack)
             layer->OnUpdate(_frameTime);
         for (auto &layer : _layerStack)
             layer->OnUIRender();
-
+        ImGui::ShowDemoWindow();
         IRenderContext::DrawFrame();
-        
         IRenderContext::RenderImGui();
         
         IRenderContext::EndFrame();

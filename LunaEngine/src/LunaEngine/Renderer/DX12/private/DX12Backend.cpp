@@ -144,13 +144,11 @@ bool DX12Backend::CreateDevice()
 
     if (FAILED(hr) || msQualityLevels.NumQualityLevels == 0)
     {
-        std::cout << "[MSAA] 4x not supported. Disabling MSAA.\n";
         m4xMsaaQuality = 0;
     }
     else
     {
         m4xMsaaQuality = msQualityLevels.NumQualityLevels;
-        std::cout << "[MSAA] Supported quality levels: " << m4xMsaaQuality << std::endl;
     }
     return true;
 }
@@ -262,8 +260,7 @@ bool DX12Backend::CreateSwapChain()
             return false;
         }
 
-        _rtvBuffer[i] = buffer; // 배열 또는 vector에 저장
-        std::cout << "Swap Chain Buffer " << i << " acquired" << std::endl;
+        _rtvBuffer[i] = buffer;
     }
 
     return true;
@@ -339,7 +336,7 @@ void DX12Backend::BeginFrame()
     _commandList->RSSetScissorRects(1, &_scissorRect);
 
     D3D12_CPU_DESCRIPTOR_HANDLE backBufferView = GetBackBufferView();
-    const FLOAT clearColor[] = { 0.2f, 0.2f, 0.2f, 1.0f };
+    const FLOAT clearColor[] = { 0.0f, 0.0f, 1.0f, 1.0f }; // Blue background
     _commandList->ClearRenderTargetView(backBufferView, clearColor, 0, nullptr);
     _commandList->OMSetRenderTargets(1, &backBufferView, FALSE, nullptr);
 }
@@ -355,7 +352,7 @@ void DX12Backend::InitImGui(void *windowHandler)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     ImGui::StyleColorsDark();
 
     ImGui_ImplGlfw_InitForOther(window, true);
@@ -380,18 +377,18 @@ void DX12Backend::StartImGui()
 
 void DX12Backend::RenderImGui()
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetBackBufferView();
-    _commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    
     ImGui::Render();
 #if defined(_DEBUG)
     if (!CheckIfImGuiData())
         return;
 #endif
     ID3D12DescriptorHeap *heaps[] = {_imGuiSrvHeap.Get()};
-    _commandList->SetDescriptorHeaps(_countof(heaps), heaps);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
+    _commandList->SetDescriptorHeaps(1, heaps);
 
+    // D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetBackBufferView();
+    // _commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    //
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
     if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
         ImGui::UpdatePlatformWindows();
@@ -401,15 +398,12 @@ void DX12Backend::RenderImGui()
 
 void DX12Backend::DrawFrame()
 {
-    std::cout << "=== DRAW FRAME START ===" << std::endl;
     BindPipeline(_trianglePipeline.get());
     SetVertexBuffer(_triangleVertexBuffer.get());
     _commandList->RSSetViewports(1, &_screenViewport);
     _commandList->RSSetScissorRects(1, &_scissorRect);
     _commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    std::cout << "-> Calling Draw(3)" << std::endl;
     Draw(3);
-    std::cout << "=== DRAW FRAME END ===" << std::endl;
 }
 
 void DX12Backend::ShutdownImGui()
