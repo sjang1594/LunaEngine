@@ -4,7 +4,9 @@
 #include "LunaEngine/Renderer/DX12/public/DX12Pipeline.h"
 #include "Renderer/DX12/public/DX12Buffer.h"
 
-// TRIANGLE TEST
+namespace Luna
+{
+
 struct Vertex
 {
     Vec3 position;
@@ -17,8 +19,13 @@ Vertex vertices[] = {
     {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}} // Left (Blue)
 };
 
-namespace Luna
+// Constant Buffer
+struct ConstantBufferStruct
 {
+    Matrix4x4 modelMatrix;
+    Matrix4x4 viewMatrix;
+    Matrix4x4 projectionMatrix;
+};
 
 bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
 {
@@ -43,8 +50,7 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
     
     std::cout << "DX12 Initialization is Successful" << endl;
 
-    _triangleVertexBuffer = std::make_shared<DX12Buffer>(
-        BufferUsage::Vertex, vertices, sizeof(vertices), sizeof(Vertex));
+    ConstantBufferStruct cbData = {};
     
     _trianglePipeline = std::make_unique<DX12Pipeline>();
     PipelineStateDesc desc;
@@ -315,6 +321,14 @@ void DX12Backend::SetResolution(const uint32_t &width, const uint32_t &height)
     _screenHeight = height;
 }
 
+void DX12Backend::SetPipelineState(D3D12_PRIMITIVE_TOPOLOGY topology, const D3D12_VIEWPORT *viewport,
+    const D3D12_RECT *scissorRect)
+{
+    _commandList->RSSetViewports(1, viewport);
+    _commandList->RSSetScissorRects(1, scissorRect);
+    _commandList->IASetPrimitiveTopology(topology);
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE DX12Backend::GetBackBufferView()
 {
     return GetRTV(_swapChain->GetCurrentBackBufferIndex());
@@ -382,10 +396,6 @@ void DX12Backend::RenderImGui()
 #endif
     ID3D12DescriptorHeap *heaps[] = {_imGuiSrvHeap.Get()};
     _commandList->SetDescriptorHeaps(1, heaps);
-
-    // D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetBackBufferView();
-    // _commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    //
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
     if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
@@ -397,10 +407,8 @@ void DX12Backend::RenderImGui()
 void DX12Backend::DrawFrame()
 {
     BindPipeline(_trianglePipeline.get());
-    SetVertexBuffer(_triangleVertexBuffer.get());
-    _commandList->RSSetViewports(1, &_screenViewport);
-    _commandList->RSSetScissorRects(1, &_scissorRect);
-    _commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // SetVertexBuffer(.get());
+    SetPipelineState(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, &_screenViewport, &_scissorRect);
     Draw(3);
 }
 
@@ -421,7 +429,6 @@ void DX12Backend::EndFrame()
     ID3D12CommandList *cmdListArr[] = {_commandList.Get()};
     _commandList->Close();
     _commandQueue->ExecuteCommandLists(_countof(cmdListArr), cmdListArr);
-
     _swapChain->Present(0, 0);
 
     WaitSync();
@@ -445,13 +452,14 @@ void DX12Backend::Draw(uint32_t vertexCount)
 
 void DX12Backend::SetVertexBuffer(IBuffer *buffer)
 {
+    // TODO: Maybe use static_cast
     auto dxBuffer = dynamic_cast<DX12Buffer*>(buffer);
-    
     _commandList->IASetVertexBuffers(0, 1, dxBuffer->GetVBView());
 }
 
 void DX12Backend::BindPipeline(IPipeline *pipeline)
 {
+    // TODO: Maybe use static_cast
     auto dx = dynamic_cast<DX12Pipeline*>(pipeline);
     if (!dx)
     {

@@ -6,7 +6,7 @@
 namespace Luna
 {
 
-DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t stride)
+DX12Buffer::DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint32_t stride)
     : _usage(usage), _size(size), _stride(stride)
 {
     if (auto dx12backend = GetBackend())
@@ -25,16 +25,19 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; // ROW MAJOR
          
-        HRESULT hr = device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                         IID_PPV_ARGS(&_resource));
+        HRESULT hr = device->CreateCommittedResource(&heapProps,
+            D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&_resource));
+        
         assert(SUCCEEDED(hr));
     
         if (data)
         {
             // Copy the triangle data to the vertex buffer
             void *mapped = nullptr;
-            D3D12_RANGE range = {0, 0}; // we do not intended to read from this resource on the CPU
+            D3D12_RANGE range = {0, 0}; // we do not intend to read from this resource on the CPU
             _resource->Map(0, &range, &mapped);
             memcpy(mapped, data, size);
             _resource->Unmap(0, nullptr);
@@ -51,6 +54,12 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
             _indexBufferView.BufferLocation = _resource->GetGPUVirtualAddress();
             _indexBufferView.Format = DXGI_FORMAT_R32_UINT;
             _indexBufferView.SizeInBytes = size;
+        }
+        else if (_usage == BufferUsage::Uniform || _usage == BufferUsage::Constant)
+        {
+            _constantBufferView.BufferLocation = _resource->GetGPUVirtualAddress();
+            // Constant Buffer should be multiple of 256 bytes.
+            _constantBufferView.SizeInBytes = (size + 255) & ~255;
         }
         // Root Signature END
     }
@@ -90,8 +99,10 @@ void DX12Buffer::Bind(uint32_t slot)
     case BufferUsage::Index:
         cmdList->IASetIndexBuffer(&_indexBufferView);
         break;
-
     case BufferUsage::Uniform:
+        cmdList->SetGraphicsRootConstantBufferView(slot, _resource->GetGPUVirtualAddress());
+        break;
+    case BufferUsage::Constant:
         cmdList->SetGraphicsRootConstantBufferView(slot, _resource->GetGPUVirtualAddress());
         break;
     default:
@@ -109,6 +120,15 @@ void *DX12Buffer::Map()
 
 void DX12Buffer::Unmap()
 {
+    _resource->Unmap(0, nullptr);
+}
+
+void DX12Buffer::UpdateData(void *data, uint32_t size)
+{
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, 0};
+    _resource->Map(0, &range, &mapped);
+    memcpy(mapped, data, size);
     _resource->Unmap(0, nullptr);
 }
 } // namespace Luna

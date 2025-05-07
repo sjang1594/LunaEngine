@@ -10,6 +10,7 @@ enum class BufferUsage
     Index,
     Uniform,
     Storage,
+    Constant,
 };
 
 class IBuffer

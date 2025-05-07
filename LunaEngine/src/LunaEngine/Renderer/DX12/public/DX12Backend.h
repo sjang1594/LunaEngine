@@ -1,5 +1,4 @@
 #pragma once
-
 #include <LunaEngine/Renderer/IRenderBackend.h>
 
 struct GLFWwindow;
@@ -12,7 +11,7 @@ using uint32 = unsigned __int32;
 class DX12Backend : public IRenderBackend
 {
   public:
-    /**/ DX12Backend() = default;
+    DX12Backend() = default;
     ~DX12Backend() override = default;
 
     bool Init(void *windowHandler, uint32_t width, uint32_t height) override;
@@ -25,11 +24,10 @@ class DX12Backend : public IRenderBackend
     void EndFrame() override;
     void Resize(uint32_t width, uint32_t height) override;
     const char *GetBackendName() const override;
-    
     void Draw(uint32_t vertexCount) override;
     void SetVertexBuffer(class IBuffer *buffer) override;
     void BindPipeline(class IPipeline* pipeline) override;
-
+    
     ComPtr<IDXGIFactory> GetDXGIFactory() const
     {
         return _mdxgiFactory;
@@ -81,6 +79,9 @@ class DX12Backend : public IRenderBackend
     bool CreateRenderTarget();
     bool CreateImGuiRenderTarget();
     void SetResolution(const uint32_t &width, const uint32_t &height);
+    void SetPipelineState(D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    const D3D12_VIEWPORT* viewport = nullptr,
+    const D3D12_RECT* scissorRect = nullptr);
 
   private:
     int _screenWidth;
@@ -123,9 +124,8 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12DescriptorHeap> _imGuiSrvHeap;
     D3D12_CPU_DESCRIPTOR_HANDLE _rtvHandle[SWAP_CHAIN_BUFFER_COUNT];
 
-    // Vertex Buffer
-    std::shared_ptr<class DX12Buffer> _triangleVertexBuffer;
-    D3D12_VERTEX_BUFFER_VIEW _vertexBufferView;
+    // Triangle Test
+    // std::shared_ptr<class DX12Buffer> _triangleVertexBuffer;
     std::shared_ptr<class DX12Pipeline> _trianglePipeline;
 };
 } // namespace Luna

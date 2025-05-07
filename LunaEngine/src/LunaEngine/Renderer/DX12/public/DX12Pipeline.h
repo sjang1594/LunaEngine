@@ -1,10 +1,6 @@
 ﻿#pragma once
 #include "Graphics/IPipeline.h"
 
-// Root Signature Creation
-// Pipeline State Object (PSO)
-// Shader Loading via D3DCompileFromFile
-
 namespace Luna
 {
 class DX12Pipeline : public IPipeline
@@ -33,5 +29,7 @@ class DX12Pipeline : public IPipeline
     PipelineStateDesc _desc;
     ComPtr<ID3D12PipelineState> _pipelineState;
     ComPtr<ID3D12RootSignature> _rootSignature;
+    ComPtr<ID3DBlob> _vsBlob;
+    ComPtr<ID3DBlob> _psBlob;
 };
 } // namespace Luna
