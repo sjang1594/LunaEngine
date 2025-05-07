@@ -26,9 +26,6 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
     _screenViewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0.0f, 1.0f};
 
     _scissorRect = CD3DX12_RECT(0, 0, width, height); // NOLINT(bugprone-narrowing-conversions)
-
-    PipelineStateDesc desc;
-    
     SetResolution(width, height);
     CreateDebugLayer();
     if (!CreateFactoryAndAdapter())
@@ -50,6 +47,7 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
         BufferUsage::Vertex, vertices, sizeof(vertices), sizeof(Vertex));
     
     _trianglePipeline = std::make_unique<DX12Pipeline>();
+    PipelineStateDesc desc;
     if (_device == nullptr)
         cout << "Device is null" << endl;
     if (!_trianglePipeline->Initialize(_device,
