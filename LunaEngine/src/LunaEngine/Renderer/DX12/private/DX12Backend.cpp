@@ -7,14 +7,14 @@
 // TRIANGLE TEST
 struct Vertex
 {
-    DirectX::XMFLOAT3 position;
-    DirectX::XMFLOAT3 color;
+    Vec3 position;
+    Vec4 color;
 };
 
 Vertex vertices[] = {
-    {{0.0f, 0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},  // TOP (RED)
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}}, // Right (Green)
-    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}} // Left (Blue)
+    {{0.0f, 0.5f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}},  // TOP (RED)
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}}, // Right (Green)
+    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}} // Left (Blue)
 };
 
 namespace Luna

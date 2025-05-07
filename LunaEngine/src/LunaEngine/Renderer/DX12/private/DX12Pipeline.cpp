@@ -82,9 +82,11 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         return false;
     }
 
-    hr = device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(),
-                                     serializedRootSignature->GetBufferSize(),
-                                     IID_PPV_ARGS(&_rootSignature));
+    hr = device->CreateRootSignature(0,
+        serializedRootSignature->GetBufferPointer(),
+        serializedRootSignature->GetBufferSize(),
+        IID_PPV_ARGS(&_rootSignature));
+
     if (FAILED(hr))
     {
         std::cerr << "[RootSignature] Failed to create root signature. HRESULT 0x" << std::hex << hr << std::endl;
@@ -102,9 +104,11 @@ bool DX12Pipeline::CreatePipelineState(ComPtr<ID3D12Device> device, ComPtr<ID3DB
         cout << "Device is null" << endl;
         return false;
     }
-    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
-                                               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-{ "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }};
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
+            0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
+    12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }};
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.InputLayout = {inputLayout, _countof(inputLayout)};
@@ -119,18 +123,7 @@ bool DX12Pipeline::CreatePipelineState(ComPtr<ID3D12Device> device, ComPtr<ID3DB
     }
     psoDesc.NodeMask = 0;
     psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
-
-    D3D12_BLEND_DESC blendDesc = {};
-    blendDesc.RenderTarget[0].BlendEnable = TRUE;
-    blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-    blendDesc.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
-    blendDesc.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    psoDesc.BlendState = blendDesc;
-    
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState.DepthEnable = _desc.enableDepthTest ? TRUE : FALSE;
     psoDesc.DSVFormat = _desc.enableDepthTest ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;

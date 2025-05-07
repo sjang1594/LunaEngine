@@ -11,6 +11,7 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
 {
     if (auto dx12backend = GetBackend())
     {
+        // ROOT Signature START
         auto device = dx12backend->GetDevice();
         D3D12_HEAP_PROPERTIES heapProps = {};
         heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -22,8 +23,8 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; // ROW MAJOR
+         
         HRESULT hr = device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&_resource));
@@ -31,13 +32,14 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
     
         if (data)
         {
+            // Copy the triangle data to the vertex buffer
             void *mapped = nullptr;
-            D3D12_RANGE range = {0, 0};
+            D3D12_RANGE range = {0, 0}; // we do not intended to read from this resource on the CPU
             _resource->Map(0, &range, &mapped);
             memcpy(mapped, data, size);
             _resource->Unmap(0, nullptr);
         }
-    
+        
         if (_usage == BufferUsage::Vertex)
         {
             _vertexBufferView.BufferLocation = _resource->GetGPUVirtualAddress();
@@ -50,6 +52,7 @@ DX12Buffer::DX12Buffer(BufferUsage usage, void *data, uint32_t size, uint32_t st
             _indexBufferView.Format = DXGI_FORMAT_R32_UINT;
             _indexBufferView.SizeInBytes = size;
         }
+        // Root Signature END
     }
     else
     {
