@@ -4,18 +4,18 @@ project "LunaEngine"
    cppdialect "C++17"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
-   
+
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
    objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
 
    pchheader "LunaPCH.h"
    pchsource "src/LunaEngine/LunaPCH.cpp"
-   
+
    local shader_dir = path.getabsolute("../LunaEngine/src/LunaEngine/Shaders"):gsub("\\", "/")
    defines {
       'SHADER_ROOT_PATH="' .. shader_dir .. '"'
   }
-   
+  
    files {
       "src/**.h", 
       "src/**.cpp",
@@ -31,6 +31,9 @@ project "LunaEngine"
       "../vendor/dxheaders/include/directxs",
       "../vendor/d3d12ma/include",
       "../vendor/dxc/include",
+      "../vendor/DirectXTex/DirectXTex",
+      "../vendor/DirectXTex/DirectXTex/BC",
+      "../vendor/DirectXTex/DirectXTex/Filters",
 
       -- Vulkan
       "../vendor/volk",
@@ -59,6 +62,7 @@ project "LunaEngine"
       "dxgi",
       "dxguid",
       "dxcompiler",      -- DXC for HLSL shader compiling
+      "DirectXTex",
       "%{Library.Vulkan}",
    }
 
@@ -76,12 +80,15 @@ project "LunaEngine"
    filter "system:windows"
       systemversion "latest"
       defines { "WL_PLATFORM_WINDOWS" }
-
+      
       includedirs {
-         "../vendor/dxheaders/include",
-         "../vendor/dxheaders/include/directxs",
-         "../vendor/d3d12ma/include",
-         "../vendor/dxc/include"
+        "../vendor/dxheaders/include",
+        "../vendor/dxheaders/include/directxs",
+        "../vendor/d3d12ma/include",
+        "../vendor/dxc/include",
+        "../vendor/DirectXTex/DirectXTex",    
+        "../vendor/DirectXTex/DirectXTex/BC",
+        "../vendor/DirectXTex/DirectXTex/Filters" 
       }
 
       libdirs {
@@ -90,7 +97,7 @@ project "LunaEngine"
 
       links {
          "d3d12", "dxgi", "dxguid", "dxcompiler",
-         "GLFW", "ImGui", "%{Library.Vulkan}"
+         "GLFW", "ImGui", "DirectXTex", "%{Library.Vulkan}"
       }
 
    filter "system:macosx"
