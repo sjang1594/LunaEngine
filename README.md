@@ -1,7 +1,7 @@
 # LunaEngine
 
 <p align="center">
-    <img src="Resources/icon.png" alt="LunaEngine Logo" width="300">
+    <img src="Resources/high_res_icon.png" alt="LunaEngine Logo" width="300">
 </p>
 
 ---
