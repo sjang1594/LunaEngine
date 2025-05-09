@@ -15,6 +15,9 @@
 #include <windows.h>
 #include <filesystem>
 
+// turn off std::byte
+#define _HAS_STD_BYTE 0
+
 using namespace std;
 
 #include <vulkan/vulkan.h>
@@ -71,19 +74,26 @@ enum
     SWAP_CHAIN_BUFFER_COUNT = 2
 };
 
-struct WindowInfo
-{
-    HWND hwnd;     // Output Window
-    int32 width;   // Width
-    int32 height;  // Height
-    bool windowed; //
-};
-
-inline void ThrowIfFailed(HRESULT hr)
+#include <comdef.h>
+inline void ThrowIfDXFailed(HRESULT hr, const char* functionName, int lineNumber)
 {
     if (FAILED(hr))
     {
-        // Set a breakpoint on this line to catch DirectX API errors
-        throw std::exception();
+        _com_error err(hr);
+        std::cerr << "[ERROR] DirectX Error: " << err.ErrorMessage()
+                  << " | Function: " << functionName
+                  << " | Line: " << lineNumber << std::endl;
+        std::terminate();  // Immediate termination with detailed log
     }
+}
+
+#define DX_CHECK(x) ThrowIfDXFailed(x, __FUNCTION__, __LINE__)
+
+inline void CheckIfVKFailed(VkResult error)
+{
+    if (error == 0)
+        return;
+    fprintf(stderr, "Vulkan Error: %d\n", error);
+    if (error < 0)
+        abort();
 }
