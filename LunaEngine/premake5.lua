@@ -36,7 +36,6 @@ project "LunaEngine"
       "../vendor/DirectXTex/DirectXTex/Filters",
 
       -- Vulkan
-      "../vendor/volk",
       "%{IncludeDir.VulkanSDK}",
 
       "../vendor/glfw/include",
@@ -68,8 +67,6 @@ project "LunaEngine"
 
    defines 
    {
-      "VOLK_IMPLEMENTATION",
-      "VK_NO_PROTOTYPES",
       "D3D12_ENABLE_DEBUG_LAYER",
       "_GLFW_WIN32"
    }
