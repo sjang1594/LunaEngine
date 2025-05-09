@@ -1,7 +1,7 @@
 #pragma once
 
 #include <LunaEngine/LunaPCH.h>
-#include <LunaEngine/Renderer/IRenderBackend.h>
+#include <LunaEngine/Renderer/HAL/Public/IRenderBackend.h>
 
 namespace Luna
 {
@@ -9,7 +9,7 @@ class VulkanBackend : public IRenderBackend
 {
   public:
     VulkanBackend();
-    ~VulkanBackend();
+    virtual ~VulkanBackend() override = default;
 
     bool Init(void *windowHandler, uint32_t width, uint32_t height) override;
     void BeginFrame() override;

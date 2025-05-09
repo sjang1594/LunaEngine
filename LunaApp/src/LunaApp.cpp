@@ -14,11 +14,11 @@ class ExampleLayer : public Layer
 
 Application *Luna::CreateApplication(int argc, char **argv)
 {
-    ApplicationSpecification spec;
-    spec.Name = "LunaApp";
+    Luna::ApplicationSpecification spec;
+    spec.name = "LunaApp";
     spec.width = 1600;
     spec.height = 900;
-    spec.backend = RenderBackendType::DirectX12;
+    spec.backend = RenderBackendType::DX12;
     spec.iconPath = "Resources/icon.png";
 
     Application *app = new Application(spec);

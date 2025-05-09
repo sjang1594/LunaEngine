@@ -1,8 +1,8 @@
 #include "LunaPCH.h"
 #include "LunaEngine/Graphics/IBuffer.h"
-#include "LunaEngine/Renderer/DX12/public/DX12Backend.h"
-#include "LunaEngine/Renderer/DX12/public/DX12Pipeline.h"
-#include "Renderer/DX12/public/DX12Buffer.h"
+#include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
+#include "LunaEngine/Renderer/DX12/Public/DX12Pipeline.h"
+#include "Renderer/DX12/Public/DX12Buffer.h"
 
 namespace Luna
 {
@@ -34,11 +34,6 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
 
     _scissorRect = CD3DX12_RECT(0, 0, width, height); // NOLINT(bugprone-narrowing-conversions)
     SetResolution(width, height);
-    CreateDebugLayer();
-    if (!CreateFactoryAndAdapter())
-        return false;
-    if (!CreateDevice())
-        return false;
     if (!CreateCommandQueueAndFenceEvent())
         return false;
     if (!CreateSwapChain())
@@ -54,8 +49,6 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
     
     _trianglePipeline = std::make_unique<DX12Pipeline>();
     PipelineStateDesc desc;
-    if (_device == nullptr)
-        cout << "Device is null" << endl;
     if (!_trianglePipeline->Initialize(_device,
         L"triangle.vert.hlsl",
         L"triangle.frag.hlsl",
@@ -74,85 +67,6 @@ bool DX12Backend::CheckIfImGuiData()
     {
         std::cout << "[ImGui] DrawData is null. Nothing to render.\n";
         return false;
-    }
-    return true;
-}
-
-void DX12Backend::CreateDebugLayer()
-{
-#if defined(_DEBUG) || defined(DEBUG)
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&_debugController))))
-    {
-        _debugController->EnableDebugLayer();
-    }
-#endif
-}
-
-bool DX12Backend::CreateFactoryAndAdapter()
-{
-    UINT flags = 0;
-
-#if defined(_DEBUG) || defined(DEBUG)
-    flags |= DXGI_CREATE_FACTORY_DEBUG;
-#endif
-
-    HRESULT hr = CreateDXGIFactory2(flags, IID_PPV_ARGS(&_mdxgiFactory));
-    if (FAILED(hr))
-    {
-        std::cout << "Create DXGIFactory2 Failed" << std::endl;
-        return false;
-    }
-
-    for (UINT i = 0;; ++i)
-    {
-        ComPtr<IDXGIAdapter1> candidate;
-        if (_mdxgiFactory->EnumAdapters1(i, candidate.GetAddressOf()) == DXGI_ERROR_NOT_FOUND)
-            break;
-
-        DXGI_ADAPTER_DESC1 desc;
-        candidate->GetDesc1(&desc);
-
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-            continue;
-
-        if (desc.DedicatedVideoMemory > 0)
-        {
-            _adapter = candidate;
-            wprintf(L" Selected Adapter: %s\n", desc.Description);
-            return true;
-        }
-    }
-    std::cout << "No suitable GPU adapter found." << std::endl;
-    return false;
-}
-
-bool DX12Backend::CreateDevice()
-{
-    HRESULT hr = D3D12CreateDevice(_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&_device));
-
-    if (FAILED(hr))
-    {
-        std::cout << "Failed to Create D3D12 Device" << std::endl;
-        return false;
-    }
-
-    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msQualityLevels;
-    msQualityLevels.Format = mBackBufferFormat;
-    msQualityLevels.SampleCount = 4;
-    msQualityLevels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
-    msQualityLevels.NumQualityLevels = 0;
-
-    hr = _device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-        &msQualityLevels, sizeof(msQualityLevels));
-    
-
-    if (FAILED(hr) || msQualityLevels.NumQualityLevels == 0)
-    {
-        m4xMsaaQuality = 0;
-    }
-    else
-    {
-        m4xMsaaQuality = msQualityLevels.NumQualityLevels;
     }
     return true;
 }
@@ -216,7 +130,7 @@ void DX12Backend::WaitSync()
 
 bool DX12Backend::CreateSwapChain()
 {
-    _swapChain.Reset();
+    _swapChain.Reset(); 
     DXGI_SWAP_CHAIN_DESC1 scDesc1 = {};
     scDesc1.Width = static_cast<UINT>(_screenWidth);
     scDesc1.Height = static_cast<UINT>(_screenHeight);
@@ -241,6 +155,7 @@ bool DX12Backend::CreateSwapChain()
     ComPtr<IDXGISwapChain1> tempSwapChain1;
     HRESULT hr = _mdxgiFactory->CreateSwapChainForHwnd(_commandQueue.Get(), _mainWindow, &scDesc1,
         &fsDesc, nullptr, &tempSwapChain1);
+
     if (FAILED(hr))
     {
         std::cerr << "Failed to create SwapChainForHwnd: " << std::hex << hr << std::endl;
