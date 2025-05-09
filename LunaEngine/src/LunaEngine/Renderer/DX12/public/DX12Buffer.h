@@ -3,6 +3,27 @@
 
 namespace Luna
 {
+
+enum class CBV_BUFFER_REGISTER : uint8
+{
+    b0,
+    b1,
+    b2,
+    b3,
+    b4,
+    END
+};
+
+enum class SRV_BUFFER_REGISTER : uint8
+{
+    t0 = static_cast<uint8>(CBV_BUFFER_REGISTER::END),
+    t1,
+    t2,
+    t3,
+    t4,
+    END
+};
+
 class DX12Buffer : public IBuffer
 {
   public:
@@ -19,9 +40,12 @@ class DX12Buffer : public IBuffer
     
   private:
     BufferUsage _usage;
+
     ComPtr<ID3D12Resource> _resource;
+    
     uint32_t _size;
     uint32_t _stride;
+    
     D3D12_VERTEX_BUFFER_VIEW _vertexBufferView;
     D3D12_INDEX_BUFFER_VIEW _indexBufferView;
     D3D12_CONSTANT_BUFFER_VIEW_DESC _constantBufferView;

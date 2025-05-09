@@ -1,6 +1,6 @@
 ﻿#include "LunaPCH.h"
 #include "IShader.h"
-#include "Renderer/DX12/public/DX12Shader.h"
+#include "Renderer/DX12/Public/DX12Shader.h"
 #include "Renderer/IRenderContext.h"
 
 namespace Luna

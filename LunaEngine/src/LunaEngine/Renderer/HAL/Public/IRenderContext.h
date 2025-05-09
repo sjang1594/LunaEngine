@@ -1,7 +1,14 @@
 #pragma once
 
-#include "Application/ApplicationSpecification.h"
 #include "IRenderBackend.h"
+
+enum class RenderBackendType
+{
+    Auto,
+    Vulkan,
+    DX12,
+    Metal
+};
 
 namespace Luna
 {

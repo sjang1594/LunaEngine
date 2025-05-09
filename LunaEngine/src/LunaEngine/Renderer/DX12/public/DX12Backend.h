@@ -1,7 +1,6 @@
 #pragma once
-#include <LunaEngine/Renderer/IRenderBackend.h>
 
-struct GLFWwindow;
+
 namespace Luna
 {
 using Microsoft::WRL::ComPtr;
@@ -23,7 +22,6 @@ class DX12Backend : public IRenderBackend
     void ShutdownImGui() override;
     void EndFrame() override;
     void Resize(uint32_t width, uint32_t height) override;
-    const char *GetBackendName() const override;
     void Draw(uint32_t vertexCount) override;
     void SetVertexBuffer(class IBuffer *buffer) override;
     void BindPipeline(class IPipeline* pipeline) override;
@@ -101,7 +99,6 @@ class DX12Backend : public IRenderBackend
     ComPtr<IDXGIFactory6> _mdxgiFactory;
     ComPtr<IDXGIAdapter1> _adapter;
     ComPtr<ID3D12Device> _device;
-    UINT m4xMsaaQuality = 0;
 
     D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msQualityLevels;
 

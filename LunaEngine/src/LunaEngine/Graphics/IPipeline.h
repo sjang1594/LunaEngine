@@ -10,9 +10,9 @@ struct PipelineStateDesc
     bool enableWireFrame = false;
 };
 
-class IPipeline
+class IPipelineState
 {
 public:
-    virtual ~IPipeline() = default;
+    virtual ~IPipelineState() = default;
 };
 } // namespace Luna

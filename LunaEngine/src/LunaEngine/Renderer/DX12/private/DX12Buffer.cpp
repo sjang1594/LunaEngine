@@ -1,6 +1,6 @@
 ﻿#include "LunaPCH.h"
-#include "LunaEngine/Renderer/DX12/public/DX12Buffer.h"
-#include "LunaEngine/Renderer/DX12/public/DX12Backend.h"
+#include "LunaEngine/Renderer/DX12/Public/DX12Buffer.h"
+#include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
 #include "Renderer/IRenderContext.h"
 
 namespace Luna
@@ -42,7 +42,6 @@ DX12Buffer::DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint3
             memcpy(mapped, data, size);
             _resource->Unmap(0, nullptr);
         }
-        
         if (_usage == BufferUsage::Vertex)
         {
             _vertexBufferView.BufferLocation = _resource->GetGPUVirtualAddress();
