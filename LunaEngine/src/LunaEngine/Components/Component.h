@@ -1,10 +1,10 @@
 #pragma once
 
+namespace Luna
+{
 class GameObject;
 class Transform;
 
-namespace Luna
-{
 enum class ComponentType
 {
     NONE,
@@ -21,14 +21,15 @@ enum
 class Component
 {
 public:
-    Component();
-    virtual ~Component();
+    Component(ComponentType type);
+    virtual ~Component() = default;
     virtual void Awake() {}
     virtual void Start() {}
     virtual void Update() {}
-    virtual void LastUpdate() {}
-
+    virtual void LateUpdate() {}
+    
     ComponentType GetComponentType() const;
+    bool IsValid() { return _gameObject.expired() == false; }
     shared_ptr<GameObject> GetGameObject() const;
     shared_ptr<Transform> GetTransform() const;
     
@@ -38,6 +39,6 @@ protected:
 
 private:
     friend class GameObject;
-    void SetGameObject(shared_ptr<GameObject> gameObject) { _gameObject = gameObject; }
+    void SetGameObject(const shared_ptr<GameObject> &gameObject) { _gameObject = gameObject; }
 };
 }

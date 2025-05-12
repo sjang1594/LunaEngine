@@ -29,22 +29,42 @@ void GameObject::Awake()
 
 void GameObject::Start()
 {
-    
+    for (shared_ptr<Component> component : _components)
+    {
+        if (component)
+            component->Start();
+    }
 }
 
-void GameObject::AddComponent(const shared_ptr<Transform> &component)
+void GameObject::Update()
 {
-    component->SetGameObject(shared_from_this());
-    uint8 index = static_cast<uint8>(component->GetComponentType());
-    if (index < FIXED_COMPONENT_COUNT)
+    for (shared_ptr<Component> component : _components)
     {
-        _components[index] = component;
+        if (component)
+            component->Update();
+    }
+}
+
+void GameObject::LateUpdate()
+{
+    for (shared_ptr<Component> component : _components)
+    {
+        if (component)
+            component->LateUpdate();
     }
 }
 
 void GameObject::AddComponent(shared_ptr<Component> component)
 {
+    component->SetGameObject(shared_from_this());
+    uint8_t index = static_cast<uint8_t>(component->GetComponentType());
+    if (index < FIXED_COMPONENT_COUNT)
+    {
+        _components[index] = component;
+    }
+    else
+    {
+        // _scripts.push_back(dynamic_pointer_cast<Monobehaviour>(component);
+    }
 }
-
-
 }
