@@ -4,8 +4,6 @@
 
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include "Logger/Logger.h"
-
-
 #include <GLFW/glfw3native.h>
 
 static Luna::Application *g_instance = nullptr;
@@ -34,6 +32,11 @@ Application &Luna::Application::Get()
 {
     static Application instance;
     return instance;
+}
+
+void * Application::GetNativeWindow() const
+{
+    
 }
 
 void Application::Init()
@@ -91,19 +94,19 @@ void Application::Init()
         }
     }
 
+    // TODO: Refactoring
 #ifdef _WIN32
     HWND hwnd = glfwGetWin32Window(_windowHandle);
-    if (_specification.backend == RenderBackendType::DX12)
+    if (_specification.backend == RenderBackendType::DirectX12)
     {
-        IRenderContext::Initialize(_specification.backend, hwnd, _specification.width,
+        IRenderContext::Initialize(RenderBackendType::DirectX12, hwnd, _specification.width,
                               _specification.height);
-        IRenderContext::InitImGui(_windowHandle);
     }
     
 #elif __APPLE__ 
-    void* nsWindow = glfwGetCocoaWindow(_windowHandle);
-    if (_specification.backend == RenderBackendType::Metal)
+    if (_specification.backend == RenderBackendType::VulkanMolt)
     {
+        void* nsWindow = glfwGetCocoaWindow(_windowHandle);
         LUNA_LOG_INFO("Metal backend is not supported yet!");
     }
 #else
@@ -115,20 +118,12 @@ void Application::Init()
             glfwTerminate();
             return;
         }
-
-        VkSurfaceKHR surface;
-        VkResult error = glfwCreateWindowSurface(g_instance, _windowHandle, nullptr, &surface);
-        if (error != VK_SUCCESS)
-        {
-            LUNA_LOG_ERROR("Failed to create Vulkan surface!");
-            glfwTerminate();
-            return;
-        }
-
-        // IRENDERBACKEND INitialize
+        LUNA_LOG_INFO("Initializing Vulkan Backend")
+        IRenderContext::Initialize(RenderBackendType::Vulkan, _windowHandle, _specification.width, _specification.height);
         LUNA_LOG_INFO("Vulkan backend is not supported yet!");
     }
 #endif
+    IRenderContext::InitImGui(_windowHandle);
     _lastFrameTime = GetTime();
     LUNA_LOG_INFO("Application initialized!");
 }
@@ -188,7 +183,7 @@ bool Application::ShouldContinueRunning() const
 
 void Application::Close()
 {
-    std::cout << "[Application] Close() called" << std::endl;
+    LUNA_LOG_INFO("Application::Close");
     _running = false;
     glfwSetWindowShouldClose(_windowHandle, GLFW_TRUE);
 }

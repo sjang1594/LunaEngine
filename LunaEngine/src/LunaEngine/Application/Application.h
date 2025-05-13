@@ -21,7 +21,7 @@ struct ApplicationSpecification
     bool customTitleBar = false;
     bool useDockSpace = true;
     bool centerWindow = true;
-    RenderBackendType backend = RenderBackendType::Auto;
+    RenderBackendType backend = RenderBackendType::Vulkan;
 };
 
 class Application
