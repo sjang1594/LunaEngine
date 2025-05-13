@@ -9,33 +9,31 @@ class IRenderBackend
   public:
     virtual ~IRenderBackend() = default;
 
-    // Window Handler (GLFWindow*)
+    /* Backend Initialization
+     * Window Handler (GLFWindow*)
+     */
     virtual bool Init(void *windowHandler, uint32_t width, uint32_t height) = 0;
-
-    // Frame start
+    virtual void Shutdown() = 0;
+    
+    /* Frame Control
+     * BeginFrame() / EndFrame() / DrawFrame() / EndFrame()
+    */
     virtual void BeginFrame() = 0;
-
-    // Frame Draw (submit queue)
     virtual void DrawFrame() = 0;
-
-    // Frame End (etc: Present)
     virtual void EndFrame() = 0;
-
     virtual void Resize(uint32_t width, uint32_t height) = 0;
 
+    /* IMGUI Support */
     virtual void InitImGui(void *windowHandler) = 0;
-
     virtual void StartImGui() = 0;
-
     virtual void RenderImGui() = 0;
-
     virtual void ShutdownImGui() = 0;
-    
-    virtual const char *GetBackendName() const = 0;
 
     // Rendering Core
     virtual void Draw(uint32_t vertexCount) = 0;
     virtual void SetVertexBuffer(class IBuffer* buffer) = 0;
     virtual void BindPipeline(class IPipeline* pipeline) = 0;
+
+    virtual const char *GetBackendName() const = 0;
 };
 } // namespace Luna

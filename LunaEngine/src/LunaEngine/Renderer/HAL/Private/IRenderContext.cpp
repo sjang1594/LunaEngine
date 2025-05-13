@@ -1,17 +1,16 @@
 #include "LunaPCH.h"
-#include "IRenderContext.h"
+#include "LunaEngine/Renderer/HAL/Public/IRenderContext.h"
+
+#include "Logger/Logger.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
-#include "LunaEngine/Renderer/Vulkan/VulkanBackend.h"
+#include "LunaEngine/Renderer/Vulkan/Public/VulkanBackend.h"
 
 namespace Luna
 {
 std::unique_ptr<IRenderBackend> IRenderContext::s_Backend = nullptr;
+RenderBackendType IRenderContext::s_BackendType = RenderBackendType::Auto;
 
-RenderBackendType IRenderContext::s_BackendType = RenderBackendType::DirectX12;
-
-void IRenderContext::Initialize(
-    RenderBackendType backendType,
-    void *windowHandler,
+void IRenderContext::Initialize(RenderBackendType backendType, void *windowHandler,
     uint32_t width, uint32_t height)
 {
     s_BackendType = backendType;
@@ -24,14 +23,15 @@ void IRenderContext::Initialize(
     case RenderBackendType::DirectX12:
         s_Backend = std::make_unique<DX12Backend>();
         break;
+
+    case RenderBackendType::VulkanMolt:
+        LUNA_LOG_ERROR("We don't support iOS Yet");
+        break;
+    default:
+        throw std::runtime_error("Invalid backend type");
     }
 
     s_Backend->Init(windowHandler, width, height);
-}
-
-void IRenderContext::Shutdown()
-{
-    s_Backend.reset();
 }
 
 void IRenderContext::BeginFrame()
@@ -50,6 +50,11 @@ void IRenderContext::EndFrame()
 {
     if (s_Backend)
         s_Backend->EndFrame();
+}
+
+void IRenderContext::Shutdown()
+{
+    s_Backend->Shutdown();
 }
 
 void IRenderContext::Resize(uint32_t width, uint32_t height)
