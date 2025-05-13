@@ -29,12 +29,15 @@ using namespace std;
 #include <directx/d3dx12_barriers.h>
 #include <directx/d3dx12_core.h>
 #include <directx/d3dx12_root_signature.h>
+
 // ImGUI
 #include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
 #include <imgui.h>
 
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
 
 // Math
