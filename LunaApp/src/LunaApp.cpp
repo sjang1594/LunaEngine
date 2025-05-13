@@ -18,7 +18,7 @@ Application *Luna::CreateApplication(int argc, char **argv)
     spec.name = "LunaApp";
     spec.width = 1600;
     spec.height = 900;
-    spec.backend = RenderBackendType::DX12;
+    spec.backend = RenderBackendType::DirectX12;
     spec.iconPath = "Resources/icon.png";
 
     Application *app = new Application(spec);
