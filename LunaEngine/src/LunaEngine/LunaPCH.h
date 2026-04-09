@@ -18,6 +18,9 @@
 // turn off std::byte
 #define _HAS_STD_BYTE 0
 
+// TODO: Remove these global using-directives — they pollute every translation unit
+// that includes this PCH. Prefer explicit std:: / DirectX:: / Microsoft::WRL::
+// prefixes in source files. Tracked in progress/code-review.md #14.
 using namespace std;
 
 #include <vulkan/vulkan.h>

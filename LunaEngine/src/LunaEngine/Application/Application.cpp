@@ -2,9 +2,12 @@
 #include "LunaEngine/Application/Application.h"
 #include "stb_image.h"
 
-#define GLFW_EXPOSE_NATIVE_WIN32
 #include "Logger/Logger.h"
+
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
+#endif
 
 static Luna::Application *g_instance = nullptr;
 
@@ -30,13 +33,16 @@ Application::~Application()
 
 Application &Luna::Application::Get()
 {
-    static Application instance;
-    return instance;
+    return *g_instance;
 }
 
-void * Application::GetNativeWindow() const
+void *Application::GetNativeWindow() const
 {
-    
+#ifdef _WIN32
+    return glfwGetWin32Window(_windowHandle);
+#else
+    return _windowHandle;
+#endif
 }
 
 void Application::Init()
@@ -90,39 +96,35 @@ void Application::Init()
         }
         else
         {
-            LUNA_LOG_ERROR("Failed to load icon: " + _specification.iconPath.string());
+            LUNA_LOG_ERROR("Failed to load icon: %s", _specification.iconPath.string().c_str());
         }
     }
 
-    // TODO: Refactoring
-#ifdef _WIN32
-    HWND hwnd = glfwGetWin32Window(_windowHandle);
     if (_specification.backend == RenderBackendType::DirectX12)
     {
-        IRenderContext::Initialize(RenderBackendType::DirectX12, hwnd, _specification.width,
-                              _specification.height);
-    }
-    
-#elif __APPLE__ 
-    if (_specification.backend == RenderBackendType::VulkanMolt)
-    {
-        void* nsWindow = glfwGetCocoaWindow(_windowHandle);
-        LUNA_LOG_INFO("Metal backend is not supported yet!");
-    }
+#ifdef _WIN32
+        HWND hwnd = glfwGetWin32Window(_windowHandle);
+        IRenderContext::Initialize(RenderBackendType::DirectX12, hwnd,
+                                   _specification.width, _specification.height);
 #else
-    if (_specification.backend == RenderBackendType::Vulkan)
+        LUNA_LOG_ERROR("DirectX 12 is only supported on Windows");
+#endif
+    }
+    else if (_specification.backend == RenderBackendType::Vulkan)
     {
         if (!glfwVulkanSupported())
         {
-            LUNA_LOG_ERROR("Vulkan is not supported on this platform!");
+            LUNA_LOG_ERROR("Vulkan is not supported on this platform");
             glfwTerminate();
             return;
         }
-        LUNA_LOG_INFO("Initializing Vulkan Backend")
-        IRenderContext::Initialize(RenderBackendType::Vulkan, _windowHandle, _specification.width, _specification.height);
-        LUNA_LOG_INFO("Vulkan backend is not supported yet!");
+        IRenderContext::Initialize(RenderBackendType::Vulkan, _windowHandle,
+                                   _specification.width, _specification.height);
     }
-#endif
+    else if (_specification.backend == RenderBackendType::VulkanMolt)
+    {
+        LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
+    }
     IRenderContext::InitImGui(_windowHandle);
     _lastFrameTime = GetTime();
     LUNA_LOG_INFO("Application initialized!");
@@ -159,20 +161,23 @@ void Application::Run()
         ImGui::ShowDemoWindow();
         IRenderContext::DrawFrame();
         IRenderContext::RenderImGui();
-        
         IRenderContext::EndFrame();
     }
-
-    Shutdown();
 }
 
 void Application::Shutdown()
 {
+    if (!_windowHandle) return;
+
     for (auto &layer : _layerStack)
         layer->OnDetach();
+    _layerStack.clear();
+
     IRenderContext::ShutdownImGui();
     IRenderContext::Shutdown();
+
     glfwDestroyWindow(_windowHandle);
+    _windowHandle = nullptr;
     glfwTerminate();
 }
 

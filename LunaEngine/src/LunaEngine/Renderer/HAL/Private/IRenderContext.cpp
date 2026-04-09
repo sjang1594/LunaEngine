@@ -25,13 +25,18 @@ void IRenderContext::Initialize(RenderBackendType backendType, void *windowHandl
         break;
 
     case RenderBackendType::VulkanMolt:
-        LUNA_LOG_ERROR("We don't support iOS Yet");
-        break;
+        LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
+        return;
+
     default:
-        throw std::runtime_error("Invalid backend type");
+        throw std::runtime_error("Unknown render backend type");
     }
 
-    s_Backend->Init(windowHandler, width, height);
+    if (!s_Backend->Init(windowHandler, width, height))
+    {
+        LUNA_LOG_ERROR("Backend initialization failed");
+        s_Backend.reset();
+    }
 }
 
 void IRenderContext::BeginFrame()
@@ -54,7 +59,11 @@ void IRenderContext::EndFrame()
 
 void IRenderContext::Shutdown()
 {
-    s_Backend->Shutdown();
+    if (s_Backend)
+    {
+        s_Backend->Shutdown();
+        s_Backend.reset();
+    }
 }
 
 void IRenderContext::Resize(uint32_t width, uint32_t height)

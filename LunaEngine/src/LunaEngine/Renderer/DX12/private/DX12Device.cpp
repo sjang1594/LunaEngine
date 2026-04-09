@@ -9,6 +9,7 @@ DX12Device::DX12Device()
     CreateDebugLayer();
     CreateDXGIFactory();
     CreateDevice();
+    SetMultiSampleQualityLevels();
     LUNA_LOG_INFO("Device has been initialized successfully");
 }
 
@@ -50,7 +51,7 @@ void DX12Device::CreateDXGIFactory()
         if (desc.DedicatedVideoMemory > 0)
         {
             _adapter = candidate;
-            wprintf(L" Selected Adapter: %s\n", desc.Description);
+            LUNA_LOG_INFO("Selected adapter: %ls", desc.Description);
             return;
         }
     }

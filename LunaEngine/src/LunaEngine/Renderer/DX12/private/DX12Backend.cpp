@@ -2,108 +2,116 @@
 #include "LunaEngine/Graphics/IBuffer.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Pipeline.h"
+#include "LunaEngine/Renderer/DX12/Public/DX12Device.h"
 #include "Renderer/DX12/Public/DX12Buffer.h"
 
 namespace Luna
 {
 
+// ---------------------------------------------------------------------------
+// Test geometry — remove once mesh system is in place
+// ---------------------------------------------------------------------------
 struct Vertex
 {
     Vec3 position;
     Vec4 color;
 };
 
-Vertex vertices[] = {
-    {{0.0f, 0.5f, 0.0f}, {1.0f, 0.0f, 0.0f, 0.0f}},  // TOP (RED)
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}}, // Right (Green)
-    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}} // Left (Blue)
+static const Vertex s_Vertices[] = {
+    {{ 0.0f,  0.5f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}}, // top    (red)
+    {{ 0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f, 1.0f}}, // right  (green)
+    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f, 1.0f}}, // left   (blue)
 };
 
-// Constant Buffer
-struct ConstantBufferStruct
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+DX12Backend::~DX12Backend()
 {
-    Matrix4x4 modelMatrix;
-    Matrix4x4 viewMatrix;
-    Matrix4x4 projectionMatrix;
-};
+    Shutdown();
+}
+
+void DX12Backend::Shutdown()
+{
+    if (_fenceEvent)
+    {
+        WaitSync();
+        CloseHandle(_fenceEvent);
+        _fenceEvent = nullptr;
+    }
+}
 
 bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
 {
-    _mainWindow = static_cast<HWND>(windowHandler);
-    _screenViewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0.0f, 1.0f};
-
-    _scissorRect = CD3DX12_RECT(0, 0, width, height); // NOLINT(bugprone-narrowing-conversions)
+    _mainWindow     = static_cast<HWND>(windowHandler);
+    _screenViewport = {0.0f, 0.0f, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0.0f, 1.0f};
+    _scissorRect    = CD3DX12_RECT(0, 0, static_cast<LONG>(width), static_cast<LONG>(height));
     SetResolution(width, height);
-    if (!CreateCommandQueueAndFenceEvent())
-        return false;
-    if (!CreateSwapChain())
-        return false;
-    if (!CreateRenderTarget())
-        return false;
-    if (!CreateImGuiRenderTarget())
-        return false;
-    
-    std::cout << "DX12 Initialization is Successful" << endl;
 
-    ConstantBufferStruct cbData = {};
-    
+    // Device and factory are created by DX12Device
+    _dx12Device   = std::make_unique<DX12Device>();
+    _device       = _dx12Device->GetDeviceComPtr();
+    _mdxgiFactory = _dx12Device->GetDXGIFactory();
+
+    if (!CreateCommandQueueAndFenceEvent()) return false;
+    if (!CreateSwapChain())                return false;
+    if (!CreateRenderTarget())             return false;
+    if (!CreateImGuiRenderTarget())        return false;
+
     _trianglePipeline = std::make_unique<DX12Pipeline>();
     PipelineStateDesc desc;
-    if (!_trianglePipeline->Initialize(_device,
-        L"triangle.vert.hlsl",
-        L"triangle.frag.hlsl",
-        desc))
+    if (!_trianglePipeline->Initialize(_device, L"triangle.vert.hlsl", L"triangle.frag.hlsl", desc))
     {
-        std::cerr << "Failed to initialize triangle pipeline" << std::endl;
+        LUNA_LOG_ERROR("Failed to initialize triangle pipeline");
         return false;
     }
+
+    LUNA_LOG_INFO("DX12 backend initialized successfully");
     return true;
 }
 
-bool DX12Backend::CheckIfImGuiData()
-{
-    auto *drawData = ImGui::GetDrawData();
-    if (!drawData)
-    {
-        std::cout << "[ImGui] DrawData is null. Nothing to render.\n";
-        return false;
-    }
-    return true;
-}
-
+// ---------------------------------------------------------------------------
+// Synchronization
+// ---------------------------------------------------------------------------
 bool DX12Backend::CreateCommandQueueAndFenceEvent()
 {
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queueDesc.Type     = D3D12_COMMAND_LIST_TYPE_DIRECT;
     queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queueDesc.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
 
-    HRESULT hr = _device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&_commandQueue));
-    if (FAILED(hr))
+    if (FAILED(_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&_commandQueue))))
     {
-        std::cout << "Failed to Create D3D12 Command Queue" << std::endl;
+        LUNA_LOG_ERROR("Failed to create D3D12 command queue");
         return false;
     }
 
-    // - D3D12_COMMAND_LIST_TYPE_DIRECT: CommandList by GPU.
-    _device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                    IID_PPV_ARGS(&_commandAllocator));
+    if (FAILED(_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&_commandAllocator))))
+    {
+        LUNA_LOG_ERROR("Failed to create command allocator");
+        return false;
+    }
 
-    _device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _commandAllocator.Get(), nullptr,
-                               IID_PPV_ARGS(&_commandList));
-
+    if (FAILED(_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          _commandAllocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&_commandList))))
+    {
+        LUNA_LOG_ERROR("Failed to create command list");
+        return false;
+    }
     _commandList->Close();
 
-    hr = _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS((&_fence)));
-    if (FAILED(hr))
+    if (FAILED(_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fence))))
     {
-        std::cout << "Failed to Create Fence" << std::endl;
+        LUNA_LOG_ERROR("Failed to create fence");
         return false;
     }
+
     _fenceEvent = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (_fenceEvent == nullptr)
+    if (!_fenceEvent)
     {
-        std::cout << "Failed Create Fence Event" << std::endl;
+        LUNA_LOG_ERROR("Failed to create fence event");
         return false;
     }
 
@@ -112,74 +120,61 @@ bool DX12Backend::CreateCommandQueueAndFenceEvent()
 
 void DX12Backend::WaitSync()
 {
-    _fenceValue++;
-
-    // GPU TIME LINE //
+    ++_fenceValue;
     _commandQueue->Signal(_fence.Get(), _fenceValue);
 
-    // Wait until the GPU has Completed commands up to this fence point
     if (_fence->GetCompletedValue() < _fenceValue)
     {
-        // Fire Event when GPU hits currenct fence value
         _fence->SetEventOnCompletion(_fenceValue, _fenceEvent);
-
-        // Wait until the GPU hitss current fence event is fired
         WaitForSingleObject(_fenceEvent, INFINITE);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Swap chain & render targets
+// ---------------------------------------------------------------------------
 bool DX12Backend::CreateSwapChain()
 {
-    _swapChain.Reset(); 
-    DXGI_SWAP_CHAIN_DESC1 scDesc1 = {};
-    scDesc1.Width = static_cast<UINT>(_screenWidth);
-    scDesc1.Height = static_cast<UINT>(_screenHeight);
-    scDesc1.Format = mBackBufferFormat;
-    scDesc1.Stereo = FALSE;
-    scDesc1.SampleDesc.Count = (m4xMsaaQuality > 1) ? 4 : 1;
-    scDesc1.SampleDesc.Quality = (m4xMsaaQuality > 1) ? (m4xMsaaQuality - 1) : 0;
-    scDesc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scDesc1.BufferCount = SWAP_CHAIN_BUFFER_COUNT;
-    scDesc1.Scaling = DXGI_SCALING_STRETCH;
-    scDesc1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    scDesc1.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-    scDesc1.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    _swapChain.Reset();
+
+    UINT msaaQuality = _dx12Device->GetMSAAQuality();
+
+    DXGI_SWAP_CHAIN_DESC1 scDesc = {};
+    scDesc.Width       = static_cast<UINT>(_screenWidth);
+    scDesc.Height      = static_cast<UINT>(_screenHeight);
+    scDesc.Format      = _backBufferFormat;
+    scDesc.Stereo      = FALSE;
+    scDesc.SampleDesc.Count   = (msaaQuality > 1) ? 4 : 1;
+    scDesc.SampleDesc.Quality = (msaaQuality > 1) ? (msaaQuality - 1) : 0;
+    scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scDesc.BufferCount = SWAP_CHAIN_BUFFER_COUNT;
+    scDesc.Scaling     = DXGI_SCALING_STRETCH;
+    scDesc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scDesc.AlphaMode   = DXGI_ALPHA_MODE_UNSPECIFIED;
+    scDesc.Flags       = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc = {};
-    fsDesc.RefreshRate.Numerator = 60;
+    fsDesc.RefreshRate.Numerator   = 60;
     fsDesc.RefreshRate.Denominator = 1;
-    fsDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
-    fsDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
-    fsDesc.Windowed = TRUE;
-    
-    ComPtr<IDXGISwapChain1> tempSwapChain1;
-    HRESULT hr = _mdxgiFactory->CreateSwapChainForHwnd(_commandQueue.Get(), _mainWindow, &scDesc1,
-        &fsDesc, nullptr, &tempSwapChain1);
+    fsDesc.ScanlineOrdering        = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+    fsDesc.Scaling                 = DXGI_MODE_SCALING_UNSPECIFIED;
+    fsDesc.Windowed                = TRUE;
+
+    ComPtr<IDXGISwapChain1> tempSwapChain;
+    HRESULT hr = _mdxgiFactory->CreateSwapChainForHwnd(
+        _commandQueue.Get(), _mainWindow, &scDesc, &fsDesc, nullptr, &tempSwapChain);
 
     if (FAILED(hr))
     {
-        std::cerr << "Failed to create SwapChainForHwnd: " << std::hex << hr << std::endl;
+        LUNA_LOG_ERROR("CreateSwapChainForHwnd failed: HRESULT 0x%08lX", static_cast<unsigned long>(hr));
         return false;
     }
 
-    hr = tempSwapChain1.As(&_swapChain);
+    hr = tempSwapChain.As(&_swapChain);
     if (FAILED(hr))
     {
-        std::cerr << "Failed to cast SwapChain1 to SwapChain4: " << std::hex << hr << std::endl;
+        LUNA_LOG_ERROR("SwapChain1 -> SwapChain4 cast failed: HRESULT 0x%08lX", static_cast<unsigned long>(hr));
         return false;
-    }
-
-    for (UINT i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i)
-    {
-        ComPtr<ID3D12Resource> buffer;
-        hr = _swapChain->GetBuffer(i, IID_PPV_ARGS(&buffer));
-        if (FAILED(hr))
-        {
-            std::cerr << "Failed to get buffer " << i << ": " << std::hex << hr << std::endl;
-            return false;
-        }
-
-        _rtvBuffer[i] = buffer;
     }
 
     return true;
@@ -188,26 +183,27 @@ bool DX12Backend::CreateSwapChain()
 bool DX12Backend::CreateRenderTarget()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heapDesc.NumDescriptors = SWAP_CHAIN_BUFFER_COUNT;
-    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    heapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
-    HRESULT hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_rtvHeap));
-
-    if (FAILED(hr))
+    if (FAILED(_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_rtvHeap))))
     {
-        std::cout << "Failed to Create RenderTarget" << std::endl;
+        LUNA_LOG_ERROR("Failed to create RTV descriptor heap");
         return false;
     }
 
-    UINT _rtvHeapSize = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    UINT rtvSize = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE heapStart = _rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapBegin = _rtvHeap->GetCPUDescriptorHandleForHeapStart();
-
-    for (int i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i)
+    for (UINT i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i)
     {
-        _swapChain->GetBuffer(i, IID_PPV_ARGS(&_rtvBuffer[i]));
-        _rtvHandle[i].ptr = rtvHeapBegin.ptr + i * _rtvHeapSize;
+        if (FAILED(_swapChain->GetBuffer(i, IID_PPV_ARGS(&_rtvBuffer[i]))))
+        {
+            LUNA_LOG_ERROR("Failed to get swap chain buffer");
+            return false;
+        }
+        _rtvHandle[i].ptr = heapStart.ptr + i * rtvSize;
         _device->CreateRenderTargetView(_rtvBuffer[i].Get(), nullptr, _rtvHandle[i]);
     }
     return true;
@@ -215,83 +211,106 @@ bool DX12Backend::CreateRenderTarget()
 
 bool DX12Backend::CreateImGuiRenderTarget()
 {
-    D3D12_DESCRIPTOR_HEAP_DESC imguiHeapDesc = {};
-    imguiHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    imguiHeapDesc.NumDescriptors = 1;
-    imguiHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 1;
+    heapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
-    HRESULT hr = _device->CreateDescriptorHeap(&imguiHeapDesc, IID_PPV_ARGS(&_imGuiSrvHeap));
-
-    if (FAILED(hr))
+    if (FAILED(_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_imGuiSrvHeap))))
     {
-        std::cout << "Failed to Create RenderTarget for IMGUI" << std::endl;
+        LUNA_LOG_ERROR("Failed to create ImGui SRV descriptor heap");
         return false;
     }
     return true;
 }
 
-void DX12Backend::SetResolution(const uint32_t &width, const uint32_t &height)
-{
-    _screenWidth = width;
-    _screenHeight = height;
-}
-
-void DX12Backend::SetPipelineState(D3D12_PRIMITIVE_TOPOLOGY topology, const D3D12_VIEWPORT *viewport,
-    const D3D12_RECT *scissorRect)
-{
-    _commandList->RSSetViewports(1, viewport);
-    _commandList->RSSetScissorRects(1, scissorRect);
-    _commandList->IASetPrimitiveTopology(topology);
-}
-
-D3D12_CPU_DESCRIPTOR_HANDLE DX12Backend::GetBackBufferView()
-{
-    return GetRTV(_swapChain->GetCurrentBackBufferIndex());
-}
-
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
 void DX12Backend::BeginFrame()
 {
     _commandAllocator->Reset();
     _commandList->Reset(_commandAllocator.Get(), nullptr);
 
+    UINT backIdx = _swapChain->GetCurrentBackBufferIndex();
     D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        GetCurrentBackBufferResource().Get(), D3D12_RESOURCE_STATE_PRESENT,
+        _rtvBuffer[backIdx].Get(),
+        D3D12_RESOURCE_STATE_PRESENT,
         D3D12_RESOURCE_STATE_RENDER_TARGET);
-
     _commandList->ResourceBarrier(1, &barrier);
+
     _commandList->RSSetViewports(1, &_screenViewport);
     _commandList->RSSetScissorRects(1, &_scissorRect);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE backBufferView = GetBackBufferView();
-    const FLOAT clearColor[] = { 0.0f, 0.0f, 1.0f, 1.0f }; // Blue background
-    _commandList->ClearRenderTargetView(backBufferView, clearColor, 0, nullptr);
-    _commandList->OMSetRenderTargets(1, &backBufferView, FALSE, nullptr);
+    const FLOAT clearColor[] = {0.1f, 0.1f, 0.1f, 1.0f};
+    _commandList->ClearRenderTargetView(_rtvHandle[backIdx], clearColor, 0, nullptr);
+    _commandList->OMSetRenderTargets(1, &_rtvHandle[backIdx], FALSE, nullptr);
 }
 
+void DX12Backend::DrawFrame()
+{
+    BindPipeline(_trianglePipeline.get());
+    SetPipelineState(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, &_screenViewport, &_scissorRect);
+    Draw(3);
+}
+
+void DX12Backend::EndFrame()
+{
+    UINT backIdx = _swapChain->GetCurrentBackBufferIndex();
+    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        _rtvBuffer[backIdx].Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PRESENT);
+    _commandList->ResourceBarrier(1, &barrier);
+    _commandList->Close();
+
+    ID3D12CommandList* lists[] = {_commandList.Get()};
+    _commandQueue->ExecuteCommandLists(_countof(lists), lists);
+    _swapChain->Present(1, 0); // vsync on; use Present(0,0) for uncapped
+
+    WaitSync();
+}
+
+void DX12Backend::Resize(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0) return;
+
+    WaitSync();
+    SetResolution(width, height);
+
+    _screenViewport = {0.0f, 0.0f, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0.0f, 1.0f};
+    _scissorRect    = CD3DX12_RECT(0, 0, static_cast<LONG>(width), static_cast<LONG>(height));
+
+    for (UINT i = 0; i < SWAP_CHAIN_BUFFER_COUNT; ++i)
+        _rtvBuffer[i].Reset();
+
+    _swapChain->ResizeBuffers(SWAP_CHAIN_BUFFER_COUNT, width, height, _backBufferFormat, 0);
+    CreateRenderTarget();
+}
+
+// ---------------------------------------------------------------------------
+// ImGui
+// ---------------------------------------------------------------------------
 void DX12Backend::InitImGui(void *windowHandler)
 {
     IMGUI_CHECKVERSION();
-    auto window = static_cast<GLFWwindow *>(windowHandler);
-    if (!window)
-    {
-        std::cout << "Casting Failed" << std::endl;
-    }
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     ImGui::StyleColorsDark();
 
+    auto *window = static_cast<GLFWwindow *>(windowHandler);
     ImGui_ImplGlfw_InitForOther(window, true);
-    if (!ImGui_ImplDX12_Init(_device.Get(), SWAP_CHAIN_BUFFER_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
-                             _imGuiSrvHeap.Get(),
-                             _imGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
-                             _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart()))
+
+    if (!ImGui_ImplDX12_Init(_device.Get(), SWAP_CHAIN_BUFFER_COUNT, _backBufferFormat,
+                              _imGuiSrvHeap.Get(),
+                              _imGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+                              _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart()))
     {
-        std::cout << "ImGui_ImplDX12_Init failed!" << std::endl;
+        LUNA_LOG_ERROR("ImGui_ImplDX12_Init failed");
         return;
     }
-
     ImGui_ImplDX12_CreateDeviceObjects();
 }
 
@@ -305,26 +324,20 @@ void DX12Backend::StartImGui()
 void DX12Backend::RenderImGui()
 {
     ImGui::Render();
+
 #if defined(_DEBUG)
-    if (!CheckIfImGuiData())
-        return;
+    if (!CheckIfImGuiData()) return;
 #endif
+
     ID3D12DescriptorHeap *heaps[] = {_imGuiSrvHeap.Get()};
     _commandList->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
+
     if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
     }
-}
-
-void DX12Backend::DrawFrame()
-{
-    BindPipeline(_trianglePipeline.get());
-    // SetVertexBuffer(.get());
-    SetPipelineState(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, &_screenViewport, &_scissorRect);
-    Draw(3);
 }
 
 void DX12Backend::ShutdownImGui()
@@ -334,32 +347,9 @@ void DX12Backend::ShutdownImGui()
     ImGui::DestroyContext();
 }
 
-void DX12Backend::EndFrame()
-{
-    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        GetCurrentBackBufferResource().Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-        D3D12_RESOURCE_STATE_PRESENT);
-
-    _commandList->ResourceBarrier(1, &barrier);
-    ID3D12CommandList *cmdListArr[] = {_commandList.Get()};
-    _commandList->Close();
-    _commandQueue->ExecuteCommandLists(_countof(cmdListArr), cmdListArr);
-    _swapChain->Present(0, 0);
-
-    WaitSync();
-
-    _backbufferIndex = (_backbufferIndex + 1) % SWAP_CHAIN_BUFFER_COUNT;
-}
-
-void DX12Backend::Resize(uint32_t width, uint32_t height)
-{
-}
-
-const char *DX12Backend::GetBackendName() const
-{
-    return "DirectX 12";
-}
-
+// ---------------------------------------------------------------------------
+// Draw calls
+// ---------------------------------------------------------------------------
 void DX12Backend::Draw(uint32_t vertexCount)
 {
     _commandList->DrawInstanced(vertexCount, 1, 0, 0);
@@ -367,21 +357,54 @@ void DX12Backend::Draw(uint32_t vertexCount)
 
 void DX12Backend::SetVertexBuffer(IBuffer *buffer)
 {
-    // TODO: Maybe use static_cast
-    auto dxBuffer = dynamic_cast<DX12Buffer*>(buffer);
+    auto *dxBuffer = static_cast<DX12Buffer *>(buffer);
     _commandList->IASetVertexBuffers(0, 1, dxBuffer->GetVBView());
 }
 
 void DX12Backend::BindPipeline(IPipeline *pipeline)
 {
-    // TODO: Maybe use static_cast
-    auto dx = dynamic_cast<DX12Pipeline*>(pipeline);
-    if (!dx)
-    {
-        std::cerr << "[DX12Backend] BindPipeline failed: pipeline is not a DX12Pipeline." << std::endl;
-        return;
-    }
+    auto *dx = static_cast<DX12Pipeline *>(pipeline);
     _commandList->SetGraphicsRootSignature(dx->GetRootSignature().Get());
     _commandList->SetPipelineState(dx->GetPipelineState().Get());
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+bool DX12Backend::CheckIfImGuiData()
+{
+    auto *drawData = ImGui::GetDrawData();
+    if (!drawData)
+    {
+        LUNA_LOG_WARN("[ImGui] DrawData is null — nothing to render");
+        return false;
+    }
+    return true;
+}
+
+void DX12Backend::SetResolution(const uint32_t &width, const uint32_t &height)
+{
+    _screenWidth  = static_cast<int>(width);
+    _screenHeight = static_cast<int>(height);
+}
+
+void DX12Backend::SetPipelineState(D3D12_PRIMITIVE_TOPOLOGY topology,
+                                    const D3D12_VIEWPORT *viewport,
+                                    const D3D12_RECT *scissorRect)
+{
+    if (viewport)    _commandList->RSSetViewports(1, viewport);
+    if (scissorRect) _commandList->RSSetScissorRects(1, scissorRect);
+    _commandList->IASetPrimitiveTopology(topology);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE DX12Backend::GetBackBufferView()
+{
+    return _rtvHandle[_swapChain->GetCurrentBackBufferIndex()];
+}
+
+ComPtr<ID3D12Resource> DX12Backend::GetCurrentBackBufferResource() const
+{
+    return _rtvBuffer[_swapChain->GetCurrentBackBufferIndex()];
+}
+
 } // namespace Luna

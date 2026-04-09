@@ -32,16 +32,16 @@ class VulkanBackend : public IRenderBackend
     const char *GetBackendName() const override { return "Vulkan"; }
     
   private:
-    void SetupImGui();
-    void SetupVulkanWindow(ImGui_ImplVulkanH_Window* wd, VkSurfaceKHR surface, int width, int height);
     bool CreateInstance();
     bool CreateSurface(void *windowHandle);
+    bool CreateImGuiDescriptorPool();
+    void SetupVulkanWindow(ImGui_ImplVulkanH_Window *wd, VkSurfaceKHR surface, int width, int height);
 
-    ImGui_ImplVulkanH_Window        _windowData;
-    VkInstance                      _instance;
-    VkSurfaceKHR                    _surface;
-    std::unique_ptr<VulkanDevice>   _device;
-    VkDescriptorPool                _imguiDescriptorPool;
-    int                             _minImageCount = 2;
+    ImGui_ImplVulkanH_Window      _windowData;
+    VkInstance                    _instance;
+    VkSurfaceKHR                  _surface;
+    std::unique_ptr<VulkanDevice> _device;
+    VkDescriptorPool              _imguiDescriptorPool;
+    int                           _minImageCount = 2;
 };
 } // namespace Luna

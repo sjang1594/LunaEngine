@@ -9,8 +9,10 @@ public:
     DX12Device();
     ~DX12Device() override = default;
     const char* GetDeviceName() const override { return "DirectX12"; }
-    ID3D12Device* GetDevice() const { return _device.Get(); }
-    ComPtr<IDXGIFactory6> GetDXGIFactory() const { return _mdxgiFactory; }
+
+    ComPtr<ID3D12Device>  GetDeviceComPtr() const { return _device; }
+    ComPtr<IDXGIFactory6> GetDXGIFactory()  const { return _mdxgiFactory; }
+    UINT                  GetMSAAQuality()  const { return m4xMsaaQuality; }
 
 private:
     void CreateDebugLayer();
