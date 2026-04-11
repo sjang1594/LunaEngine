@@ -17,9 +17,9 @@ struct PipelineStateDesc
     VertexLayout vertexLayout    = VertexLayout::Triangle;
 };
 
-class IPipelineState
+class IPipeline
 {
 public:
-    virtual ~IPipelineState() = default;
+    virtual ~IPipeline() = default;
 };
 } // namespace Luna

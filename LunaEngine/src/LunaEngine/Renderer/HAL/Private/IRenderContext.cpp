@@ -1,4 +1,5 @@
 #include "LunaPCH.h"
+<<<<<<<< Updated upstream:LunaEngine/src/LunaEngine/Renderer/HAL/Private/IRenderContext.cpp
 #include "LunaEngine/Renderer/HAL/Public/IRenderContext.h"
 
 #include "Logger/Logger.h"
@@ -125,3 +126,7 @@ RenderBackendType IRenderContext::GetCurrentBackendType()
     return s_BackendType;
 }
 } // namespace Luna
+========
+// Superseded by Renderer/HAL/Private/IRenderContext.cpp during the HAL refactor.
+// This file is intentionally empty — do not add definitions here.
+>>>>>>>> Stashed changes:LunaEngine/src/LunaEngine/Renderer/IRenderContext.cpp

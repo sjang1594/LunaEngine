@@ -1,6 +1,10 @@
 #pragma once
 
+// _HAS_STD_BYTE must be defined before any STL / Windows SDK header that references std::byte
+#define _HAS_STD_BYTE 0
+
 // STL
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -11,17 +15,10 @@
 #include <memory>
 #include <string>
 #include <tchar.h>
+#include <unordered_map>
 #include <vector>
 #include <windows.h>
 #include <filesystem>
-
-// turn off std::byte
-#define _HAS_STD_BYTE 0
-
-// TODO: Remove these global using-directives — they pollute every translation unit
-// that includes this PCH. Prefer explicit std:: / DirectX:: / Microsoft::WRL::
-// prefixes in source files. Tracked in progress/code-review.md #14.
-using namespace std;
 
 #include <vulkan/vulkan.h>
 
@@ -40,6 +37,9 @@ using namespace std;
 #include <imgui.h>
 
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#endif
 #include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
 
@@ -54,11 +54,34 @@ using namespace std;
 #include <windows.h>
 #include <wrl.h>
 
+// DirectX math types are used pervasively across all rendering code; bringing
+// them in at PCH level avoids thousands of DirectX:: qualifications.
+// Microsoft::WRL is intentionally NOT brought in wholesale — use ComPtr<> explicitly.
 using namespace DirectX;
 using namespace DirectX::PackedVector;
-using namespace Microsoft::WRL;
 using Microsoft::WRL::ComPtr;
+
+// Explicit std:: aliases — avoids "using namespace std" polluting all TUs
+// while still allowing unqualified use of the most common standard types.
+using std::array;
+using std::enable_shared_from_this;
+using std::forward;
+using std::function;
+using std::list;
+using std::make_shared;
+using std::make_unique;
+using std::map;
+using std::move;
+using std::pair;
+using std::runtime_error;
+using std::shared_ptr;
+using std::static_pointer_cast;
+using std::string;
+using std::unique_ptr;
+using std::unordered_map;
 using std::vector;
+using std::weak_ptr;
+using std::wstring;
 
 // All Type Def
 using int8 = __int8;
