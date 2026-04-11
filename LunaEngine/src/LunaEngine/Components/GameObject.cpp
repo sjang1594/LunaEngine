@@ -54,6 +54,12 @@ void GameObject::LateUpdate()
     }
 }
 
+shared_ptr<Transform> GameObject::GetTransform() const
+{
+    return static_pointer_cast<Transform>(
+        _components[static_cast<uint8_t>(ComponentType::TRANSFORM)]);
+}
+
 void GameObject::AddComponent(shared_ptr<Component> component)
 {
     component->SetGameObject(shared_from_this());

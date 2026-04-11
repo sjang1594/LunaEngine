@@ -5,7 +5,8 @@ class IRenderDevice
 {
 public:
     virtual ~IRenderDevice() = default;
-    virtual bool Initialize();
-    virtual bool Initialize(VkInstance instance, VkSurfaceKHR surface);
+    // Default no-ops — each backend overrides only the signature it needs.
+    virtual bool Initialize()                                   { return false; }
+    virtual bool Initialize(VkInstance, VkSurfaceKHR)          { return false; }
     virtual const char* GetDeviceName() const = 0;
 };

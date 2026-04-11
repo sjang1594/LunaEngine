@@ -1,5 +1,6 @@
 #include "LunaPCH.h"
 #include "LunaEngine/Application/Application.h"
+#include "Manager/SceneManager.h"
 #include "stb_image.h"
 
 #include "Logger/Logger.h"
@@ -20,6 +21,9 @@ namespace Luna
 {
 Application::Application(ApplicationSpecification applicationSpecification)
     : _specification(std::move(applicationSpecification))
+    , _camera(45.0f,
+              static_cast<float>(_specification.width) / static_cast<float>(_specification.height),
+              0.1f, 500.0f)
 {
     g_instance = this;
     Init();
@@ -63,9 +67,9 @@ void Application::Init()
 #ifdef __APPLE__
     glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_TRUE);
 #endif
-    
-    _windowHandle = glfwCreateWindow(_specification.width,_specification.height,
-                                 _specification.name.c_str(), nullptr, nullptr);
+
+    _windowHandle = glfwCreateWindow(_specification.width, _specification.height,
+                                     _specification.name.c_str(), nullptr, nullptr);
     if (!_windowHandle)
     {
         LUNA_LOG_ERROR("Failed to create GLFW window!");
@@ -76,14 +80,23 @@ void Application::Init()
     if (_specification.centerWindow)
     {
         glfwSetWindowPos(_windowHandle,
-            monitorX + (videoMode->width - _specification.width) * 0.5,
-            monitorY + (videoMode->height - _specification.height) * 0.5);
-        glfwSetWindowAttrib(_windowHandle, GLFW_RESIZABLE, _specification.windowResizeable ? GLFW_TRUE : GLFW_FALSE);
+            monitorX + (videoMode->width  - _specification.width)  / 2,
+            monitorY + (videoMode->height - _specification.height) / 2);
+        glfwSetWindowAttrib(_windowHandle, GLFW_RESIZABLE,
+                            _specification.windowResizeable ? GLFW_TRUE : GLFW_FALSE);
     }
 
     glfwShowWindow(_windowHandle);
 
-    GLFWimage icon;
+    // Register GLFW callbacks
+    glfwSetWindowUserPointer(_windowHandle, this);
+    glfwSetFramebufferSizeCallback(_windowHandle, OnFramebufferResize);
+    glfwSetCursorPosCallback(_windowHandle,  OnMouseMove);
+    glfwSetMouseButtonCallback(_windowHandle, OnMouseButton);
+    glfwSetScrollCallback(_windowHandle,     OnScroll);
+
+    // Load icon
+    GLFWimage icon = {};
     if (!_specification.iconPath.empty())
     {
         int channels;
@@ -100,6 +113,7 @@ void Application::Init()
         }
     }
 
+    // Initialize render backend
     if (_specification.backend == RenderBackendType::DirectX12)
     {
 #ifdef _WIN32
@@ -125,7 +139,15 @@ void Application::Init()
     {
         LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
     }
+
+    // P2-04: propagate vsync preference to the backend before any frames are rendered
+    IRenderContext::SetVSync(_specification.vsync);
+
     IRenderContext::InitImGui(_windowHandle);
+
+    // Load the initial test scene (glTF mesh upload happens here)
+    SceneManager::GetInstance()->LoadScene(L"Test");
+
     _lastFrameTime = GetTime();
     LUNA_LOG_INFO("Application initialized!");
 }
@@ -136,9 +158,27 @@ void Application::Run()
     while (ShouldContinueRunning())
     {
         glfwPollEvents();
-        float time = GetTime();
-        _frameTime = time - _lastFrameTime;
+
+        float time   = GetTime();
+        _frameTime   = time - _lastFrameTime;
         _lastFrameTime = time;
+
+        // ----------------------------------------------------------------
+        // Update MVP from orbital camera — must happen before BeginFrame
+        // so the correct CB data is memcpy'd before GPU submission
+        // ----------------------------------------------------------------
+        {
+            XMMATRIX model = XMMatrixIdentity();
+            XMMATRIX view  = _camera.GetViewMatrix();
+            XMMATRIX proj  = _camera.GetProjectionMatrix();
+
+            XMFLOAT4X4 modelF, viewF, projF;
+            XMStoreFloat4x4(&modelF, model);
+            XMStoreFloat4x4(&viewF,  view);
+            XMStoreFloat4x4(&projF,  proj);
+
+            IRenderContext::UpdateMVP(modelF, viewF, projF);
+        }
 
         IRenderContext::BeginFrame();
         IRenderContext::StartImGuiFrame();
@@ -149,7 +189,7 @@ void Application::Run()
                 _menubarCallBack();
             ImGui::EndMainMenuBar();
         }
-        
+
         ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::DockSpaceOverViewport(ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
         ImGui::PopStyleColor();
@@ -158,8 +198,14 @@ void Application::Run()
             layer->OnUpdate(_frameTime);
         for (auto &layer : _layerStack)
             layer->OnUIRender();
+
         ImGui::ShowDemoWindow();
         IRenderContext::DrawFrame();
+
+        // Scene update: calls MeshRenderer::Render() per object, which records
+        // DrawIndexedInstanced into the open command list via IRenderContext::DrawMesh().
+        SceneManager::GetInstance()->Update();
+
         IRenderContext::RenderImGui();
         IRenderContext::EndFrame();
     }
@@ -168,6 +214,10 @@ void Application::Run()
 void Application::Shutdown()
 {
     if (!_windowHandle) return;
+
+    // Reset scene before backend shutdown: destroys GameObjects → MeshRenderers →
+    // releases shared_ptr<Mesh> refs so ~Mesh() fires while D3D12MA allocator is alive.
+    SceneManager::GetInstance()->ResetActiveScene();
 
     for (auto &layer : _layerStack)
         layer->OnDetach();
@@ -215,4 +265,55 @@ float Application::GetTime() const
 {
     return static_cast<float>(glfwGetTime());
 }
+
+// ---------------------------------------------------------------------------
+// GLFW static callbacks — retrieve the Application* from the user pointer
+// ---------------------------------------------------------------------------
+void Application::OnFramebufferResize(GLFWwindow* w, int width, int height)
+{
+    if (width == 0 || height == 0) return;
+    auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
+    IRenderContext::Resize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    app->_camera.SetAspect(static_cast<float>(width) / static_cast<float>(height));
+}
+
+void Application::OnMouseButton(GLFWwindow* w, int button, int action, int /*mods*/)
+{
+    auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
+    if (button == GLFW_MOUSE_BUTTON_LEFT)
+    {
+        if (action == GLFW_PRESS)
+        {
+            app->_mouseDown = true;
+            glfwGetCursorPos(w, &app->_lastMouseX, &app->_lastMouseY);
+        }
+        else if (action == GLFW_RELEASE)
+        {
+            app->_mouseDown = false;
+        }
+    }
+}
+
+void Application::OnMouseMove(GLFWwindow* w, double x, double y)
+{
+    auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
+    if (!app->_mouseDown) return;
+
+    // Sensitivity: 0.3 degrees per pixel
+    constexpr float kSensitivity = 0.3f;
+    float dYaw   = static_cast<float>(x - app->_lastMouseX) * kSensitivity;
+    float dPitch = static_cast<float>(y - app->_lastMouseY) * kSensitivity;
+
+    app->_camera.Orbit(dYaw, dPitch);
+    app->_lastMouseX = x;
+    app->_lastMouseY = y;
+}
+
+void Application::OnScroll(GLFWwindow* w, double /*xOffset*/, double yOffset)
+{
+    auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
+    // Positive yOffset = scroll up = zoom in (decrease radius)
+    app->_camera.Zoom(static_cast<float>(yOffset) * 0.5f);
+}
+
 } // namespace Luna

@@ -5,7 +5,7 @@
 namespace Luna
 {
 
-DX12Shader::DX12Shader(const std::wstring &vsPath, const std::wstring &psPath)
+DX12ShaderProgram::DX12ShaderProgram(const std::wstring &vsPath, const std::wstring &psPath)
 {
     if (!CompileShader(vsPath, "vs_5_0", _vsBlob))
         LUNA_LOG_ERROR("Vertex shader compilation failed: %ls", vsPath.c_str());
@@ -14,7 +14,7 @@ DX12Shader::DX12Shader(const std::wstring &vsPath, const std::wstring &psPath)
         LUNA_LOG_ERROR("Pixel shader compilation failed: %ls", psPath.c_str());
 }
 
-bool DX12Shader::CompileShader(const std::wstring &path, const std::string &target,
+bool DX12ShaderProgram::CompileShader(const std::wstring &path, const std::string &target,
                                 ComPtr<ID3DBlob> &outBlob)
 {
     ComPtr<ID3DBlob> errorBlob;

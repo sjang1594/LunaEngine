@@ -1,5 +1,6 @@
-﻿#pragma once
+#pragma once
 #include "Graphics/IPipeline.h"
+#include <dxcapi.h>
 
 namespace Luna
 {
@@ -12,24 +13,26 @@ class DX12Pipeline : public IPipeline
     bool Initialize(const ComPtr<ID3D12Device> &device, const std::wstring &vsPath,
                     const std::wstring &psPath, const PipelineStateDesc &desc);
 
-    ComPtr<ID3D12PipelineState> GetPipelineState() const
-    {
-        return _pipelineState;
-    }
-    ComPtr<ID3D12RootSignature> GetRootSignature() const
-    {
-        return _rootSignature;
-    }
+    ComPtr<ID3D12PipelineState> GetPipelineState() const { return _pipelineState; }
+    ComPtr<ID3D12RootSignature> GetRootSignature() const { return _rootSignature; }
+
+    // Shared DXC library instances (created once, reused across all pipelines)
+    static ComPtr<IDxcUtils>     s_DxcUtils;
+    static ComPtr<IDxcCompiler3> s_DxcCompiler;
+    static void EnsureDXCInitialized();
 
   private:
-    bool LoadShader(const std::wstring &path, const std::string &target, ComPtr<ID3DBlob> &blob);
+    // Phase 2B: DXC-based shader compilation (SM 6.0+)
+    bool LoadShaderDXC(const std::wstring &path, const std::wstring &target,
+                       ComPtr<IDxcBlob> &outBlob);
     bool CreateRootSignature(const ComPtr<ID3D12Device> &device);
-    bool CreatePipelineState(ComPtr<ID3D12Device> device, ComPtr<ID3DBlob> vs, ComPtr<ID3DBlob> ps);
+    bool CreatePipelineState(const ComPtr<ID3D12Device>& device,
+                             ComPtr<IDxcBlob> vs, ComPtr<IDxcBlob> ps);
 
-    PipelineStateDesc _desc;
+    PipelineStateDesc           _desc;
     ComPtr<ID3D12PipelineState> _pipelineState;
     ComPtr<ID3D12RootSignature> _rootSignature;
-    ComPtr<ID3DBlob> _vsBlob;
-    ComPtr<ID3DBlob> _psBlob;
+    ComPtr<IDxcBlob>            _vsBlob;
+    ComPtr<IDxcBlob>            _psBlob;
 };
 } // namespace Luna

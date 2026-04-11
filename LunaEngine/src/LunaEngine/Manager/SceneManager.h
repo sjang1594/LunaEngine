@@ -20,6 +20,10 @@ public:
     void Update();
     void LoadScene(wstring sceneName);
 
+    // Release the active scene before backend shutdown so D3D12MA allocations
+    // in Mesh objects are freed while the allocator is still alive.
+    void ResetActiveScene() { _activeScene.reset(); }
+
     shared_ptr<Scene> GetActiveScene() { return _activeScene; }
 private:
     shared_ptr<Scene> _activeScene;

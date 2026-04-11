@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *.sln)",
+      "Bash(vendor/bin/premake5.exe vs2022:*)",
+      "Bash(cmd.exe /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\Common7\\\\IDE\\\\devenv.com\" LunaApp.sln /Build \"Debug|x64\" /Project LunaEngine 2>&1')",
+      "Bash(cmd.exe /c \"\\\\\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\\\\\" LunaApp.sln /t:LunaEngine /p:Configuration=Debug /p:Platform=x64 /m /v:minimal 2>&1\")",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" \"LunaApp.sln\" \"/t:LunaEngine\" \"/p:Configuration=Debug\" \"/p:Platform=x64\" \"/m\" \"/v:minimal\")",
+      "Bash(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"LunaApp.sln\" \"/t:LunaEngine\" \"/p:Configuration=Debug;Platform=x64\" \"/m\" \"/v:minimal\"')",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'LunaApp.sln' '/t:LunaEngine' '/p:Configuration=Debug;Platform=x64' '/m' '/v:minimal' 2>&1\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'LunaApp.sln' '/p:Configuration=Debug;Platform=x64' '/m' '/v:minimal' 2>&1\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(powershell.exe -Command \"Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jkuhlmann/cgltf/master/cgltf.h' -OutFile 'vendor/cgltf/cgltf.h'\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'LunaApp.sln' '/p:Configuration=Debug;Platform=x64' '/m' '/v:diagnostic' 2>&1\")",
+      "Bash(ls vendor/imgui/*.vcxproj)",
+      "Bash(powershell.exe -Command \"Get-ChildItem -Path 'C:\\\\' -Recurse -Filter 'imguid.lib' -ErrorAction SilentlyContinue | Select-Object -First 5 FullName\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'LunaApp.sln' '/p:Configuration=Debug;Platform=x64' '/m' '/v:detailed' 2>&1\")",
+      "Bash(grep -rn \"imguid\\\\|pragma comment\" vendor/imgui/*.h)",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'LunaApp\\\\LunaApp.vcxproj' '/p:Configuration=Debug;Platform=x64' '/m' '/v:diagnostic' 2>&1\")",
+      "Bash(cmd /c \"vendor\\\\premake\\\\premake5.exe vs2022 2>&1\")",
+      "Bash(vendor\\\\premake\\\\premake5.exe vs2022:*)",
+      "Bash(cmd.exe /c \"cd /d C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine && vendor\\\\premake\\\\premake5.exe vs2022\")",
+      "Bash(cmd.exe /c \"cd /d C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine && vendor\\\\premake\\\\premake5.exe vs2022 && echo PREMAKE_OK\")",
+      "Bash(cmd.exe /c \"cd /d C:\\\\\\\\Users\\\\\\\\skcjf\\\\\\\\project\\\\\\\\LunaEngine && vendor\\\\\\\\premake\\\\\\\\premake5.exe vs2022 && echo PREMAKE_OK\")",
+      "Bash(powershell.exe -Command \"Set-Location 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine'; & '.\\\\vendor\\\\premake\\\\premake5.exe' vs2022; Write-Host 'DONE' -ForegroundColor Green\")",
+      "Bash(powershell.exe -Command \"Set-Location 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine'; & '.\\\\vendor\\\\bin\\\\premake5.exe' vs2022; Write-Host 'DONE'\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine\\\\LunaEngine.sln' /p:Configuration=Debug /p:Platform=x64 /m /nologo /v:minimal 2>&1\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine\\\\LunaApp.sln' /p:Configuration=Debug /p:Platform=x64 /m /nologo /v:minimal 2>&1\")",
+      "Bash(powershell.exe -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe' 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine\\\\LunaApp.sln' /p:Configuration=Debug /p:Platform=x64 /m /nologo /v:minimal *> 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine\\\\build_errors.txt'; exit 0\")",
+      "Bash(powershell.exe -Command \"Get-Content 'C:\\\\Users\\\\skcjf\\\\project\\\\LunaEngine\\\\build_errors.txt' | Select-String 'error C[0-9]' | Select-Object -First 40 | Out-String\")"
+    ]
+  }
+}

@@ -1,18 +1,18 @@
 ﻿#include "LunaPCH.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Buffer.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
-#include "Renderer/IRenderContext.h"
+#include "Renderer/HAL/Public/IRenderContext.h"
 
 namespace Luna
 {
 
-DX12Buffer::DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint32_t stride)
-    : _usage(usage), _size(size), _stride(stride)
+DX12Buffer::DX12Buffer(ID3D12Device* device, D3D12MA::Allocator* /*allocator*/,
+                       BufferUsage usage, const void *data, uint32_t size, uint32_t stride)
+    : _usage(usage), _size(size), _stride(stride), _deviceRaw(device)
 {
-    if (auto dx12backend = GetBackend())
+    if (device)
     {
         // ROOT Signature START
-        auto device = dx12backend->GetDevice();
         D3D12_HEAP_PROPERTIES heapProps = {};
         heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
     
@@ -25,7 +25,7 @@ DX12Buffer::DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint3
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; // ROW MAJOR
          
-        HRESULT hr = device->CreateCommittedResource(&heapProps,
+        HRESULT hr = _deviceRaw->CreateCommittedResource(&heapProps,
             D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             nullptr,
@@ -64,7 +64,7 @@ DX12Buffer::DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint3
     }
     else
     {
-        assert(false && "IRenderBackend is not DX12Backend");
+        assert(false && "DX12Buffer: null device pointer passed to constructor");
     }
 }
 
@@ -75,14 +75,8 @@ DX12Buffer::~DX12Buffer()
 
 DX12Backend* DX12Buffer::GetBackend() const
 {
-    if (auto backend = IRenderContext::GetBackend())
-    {
-        return dynamic_cast<DX12Backend*>(backend);
-    }
-    else
-    {
-        return nullptr;
-    }
+    // Type is statically known — DX12Buffer is only ever created when the backend is DX12.
+    return static_cast<DX12Backend*>(IRenderContext::GetBackend());
 }
 
 void DX12Buffer::Bind(uint32_t slot)

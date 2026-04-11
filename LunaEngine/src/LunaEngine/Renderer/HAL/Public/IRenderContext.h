@@ -14,6 +14,8 @@ enum class RenderBackendType
 
 namespace Luna
 {
+struct Mesh;  // forward-declared — callers that pass a Mesh* must include Renderer/Mesh.h
+
 class IRenderContext
 {
   public:
@@ -24,12 +26,20 @@ class IRenderContext
     static void DrawFrame();
     static void EndFrame();
     static void Resize(uint32_t width, uint32_t height);
+    static void UpdateMVP(const XMFLOAT4X4& model, const XMFLOAT4X4& view,
+                          const XMFLOAT4X4& proj);
 
-    /* IMGUI Control */ 
+    /* Records a mesh draw into the open command list (call between BeginFrame / EndFrame) */
+    static void DrawMesh(const Mesh* mesh, const XMFLOAT4X4& model);
+
+    /* IMGUI Control */
     static void InitImGui(void *windowHandler);
     static void StartImGuiFrame();
     static void RenderImGui();
     static void ShutdownImGui();
+
+    /* Vsync — delegates to backend::SetVSync(); call after Initialize() */
+    static void SetVSync(bool vsync);
 
     static IRenderBackend *GetBackend();
     static RenderBackendType GetCurrentBackendType();

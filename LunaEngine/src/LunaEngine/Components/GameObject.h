@@ -21,7 +21,7 @@ public:
     void Update();
     void LateUpdate();
 
-    shared_ptr<Transform> GetTransform() const { return nullptr; };
+    shared_ptr<Transform> GetTransform() const;
     void AddComponent(shared_ptr<Component> shared);
     
 private:

@@ -12,9 +12,10 @@ project "LunaApp"
       "../vendor/imgui",
       "../vendor/glfw/include",
       "../vendor/imgui/backends",
-      "../vendor/dxheaders/include",            
-      "../vendor/dxheaders/include/directx",    
+      "../vendor/dxheaders/include",
+      "../vendor/dxheaders/include/directx",
       "../LunaEngine/src",
+      "../LunaEngine/src/LunaEngine",
       "%{IncludeDir.VulkanSDK}",
       "%{IncludeDir.glm}",
    }
@@ -28,6 +29,12 @@ project "LunaApp"
    {
       "LunaEngine"
    }
+
+   -- vcpkg global integration injects its debug/lib/*.lib wildcard into every MSVC project.
+   -- imguid.lib / imgui.lib (vcpkg copies) collide with our vendor ImGui.lib.
+   -- /FORCE:MULTIPLE lets the linker proceed using the first definition (our vendor copy,
+   -- which appears before vcpkg's wildcard glob in the link command).
+   linkoptions { "/FORCE:MULTIPLE" }
 
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
    objdir ("bin-int/" .. outputdir .. "/%{prj.name}")

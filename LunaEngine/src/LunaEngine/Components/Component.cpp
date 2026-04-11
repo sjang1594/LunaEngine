@@ -9,6 +9,11 @@ Component::Component(ComponentType type) : _componentType(type)
 {
 }
 
+ComponentType Component::GetComponentType() const
+{
+    return _componentType;
+}
+
 shared_ptr<GameObject> Component::GetGameObject() const
 {
     return _gameObject.lock();

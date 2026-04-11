@@ -19,6 +19,7 @@ public:
     VkQueue GetGraphicsQueue() const { return _graphicsQueue; }
     VkQueue GetPresentQueue() const { return _presentQueue; }
     uint32_t GetGraphicsQueueFamily() const { return _graphicsQueueFamily; }
+    uint32_t GetPresentQueueFamily()  const { return _presentQueueFamily; }
     
 private:
     bool PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface);

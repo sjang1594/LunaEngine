@@ -72,6 +72,19 @@ void IRenderContext::Resize(uint32_t width, uint32_t height)
         s_Backend->Resize(width, height);
 }
 
+void IRenderContext::UpdateMVP(const XMFLOAT4X4& model, const XMFLOAT4X4& view,
+                               const XMFLOAT4X4& proj)
+{
+    if (s_Backend)
+        s_Backend->UpdateMVP(model, view, proj);
+}
+
+void IRenderContext::DrawMesh(const Mesh* mesh, const XMFLOAT4X4& model)
+{
+    if (s_Backend)
+        s_Backend->DrawMesh(mesh, model);
+}
+
 void IRenderContext::InitImGui(void *windowHandler)
 {
     if (s_Backend)
@@ -94,6 +107,12 @@ void IRenderContext::ShutdownImGui()
 {
     if (s_Backend)
         s_Backend->ShutdownImGui();
+}
+
+void IRenderContext::SetVSync(bool vsync)
+{
+    if (s_Backend)
+        s_Backend->SetVSync(vsync);
 }
 
 IRenderBackend *IRenderContext::GetBackend()

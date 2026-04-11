@@ -15,7 +15,8 @@ enum class ComponentType
 
 enum
 {
-    FIXED_COMPONENT_COUNT = static_cast<uint8_t>(ComponentType::END) - 1
+    // Size to hold all valid component indices (0..END-1 inclusive, NONE slot unused).
+    FIXED_COMPONENT_COUNT = static_cast<uint8_t>(ComponentType::END)
 };
 
 class Component
@@ -27,12 +28,12 @@ public:
     virtual void Start() {}
     virtual void Update() {}
     virtual void LateUpdate() {}
-    
+
     ComponentType GetComponentType() const;
     bool IsValid() { return _gameObject.expired() == false; }
     shared_ptr<GameObject> GetGameObject() const;
     shared_ptr<Transform> GetTransform() const;
-    
+
 protected:
     ComponentType _componentType;
     weak_ptr<GameObject> _gameObject;
