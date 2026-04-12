@@ -1,4 +1,5 @@
 #pragma once
+#ifdef LUNA_VULKAN_ENABLED
 
 #include <LunaEngine/LunaPCH.h>
 #include <LunaEngine/Renderer/HAL/Public/IRenderBackend.h>
@@ -107,3 +108,5 @@ class VulkanBackend : public IRenderBackend
 };
 
 } // namespace Luna
+
+#endif // LUNA_VULKAN_ENABLED

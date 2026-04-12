@@ -1,4 +1,6 @@
 #include "LunaPCH.h"
+#ifdef LUNA_VULKAN_ENABLED
+
 #include "LunaEngine/Renderer/Vulkan/Public/VulkanBackend.h"
 #include "Logger/Logger.h"
 #include "Renderer/Vulkan/Public/VulkanDevice.h"
@@ -182,7 +184,7 @@ void VulkanBackend::BeginFrame()
 
 void VulkanBackend::DrawFrame()
 {
-    // Geometry draw calls go here once VulkanPipeline + MeshRenderer are wired (P4-02).
+    // Geometry draw calls go here once VulkanPipeline + MeshRenderer are wired.
     // For now the render pass stays open; ImGui is drawn in RenderImGui().
 }
 
@@ -319,11 +321,11 @@ void VulkanBackend::Resize(uint32_t width, uint32_t height)
 }
 
 // ===========================================================================
-// Draw call stubs (wired up once VulkanPipeline exists — P4-02)
+// Draw call stubs (wired up once VulkanPipeline exists)
 // ===========================================================================
-void VulkanBackend::Draw(uint32_t /*vertexCount*/)      {}
-void VulkanBackend::SetVertexBuffer(class IBuffer*)     {}
-void VulkanBackend::BindPipeline(class IPipeline*)      {}
+void VulkanBackend::Draw(uint32_t /*vertexCount*/)  {}
+void VulkanBackend::SetVertexBuffer(class IBuffer*) {}
+void VulkanBackend::BindPipeline(class IPipeline*)  {}
 
 // ===========================================================================
 // Private — Instance
@@ -376,7 +378,7 @@ bool VulkanBackend::CreateInstance()
 }
 
 // ===========================================================================
-// Private — Debug messenger (resolves P1-05)
+// Private — Debug messenger
 // ===========================================================================
 bool VulkanBackend::SetupDebugMessenger()
 {
@@ -465,7 +467,6 @@ bool VulkanBackend::CreateSwapchain(uint32_t width, uint32_t height)
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, _surface, &caps);
 
-    // Choose surface format (prefer B8G8R8A8_UNORM / SRGB_NONLINEAR)
     uint32_t formatCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, _surface, &formatCount, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
@@ -479,7 +480,6 @@ bool VulkanBackend::CreateSwapchain(uint32_t width, uint32_t height)
         { chosen = f; break; }
     }
 
-    // Clamp extent to surface capabilities
     VkExtent2D extent;
     if (caps.currentExtent.width != UINT32_MAX)
     {
@@ -491,7 +491,6 @@ bool VulkanBackend::CreateSwapchain(uint32_t width, uint32_t height)
         extent.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
     }
 
-    // One more image than the minimum to reduce latency
     uint32_t imageCount = caps.minImageCount + 1;
     if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount)
         imageCount = caps.maxImageCount;
@@ -521,7 +520,7 @@ bool VulkanBackend::CreateSwapchain(uint32_t width, uint32_t height)
 
     info.preTransform   = caps.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    info.presentMode    = VK_PRESENT_MODE_FIFO_KHR; // vsync — always available
+    info.presentMode    = VK_PRESENT_MODE_FIFO_KHR;
     info.clipped        = VK_TRUE;
 
     if (vkCreateSwapchainKHR(dev, &info, nullptr, &_swapchain) != VK_SUCCESS)
@@ -581,7 +580,6 @@ void VulkanBackend::DestroySwapchain()
 
 void VulkanBackend::RecreateSwapchain()
 {
-    // Render pass is reused — its format matches the surface format which doesn't change
     DestroySwapchain();
     CreateSwapchain(_width, _height);
     CreateFramebuffers();
@@ -609,7 +607,6 @@ bool VulkanBackend::CreateRenderPass()
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments    = &colorRef;
 
-    // External → subpass 0: wait for swapchain image before writing colour
     VkSubpassDependency dep{};
     dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass    = 0;
@@ -636,7 +633,7 @@ bool VulkanBackend::CreateRenderPass()
 }
 
 // ===========================================================================
-// Private — Framebuffers (one per swapchain image)
+// Private — Framebuffers
 // ===========================================================================
 bool VulkanBackend::CreateFramebuffers()
 {
@@ -662,7 +659,7 @@ bool VulkanBackend::CreateFramebuffers()
 }
 
 // ===========================================================================
-// Private — Per-frame command pools / buffers / semaphores / fences
+// Private — Per-frame resources
 // ===========================================================================
 bool VulkanBackend::CreateFrameResources()
 {
@@ -693,7 +690,6 @@ bool VulkanBackend::CreateFrameResources()
             return false;
         }
 
-        // Start signalled so the first BeginFrame doesn't wait indefinitely
         VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
                                      nullptr, VK_FENCE_CREATE_SIGNALED_BIT };
         if (vkCreateFence(dev, &fenceInfo, nullptr, &_frames[i].fence) != VK_SUCCESS)
@@ -714,3 +710,5 @@ bool VulkanBackend::CreateFrameResources()
 }
 
 } // namespace Luna
+
+#endif // LUNA_VULKAN_ENABLED

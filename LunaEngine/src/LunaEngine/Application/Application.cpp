@@ -124,20 +124,22 @@ void Application::Init()
         LUNA_LOG_ERROR("DirectX 12 is only supported on Windows");
 #endif
     }
-    else if (_specification.backend == RenderBackendType::Vulkan)
+    else if (_specification.backend == RenderBackendType::Vulkan ||
+             _specification.backend == RenderBackendType::VulkanMolt)
     {
+#ifdef LUNA_VULKAN_ENABLED
         if (!glfwVulkanSupported())
         {
             LUNA_LOG_ERROR("Vulkan is not supported on this platform");
             glfwTerminate();
             return;
         }
-        IRenderContext::Initialize(RenderBackendType::Vulkan, _windowHandle,
+        IRenderContext::Initialize(_specification.backend, _windowHandle,
                                    _specification.width, _specification.height);
-    }
-    else if (_specification.backend == RenderBackendType::VulkanMolt)
-    {
-        LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
+#else
+        LUNA_LOG_ERROR("Vulkan backend requested but this build was compiled without "
+                       "LUNA_VULKAN_ENABLED. Falling back to no renderer.");
+#endif
     }
 
     // P2-04: propagate vsync preference to the backend before any frames are rendered

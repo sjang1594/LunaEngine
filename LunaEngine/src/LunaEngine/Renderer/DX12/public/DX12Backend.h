@@ -6,6 +6,7 @@
 #include "D3D12MemAlloc.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/HAL/Public/IRenderBackend.h"
+#include "LunaEngine/Renderer/RenderGraph.h"
 
 namespace Luna
 {
@@ -24,10 +25,18 @@ using uint32 = unsigned __int32;
 struct FrameResource
 {
     ComPtr<ID3D12CommandAllocator> cmdAllocator;
-    ComPtr<ID3D12Resource>         mvpCB;
-    void*                          mvpCBMapped  = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS      mvpCBGPUAddr = 0;
-    UINT64                         fenceValue   = 0;
+
+    // b0 — MVP transform constant buffer
+    ComPtr<ID3D12Resource>    mvpCB;
+    void*                     mvpCBMapped  = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS mvpCBGPUAddr = 0;
+
+    // b2 — SceneBuffer constant buffer (PBR pass only)
+    ComPtr<ID3D12Resource>    sceneCB;
+    void*                     sceneCBMapped  = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS sceneCBGPUAddr = 0;
+
+    UINT64 fenceValue = 0;
 };
 
 class DX12Backend : public IRenderBackend
@@ -87,6 +96,8 @@ class DX12Backend : public IRenderBackend
     bool CreateDepthBuffer();
     bool CreateVertexBuffer();
     bool CreateMVPConstantBuffer();
+    bool CreateSceneConstantBuffer();
+    bool CreateFallbackShadowSRV();
     bool InitD3D12MA();
     bool CreateShadowUAV();
 
@@ -194,13 +205,27 @@ class DX12Backend : public IRenderBackend
     // -----------------------------------------------------------------------
     // DXR shadow map
     // -----------------------------------------------------------------------
-    bool                   _dxrSupported      = false;
-    ComPtr<ID3D12Resource> _shadowUAV;          // R32_FLOAT, viewport-sized, UAV-flagged
-    D3D12MA::Allocation*   _shadowUAVAlloc     = nullptr;
-    UINT                   _shadowUAVSRVIndex  = 0; // SRV slot index in _imGuiSrvHeap
+    bool                   _dxrSupported         = false;
+    ComPtr<ID3D12Resource> _shadowUAV;             // R32_FLOAT, viewport-sized, UAV-flagged
+    D3D12MA::Allocation*   _shadowUAVAlloc        = nullptr;
+    UINT                   _shadowUAVSRVIndex     = 0; // SRV slot index in _imGuiSrvHeap
+    UINT                   _fallbackShadowSRVIdx  = 0; // SRV for 1x1 white R32 texture (1.0 = fully lit)
+    ComPtr<ID3D12Resource> _fallbackShadowTex;         // persistent 1x1 R32_FLOAT = 1.0f
+    D3D12MA::Allocation*   _fallbackShadowAlloc   = nullptr;
 
     // DXR pipeline and acceleration structure (forward-declared — included in .cpp)
     std::unique_ptr<class DX12AccelStructure> _accelStructure;
     std::unique_ptr<class DX12RTPipeline>     _rtPipeline;
+
+    // -----------------------------------------------------------------------
+    // Phase 6 — Render Graph
+    // Rebuilt each DrawFrame(); tracks resource states and emits barriers.
+    // -----------------------------------------------------------------------
+    RenderGraph _renderGraph;
+
+    // True when the shadow UAV was transitioned to PIXEL_SHADER_RESOURCE by the
+    // DXR pass and has not yet been restored. DrawMesh() reads it in that state;
+    // the next DrawFrame() restores it to UAV before the new DXR dispatch.
+    bool _shadowInSRVState = false;
 };
 } // namespace Luna

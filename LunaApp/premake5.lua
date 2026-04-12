@@ -30,11 +30,9 @@ project "LunaApp"
       "LunaEngine"
    }
 
-   -- vcpkg global integration injects its debug/lib/*.lib wildcard into every MSVC project.
-   -- imguid.lib / imgui.lib (vcpkg copies) collide with our vendor ImGui.lib.
-   -- /FORCE:MULTIPLE lets the linker proceed using the first definition (our vendor copy,
-   -- which appears before vcpkg's wildcard glob in the link command).
-   linkoptions { "/FORCE:MULTIPLE" }
+   -- vcpkg integration is disabled via Directory.Build.props at the workspace root.
+   -- All third-party dependencies are managed exclusively through premake.
+   -- (Previously needed /FORCE:MULTIPLE to fight vcpkg's imguid.lib injection — no longer required.)
 
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
    objdir ("bin-int/" .. outputdir .. "/%{prj.name}")

@@ -1,10 +1,14 @@
 #include "LunaPCH.h"
-<<<<<<<< Updated upstream:LunaEngine/src/LunaEngine/Renderer/HAL/Private/IRenderContext.cpp
 #include "LunaEngine/Renderer/HAL/Public/IRenderContext.h"
 
 #include "Logger/Logger.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
+
+// Vulkan backend is gated behind LUNA_VULKAN_ENABLED.
+// Excluded from the build until the backend is production-ready.
+#ifdef LUNA_VULKAN_ENABLED
 #include "LunaEngine/Renderer/Vulkan/Public/VulkanBackend.h"
+#endif
 
 namespace Luna
 {
@@ -18,7 +22,13 @@ void IRenderContext::Initialize(RenderBackendType backendType, void *windowHandl
     switch (backendType)
     {
     case RenderBackendType::Vulkan:
+#ifdef LUNA_VULKAN_ENABLED
         s_Backend = std::make_unique<VulkanBackend>();
+#else
+        LUNA_LOG_ERROR("Vulkan backend is not available in this build. "
+                       "Build with LUNA_VULKAN_ENABLED and a valid VULKAN_SDK to enable it.");
+        return;
+#endif
         break;
 
     case RenderBackendType::DirectX12:
@@ -126,7 +136,3 @@ RenderBackendType IRenderContext::GetCurrentBackendType()
     return s_BackendType;
 }
 } // namespace Luna
-========
-// Superseded by Renderer/HAL/Private/IRenderContext.cpp during the HAL refactor.
-// This file is intentionally empty — do not add definitions here.
->>>>>>>> Stashed changes:LunaEngine/src/LunaEngine/Renderer/IRenderContext.cpp

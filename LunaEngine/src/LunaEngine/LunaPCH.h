@@ -20,7 +20,10 @@
 #include <windows.h>
 #include <filesystem>
 
+// Vulkan headers — only included when building the Vulkan backend
+#ifdef LUNA_VULKAN_ENABLED
 #include <vulkan/vulkan.h>
+#endif
 
 // DX12
 #include <directx/d3d12.h>
@@ -33,7 +36,9 @@
 // ImGUI
 #include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_glfw.h>
+#ifdef LUNA_VULKAN_ENABLED
 #include <backends/imgui_impl_vulkan.h>
+#endif
 #include <imgui.h>
 
 #include <GLFW/glfw3.h>
@@ -118,6 +123,7 @@ inline void ThrowIfDXFailed(HRESULT hr, const char* functionName, int lineNumber
 
 #define DX_CHECK(x) ThrowIfDXFailed(x, __FUNCTION__, __LINE__)
 
+#ifdef LUNA_VULKAN_ENABLED
 inline void CheckIfVKFailed(VkResult error)
 {
     if (error == 0)
@@ -126,3 +132,4 @@ inline void CheckIfVKFailed(VkResult error)
     if (error < 0)
         abort();
 }
+#endif // LUNA_VULKAN_ENABLED

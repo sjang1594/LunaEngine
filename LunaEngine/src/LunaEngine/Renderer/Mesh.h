@@ -1,6 +1,8 @@
 #pragma once
 #include <DirectXMath.h>
 #include "D3D12MemAlloc.h"
+#include "Graphics/Material.h"
+#include <memory>
 
 using namespace DirectX;
 
@@ -25,8 +27,12 @@ struct Mesh
 
     D3D12_VERTEX_BUFFER_VIEW vbView = {};
     D3D12_INDEX_BUFFER_VIEW  ibView = {};
-    UINT                     indexCount   = 0;
+    UINT                     indexCount    = 0;
     UINT                     materialIndex = 0;  // index into scene material array
+
+    // PBR material — populated by MeshLoader when the glTF primitive has a material.
+    // Null when the mesh has no material (falls back to mesh-preview pipeline).
+    std::shared_ptr<Material> material;
 
     Mesh() = default;
     ~Mesh()

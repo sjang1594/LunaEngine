@@ -22,9 +22,15 @@ project "LunaEngine"
       "src/LunaEngine/Shaders/*.hlsl",
       "../vendor/imgui/backends/imgui_impl_dx12.cpp",
       "../vendor/imgui/backends/imgui_impl_glfw.cpp",
-      "../vendor/imgui/backends/imgui_impl_vulkan.cpp",
       -- D3D12MA implementation (compiled as a non-PCH translation unit)
       "../vendor/d3d12ma/src/D3D12MemAlloc.cpp",
+   }
+
+   -- Vulkan backend is a work-in-progress — exclude its source tree from the build.
+   -- When ready, add LUNA_VULKAN_ENABLED to defines and remove these exclusions.
+   removefiles {
+      "src/LunaEngine/Renderer/Vulkan/**.cpp",
+      "src/LunaEngine/Renderer/Vulkan/**.h",
    }
 
    includedirs
@@ -41,8 +47,8 @@ project "LunaEngine"
       -- glTF loader (single-header, implementation compiled in MeshLoader.cpp)
       "../vendor/cgltf",
 
-      -- Vulkan
-      "%{IncludeDir.VulkanSDK}",
+      -- Vulkan SDK headers (only when SDK is present)
+      (VULKAN_ENABLED and "%{IncludeDir.VulkanSDK}" or nil),
 
       "../vendor/glfw/include",
       "../vendor/glm",
@@ -59,6 +65,15 @@ project "LunaEngine"
       "../vendor/dxc/lib/x64"
    }
 
+   -- DirectXTex is sourced from the vcpkg installation (no vendor build included).
+   -- vcpkg's wildcard lib injection is disabled via Directory.Build.props, so we reference
+   -- the appropriate config-specific path explicitly here.
+   filter "configurations:Debug"
+      libdirs { "C:/Users/skcjf/vcpkg/installed/x64-windows/debug/lib" }
+   filter "configurations:Release or configurations:Dist"
+      libdirs { "C:/Users/skcjf/vcpkg/installed/x64-windows/lib" }
+   filter {}
+
    links
    {
       "GLFW",
@@ -68,7 +83,7 @@ project "LunaEngine"
       "dxguid",
       "dxcompiler",      -- DXC for HLSL SM 6.x compiling
       "DirectXTex",
-      "%{Library.Vulkan}",
+      (VULKAN_ENABLED and "%{Library.Vulkan}" or nil),
    }
 
    defines
@@ -80,8 +95,11 @@ project "LunaEngine"
    -- Vendor files: disable PCH (they have their own includes and don't need LunaPCH.h)
    filter { "files:../vendor/d3d12ma/src/D3D12MemAlloc.cpp" }
       flags { "NoPCH" }
-   filter { "files:../vendor/imgui/backends/imgui_impl_vulkan.cpp" }
+   filter { "files:../vendor/imgui/backends/imgui_impl_dx12.cpp" }
       flags { "NoPCH" }
+   filter { "files:../vendor/imgui/backends/imgui_impl_glfw.cpp" }
+      flags { "NoPCH" }
+   -- imgui_impl_vulkan.cpp excluded from build (Vulkan not ready)
    filter {}
 
    filter { "files:**.hlsl" }
@@ -108,7 +126,8 @@ project "LunaEngine"
 
       links {
          "d3d12", "dxgi", "dxguid", "dxcompiler",
-         "GLFW", "ImGui", "DirectXTex", "%{Library.Vulkan}"
+         "GLFW", "ImGui", "DirectXTex",
+         (VULKAN_ENABLED and "%{Library.Vulkan}" or nil),
       }
 
    filter "system:macosx"

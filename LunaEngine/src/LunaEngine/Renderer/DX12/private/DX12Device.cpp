@@ -51,12 +51,20 @@ void DX12Device::CreateDXGIFactory()
         if (desc.DedicatedVideoMemory > 0)
         {
             _adapter = candidate;
+
+            // P3-04: persist the real adapter name so GetDeviceName() returns something useful
+            _adapterName = desc.Description;
+            _adapterNameNarrow.resize(_adapterName.size());
+            std::transform(_adapterName.begin(), _adapterName.end(),
+                           _adapterNameNarrow.begin(),
+                           [](wchar_t c) { return static_cast<char>(c < 128 ? c : '?'); });
+
             LUNA_LOG_INFO("Selected adapter: %ls", desc.Description);
             return;
         }
     }
 
-    LUNA_LOG_ERROR("No suitable GPU adapter found.")
+    LUNA_LOG_ERROR("No suitable GPU adapter found.");
 }
 
 void DX12Device::CreateDevice()
@@ -86,5 +94,19 @@ void DX12Device::SetMultiSampleQualityLevels()
     {
         m4xMsaaQuality = msQualityLevels.NumQualityLevels;
     }
+}
+
+// Phase 4A: Query DXR support via ID3D12Device5::CheckFeatureSupport
+bool DX12Device::SupportsDXR() const
+{
+    ComPtr<ID3D12Device5> device5;
+    if (FAILED(_device.As(&device5)))
+        return false;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5 = {};
+    if (FAILED(device5->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))))
+        return false;
+
+    return opts5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
 }
 }

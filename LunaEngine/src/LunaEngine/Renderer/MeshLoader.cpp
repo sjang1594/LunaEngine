@@ -6,7 +6,11 @@
 
 #include "Renderer/MeshLoader.h"
 #include "Renderer/Mesh.h"
+#include "Graphics/Material.h"
+#include "Graphics/Texture.h"
 #include "Logger/Logger.h"
+
+#include <filesystem>
 
 namespace Luna
 {
@@ -71,13 +75,18 @@ ComPtr<ID3D12Resource> MeshLoader::UploadBuffer(
 }
 
 // ---------------------------------------------------------------------------
-// LoadGLTF — parse glTF/GLB, interleave PBRVertex[], upload to GPU
+// LoadGLTF — parse glTF/GLB, interleave PBRVertex[], upload to GPU.
+// When srvHeap/srvDescSize/srvAllocIdx are provided, cgltf materials are parsed
+// and mesh->material is populated with textures + a per-material constant buffer.
 // ---------------------------------------------------------------------------
 std::vector<std::unique_ptr<Mesh>> MeshLoader::LoadGLTF(
     const std::string&          path,
-    ID3D12Device*               /*device*/,
+    ID3D12Device*               device,
     D3D12MA::Allocator*         allocator,
-    ID3D12GraphicsCommandList*  cmdList)
+    ID3D12GraphicsCommandList*  cmdList,
+    ID3D12DescriptorHeap*       srvHeap,
+    UINT                        srvDescSize,
+    UINT*                       srvAllocIdx)
 {
     std::vector<std::unique_ptr<Mesh>> meshes;
 
@@ -99,11 +108,80 @@ std::vector<std::unique_ptr<Mesh>> MeshLoader::LoadGLTF(
         return meshes;
     }
 
+    // Base path for resolving relative texture URIs inside the glTF file
+    const std::filesystem::path gltfDir = std::filesystem::path(path).parent_path();
+
+    const bool loadMaterials = (srvHeap != nullptr) && (srvDescSize > 0)
+                               && (srvAllocIdx != nullptr) && (device != nullptr);
+
     // Staging buffers must stay alive until the caller executes + waits the cmdList
     // We keep them in a local vector that gets moved out via lambda captures (intentionally leaked
     // until the next WaitForFrame in the caller).
     struct StagingEntry { ComPtr<ID3D12Resource> buf; D3D12MA::Allocation* alloc = nullptr; };
     std::vector<StagingEntry> stagingBuffers;
+
+    // Helper: create a null SRV (black/zero) for a slot that has no texture.
+    // Required to avoid unbound resource errors on the GPU.
+    auto WriteNullSRV = [&](UINT slotIndex)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+        cpuHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+                        + static_cast<SIZE_T>(slotIndex) * srvDescSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+        nullDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullDesc.Texture2D.MipLevels     = 1;
+        device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+    };
+
+    // Helper: load a texture from a cgltf_image and write its SRV into slotIndex.
+    // Handles both external URI textures and GLB-embedded buffer_view textures.
+    // Returns the shared_ptr<Texture> on success, nullptr (+ null SRV) on failure.
+    auto LoadTextureSRV = [&](const cgltf_image* img, UINT slotIndex) -> std::shared_ptr<Texture>
+    {
+        if (!img)
+        {
+            WriteNullSRV(slotIndex);
+            return nullptr;
+        }
+
+        auto tex = std::make_shared<Texture>();
+        ComPtr<ID3D12Resource> staging;
+        D3D12MA::Allocation*   stagingAlloc = nullptr;
+        bool loaded = false;
+
+        if (img->buffer_view && img->buffer_view->buffer && img->buffer_view->buffer->data)
+        {
+            // GLB embedded image — decode from in-memory bytes (JPEG or PNG)
+            const uint8_t* imgData =
+                static_cast<const uint8_t*>(img->buffer_view->buffer->data)
+                + img->buffer_view->offset;
+            size_t imgSize = img->buffer_view->size;
+            loaded = tex->LoadFromMemory(imgData, imgSize, device, allocator,
+                                         cmdList, staging, &stagingAlloc);
+        }
+        else if (img->uri && img->uri[0] != '\0')
+        {
+            // External texture file referenced by relative URI
+            std::string texPath = (gltfDir / img->uri).string();
+            loaded = tex->Load(texPath, device, allocator, cmdList, staging, &stagingAlloc);
+        }
+
+        if (!loaded)
+        {
+            WriteNullSRV(slotIndex);
+            return nullptr;
+        }
+
+        stagingBuffers.push_back({staging, stagingAlloc});
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+        cpuHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+                        + static_cast<SIZE_T>(slotIndex) * srvDescSize;
+        tex->CreateSRV(device, cpuHandle);
+        return tex;
+    };
 
     for (cgltf_size mi = 0; mi < data->meshes_count; ++mi)
     {
@@ -218,6 +296,82 @@ std::vector<std::unique_ptr<Mesh>> MeshLoader::LoadGLTF(
             mesh->materialIndex = (prim.material)
                 ? static_cast<UINT>(prim.material - data->materials)
                 : 0;
+
+            // ----------------------------------------------------------------
+            // Material loading (Phase 5B) — only when srvHeap is provided
+            // ----------------------------------------------------------------
+            if (loadMaterials && prim.material)
+            {
+                cgltf_material* m = prim.material;
+                auto mat = std::make_shared<Material>();
+
+                // Allocate 3 consecutive SRV slots: albedo(+0), normal(+1), metalRough(+2)
+                mat->srvHeapStartIndex = *srvAllocIdx;
+                *srvAllocIdx += 3;
+
+                // t0 — albedo (base colour texture)
+                const cgltf_image* albedoImg = nullptr;
+                if (m->has_pbr_metallic_roughness &&
+                    m->pbr_metallic_roughness.base_color_texture.texture)
+                    albedoImg = m->pbr_metallic_roughness.base_color_texture.texture->image;
+                mat->albedo = LoadTextureSRV(albedoImg, mat->srvHeapStartIndex + 0);
+
+                // t1 — normal map
+                const cgltf_image* normalImg = nullptr;
+                if (m->normal_texture.texture)
+                    normalImg = m->normal_texture.texture->image;
+                mat->normal = LoadTextureSRV(normalImg, mat->srvHeapStartIndex + 1);
+
+                // t2 — metallic-roughness map (G=roughness, B=metallic per glTF spec)
+                const cgltf_image* metalRoughImg = nullptr;
+                if (m->has_pbr_metallic_roughness &&
+                    m->pbr_metallic_roughness.metallic_roughness_texture.texture)
+                    metalRoughImg = m->pbr_metallic_roughness.metallic_roughness_texture.texture->image;
+                mat->metalRough = LoadTextureSRV(metalRoughImg, mat->srvHeapStartIndex + 2);
+
+                // Per-material constant buffer (b1 — MaterialBuffer, 256-byte aligned)
+                {
+                    const UINT cbSize = (sizeof(MaterialConstants) + 255) & ~255;
+                    D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+                    D3D12_RESOURCE_DESC   cbDesc    = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+
+                    D3D12MA::ALLOCATION_DESC cbAllocDesc = {};
+                    cbAllocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+
+                    HRESULT hr = allocator->CreateResource(
+                        &cbAllocDesc, &cbDesc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                        &mat->cbAlloc,
+                        IID_PPV_ARGS(&mat->constantBuffer));
+
+                    if (SUCCEEDED(hr))
+                    {
+                        D3D12_RANGE noRead = {0, 0};
+                        mat->constantBuffer->Map(0, &noRead, &mat->cbMapped);
+                        mat->cbGPUAddr = mat->constantBuffer->GetGPUVirtualAddress();
+
+                        MaterialConstants mc = {};
+                        if (m->has_pbr_metallic_roughness)
+                        {
+                            auto& pbr = m->pbr_metallic_roughness;
+                            mc.albedoFactor    = { pbr.base_color_factor[0],
+                                                   pbr.base_color_factor[1],
+                                                   pbr.base_color_factor[2],
+                                                   pbr.base_color_factor[3] };
+                            mc.metallicFactor  = pbr.metallic_factor;
+                            mc.roughnessFactor = pbr.roughness_factor;
+                        }
+                        memcpy(mat->cbMapped, &mc, sizeof(mc));
+                    }
+                    else
+                    {
+                        LUNA_LOG_WARN("MeshLoader: failed to create material CB: 0x%08lX",
+                                      (unsigned long)hr);
+                    }
+                }
+
+                mesh->material = std::move(mat);
+            }
 
             meshes.push_back(std::move(mesh));
         }

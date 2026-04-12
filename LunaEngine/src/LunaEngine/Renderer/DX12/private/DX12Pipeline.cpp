@@ -134,18 +134,75 @@ bool DX12Pipeline::LoadShaderDXC(const std::wstring &path, const std::wstring &t
 
 bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
 {
-    CD3DX12_ROOT_PARAMETER params[1];
-    params[0].InitAsConstantBufferView(0); // b0 — MVP transform
-
-    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
-    rootSigDesc.Init(1, params, 0, nullptr,
-                     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
-
     ComPtr<ID3DBlob> serializedBlob;
     ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = S_OK;
 
-    HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                             &serializedBlob, &errorBlob);
+    if (_desc.rootSigLayout == RootSignatureLayout::PBR)
+    {
+        // -----------------------------------------------------------------------
+        // PBR root signature layout:
+        //   [0] CBV b0 — TransformBuffer  (vertex stage)
+        //   [1] CBV b1 — MaterialBuffer   (pixel stage)
+        //   [2] CBV b2 — SceneBuffer      (pixel stage)
+        //   [3] SRV descriptor table t0-t3 — albedo, normal, metalRough, shadowMap (pixel)
+        // Static sampler s0 — anisotropic linear wrap (pixel)
+        // -----------------------------------------------------------------------
+        CD3DX12_ROOT_PARAMETER params[5];
+        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);     // b0 MVP (declared in both stages)
+        params[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL);   // b1 Material
+        params[2].InitAsConstantBufferView(2, 0, D3D12_SHADER_VISIBILITY_PIXEL);   // b2 Scene
+
+        // Descriptor table [3]: 3 SRVs for material textures (t0-t2: albedo, normal, metalRough)
+        CD3DX12_DESCRIPTOR_RANGE matSrvRange;
+        matSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0); // t0-t2
+        params[3].InitAsDescriptorTable(1, &matSrvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        // Descriptor table [4]: 1 SRV for shadow map (t3) — separate so it can be swapped per frame
+        CD3DX12_DESCRIPTOR_RANGE shadowSrvRange;
+        shadowSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3
+        params[4].InitAsDescriptorTable(1, &shadowSrvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        // Static sampler s0: anisotropic, linear, wrap (pixel stage)
+        D3D12_STATIC_SAMPLER_DESC staticSampler = {};
+        staticSampler.Filter           = D3D12_FILTER_ANISOTROPIC;
+        staticSampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSampler.MipLODBias       = 0.0f;
+        staticSampler.MaxAnisotropy    = 8;
+        staticSampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_ALWAYS;
+        staticSampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        staticSampler.MinLOD           = 0.0f;
+        staticSampler.MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSampler.ShaderRegister   = 0;   // s0
+        staticSampler.RegisterSpace    = 0;
+        staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
+        rootSigDesc.Init(_countof(params), params, 1, &staticSampler,
+                         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+        hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                         &serializedBlob, &errorBlob);
+    }
+    else
+    {
+        // -----------------------------------------------------------------------
+        // MVP-only root signature (triangle / mesh-preview pipelines)
+        //   [0] CBV b0 — MVP (all stages)
+        // -----------------------------------------------------------------------
+        CD3DX12_ROOT_PARAMETER params[1];
+        params[0].InitAsConstantBufferView(0); // b0 — MVP transform
+
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
+        rootSigDesc.Init(1, params, 0, nullptr,
+                         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+        hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                         &serializedBlob, &errorBlob);
+    }
+
     if (FAILED(hr))
     {
         if (errorBlob)

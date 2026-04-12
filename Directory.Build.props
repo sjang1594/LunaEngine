@@ -1,0 +1,8 @@
+<!-- Disable vcpkg MSBuild integration for this workspace.
+     All third-party dependencies are managed manually through premake5.
+     vcpkg's wildcard lib glob (imguid.lib, etc.) conflicts with our vendor libs. -->
+<Project>
+  <PropertyGroup>
+    <VcpkgEnabled>false</VcpkgEnabled>
+  </PropertyGroup>
+</Project>
