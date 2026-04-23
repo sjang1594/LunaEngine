@@ -22,6 +22,8 @@ public:
     virtual void Reload(const std::string& filePath) = 0;
     virtual void Destroy() = 0;
 
+    // P0-05: Factory stub — shader compilation is handled by DX12Pipeline/DXC directly.
+    // Returns nullptr on all backends; here for API symmetry only.
     static std::shared_ptr<IShaderProgram> Create(const std::string& path);
 };
 }

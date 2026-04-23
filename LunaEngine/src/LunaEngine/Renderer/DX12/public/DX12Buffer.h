@@ -1,6 +1,5 @@
 ﻿#pragma once
 #include "Graphics/IBuffer.h"
-#include "D3D12MemAlloc.h"
 
 namespace Luna
 {
@@ -28,27 +27,19 @@ enum class SRV_BUFFER_REGISTER : uint8
 class DX12Buffer : public IBuffer
 {
   public:
-    // Pass device and allocator explicitly — avoids dynamic_cast on every buffer operation.
-    DX12Buffer(ID3D12Device* device, D3D12MA::Allocator* allocator,
-               BufferUsage usage, const void *data, uint32_t size, uint32_t stride);
+    DX12Buffer(BufferUsage usage, const void *data, uint32_t size, uint32_t stride);
     ~DX12Buffer() override;
-
-    // View accessors — public so DX12Backend can use them without friendship boilerplate.
-    const D3D12_VERTEX_BUFFER_VIEW*        GetVBView() const { return &_vertexBufferView; }
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC* GetCBView() const { return &_constantBufferView; }
-
-  private:
-    // Returns the DX12Backend — type is statically known at this call site so static_cast is safe.
     class DX12Backend* GetBackend() const;
     void Bind(uint32_t slot = 0) override;
     void *Map() override;
     void Unmap() override;
     uint32_t GetSize() const override { return _size; }
     void UpdateData(void* data, uint32_t size);
+    const D3D12_VERTEX_BUFFER_VIEW* GetVBView() const { return &_vertexBufferView; }
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* GetCBView() const { return &_constantBufferView; }
     
   private:
-    BufferUsage     _usage;
-    ID3D12Device*   _deviceRaw   = nullptr;  // non-owning; lifetime guaranteed by DX12Backend
+    BufferUsage _usage;
 
     ComPtr<ID3D12Resource> _resource;
     

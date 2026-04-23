@@ -23,6 +23,10 @@ class IBuffer
     virtual uint32_t GetSize() const = 0;
 };
 
+// P0-05: Factory function is DX12-only; not yet backed by a Vulkan implementation.
+// Use DX12Backend::GetD3D12MAAllocator() + MeshLoader for production buffer creation.
+#ifdef _WIN32
 std::shared_ptr<IBuffer> CreateBuffer(BufferUsage usage, void *data, uint32_t size,
                                         uint32_t stride = 0);
+#endif
 } // namespace Luna

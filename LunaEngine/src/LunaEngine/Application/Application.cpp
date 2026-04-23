@@ -1,6 +1,7 @@
 #include "LunaPCH.h"
 #include "LunaEngine/Application/Application.h"
 #include "Manager/SceneManager.h"
+#include "LunaEngine/ImGui/ImGuiTheme.h"
 #include "stb_image.h"
 
 #include "Logger/Logger.h"
@@ -124,28 +125,37 @@ void Application::Init()
         LUNA_LOG_ERROR("DirectX 12 is only supported on Windows");
 #endif
     }
-    else if (_specification.backend == RenderBackendType::Vulkan ||
-             _specification.backend == RenderBackendType::VulkanMolt)
+    else if (_specification.backend == RenderBackendType::Vulkan)
     {
-#ifdef LUNA_VULKAN_ENABLED
         if (!glfwVulkanSupported())
         {
             LUNA_LOG_ERROR("Vulkan is not supported on this platform");
             glfwTerminate();
             return;
         }
-        IRenderContext::Initialize(_specification.backend, _windowHandle,
+        IRenderContext::Initialize(RenderBackendType::Vulkan, _windowHandle,
                                    _specification.width, _specification.height);
-#else
-        LUNA_LOG_ERROR("Vulkan backend requested but this build was compiled without "
-                       "LUNA_VULKAN_ENABLED. Falling back to no renderer.");
-#endif
+    }
+    else if (_specification.backend == RenderBackendType::VulkanMolt)
+    {
+        LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
     }
 
-    // P2-04: propagate vsync preference to the backend before any frames are rendered
+    // P2-04: propagate vsync preference to the backend
     IRenderContext::SetVSync(_specification.vsync);
 
     IRenderContext::InitImGui(_windowHandle);
+
+    // Apply Walnut-style dark theme with black borders
+    ImGuiTheme::ApplyWalnutTheme();
+
+    // Initialize custom title bar (removes Windows title bar, adds custom ImGui one)
+    if (_specification.customTitleBar)
+    {
+        _titleBar.Init(_windowHandle);
+        _titleBar.SetTitle(_specification.name);
+        _titleBar.SetLogoText("LUNA");
+    }
 
     // Load the initial test scene (glTF mesh upload happens here)
     SceneManager::GetInstance()->LoadScene(L"Test");
@@ -185,16 +195,41 @@ void Application::Run()
         IRenderContext::BeginFrame();
         IRenderContext::StartImGuiFrame();
 
-        if (ImGui::BeginMainMenuBar())
+        // Render custom title bar (includes minimize/maximize/close + menu)
+        if (_specification.customTitleBar)
         {
-            if (_menubarCallBack)
-                _menubarCallBack();
-            ImGui::EndMainMenuBar();
+            _titleBar.SetMenuCallback(_menubarCallBack);
+            _titleBar.Render();
+        }
+        else
+        {
+            // Standard ImGui menu bar
+            if (ImGui::BeginMainMenuBar())
+            {
+                if (_menubarCallBack)
+                    _menubarCallBack();
+                ImGui::EndMainMenuBar();
+            }
         }
 
+        // DockSpace — offset Y by title bar height when using custom title bar
+        float titleBarOffset = _specification.customTitleBar ? _titleBar.GetHeight() : 0.0f;
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, viewport->Pos.y + titleBarOffset));
+        ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, viewport->Size.y - titleBarOffset));
+        ImGui::SetNextWindowViewport(viewport->ID);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        ImGui::DockSpaceOverViewport(ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+        ImGuiWindowFlags dockFlags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoTitleBar |
+                                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                                     ImGuiWindowFlags_NoMove |
+                                     ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground;
+        ImGui::Begin("##DockSpace", nullptr, dockFlags);
+        ImGui::PopStyleVar(2);
         ImGui::PopStyleColor();
+        ImGui::DockSpace(ImGui::GetID("MainDockSpace"), ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
+        ImGui::End();
 
         for (auto &layer : _layerStack)
             layer->OnUpdate(_frameTime);
@@ -202,11 +237,24 @@ void Application::Run()
             layer->OnUIRender();
 
         ImGui::ShowDemoWindow();
+
+        // DrawFrame() sets up G-buffer RTVs and clears them; command list stays open.
         IRenderContext::DrawFrame();
 
         // Scene update: calls MeshRenderer::Render() per object, which records
         // DrawIndexedInstanced into the open command list via IRenderContext::DrawMesh().
+        // DrawMesh() writes geometry into the G-buffer RTVs (Phase 7 deferred rendering).
+        // IMPORTANT: must happen AFTER DrawFrame() (which binds G-buffer RTVs) and
+        // BEFORE CompositeFrame() (which reads the G-buffer as SRVs).
         SceneManager::GetInstance()->Update();
+
+        // Phase 12: Flush recorded DrawMesh() calls — uploads instances, dispatches
+        // GPU frustum cull compute, executes indirect draws into the G-buffer.
+        IRenderContext::FlushDraws();
+
+        // Phase 7: Deferred composite — reads G-buffer + shadow, runs Cook-Torrance
+        // lighting, writes final colour to the back buffer.
+        IRenderContext::CompositeFrame();
 
         IRenderContext::RenderImGui();
         IRenderContext::EndFrame();
@@ -281,6 +329,9 @@ void Application::OnFramebufferResize(GLFWwindow* w, int width, int height)
 
 void Application::OnMouseButton(GLFWwindow* w, int button, int action, int /*mods*/)
 {
+    // Don't process camera input when ImGui wants the mouse
+    if (ImGui::GetIO().WantCaptureMouse) return;
+
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
     if (button == GLFW_MOUSE_BUTTON_LEFT)
     {
@@ -301,6 +352,13 @@ void Application::OnMouseMove(GLFWwindow* w, double x, double y)
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
     if (!app->_mouseDown) return;
 
+    // Don't process camera input when ImGui wants the mouse
+    if (ImGui::GetIO().WantCaptureMouse)
+    {
+        app->_mouseDown = false;  // Reset to prevent stuck drag state
+        return;
+    }
+
     // Sensitivity: 0.3 degrees per pixel
     constexpr float kSensitivity = 0.3f;
     float dYaw   = static_cast<float>(x - app->_lastMouseX) * kSensitivity;
@@ -313,6 +371,9 @@ void Application::OnMouseMove(GLFWwindow* w, double x, double y)
 
 void Application::OnScroll(GLFWwindow* w, double /*xOffset*/, double yOffset)
 {
+    // Don't process camera input when ImGui wants the mouse
+    if (ImGui::GetIO().WantCaptureMouse) return;
+
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
     // Positive yOffset = scroll up = zoom in (decrease radius)
     app->_camera.Zoom(static_cast<float>(yOffset) * 0.5f);

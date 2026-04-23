@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -8,6 +9,7 @@
 #include "LunaEngine/Layer.h"
 #include "Renderer/HAL/Public/IRenderContext.h"
 #include "Renderer/Camera.h"
+#include "LunaEngine/Application/CustomTitleBar.h"
 
 struct GLFWwindow;
 namespace Luna
@@ -21,11 +23,11 @@ struct ApplicationSpecification
 
     std::filesystem::path iconPath;
     bool windowResizeable = true;
-    bool customTitleBar   = false;
+    bool customTitleBar   = true;   // Enable custom title bar by default
     bool useDockSpace     = true;
     bool centerWindow     = true;
-    bool vsync            = true;   // P2-04: passed to IRenderContext::SetVSync after init
     RenderBackendType backend = RenderBackendType::Vulkan;
+    bool vsync = false;
 };
 
 class Application
@@ -71,7 +73,10 @@ private:
     std::vector<std::shared_ptr<Layer>> _layerStack;
     std::function<void()> _menubarCallBack;
 
-    // Orbital camera — updated each frame from GLFW mouse/scroll input
+    // Custom title bar
+    CustomTitleBar _titleBar;
+
+    // Orbital camera
     Camera _camera;
 
     // Mouse drag state

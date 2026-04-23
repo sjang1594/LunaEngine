@@ -36,8 +36,30 @@ Application *Luna::CreateApplication(int argc, char **argv)
     spec.name    = "LunaApp";
     spec.width   = 1600;
     spec.height  = 900;
-    spec.backend = RenderBackendType::DirectX12;
+    spec.backend = RenderBackendType::DirectX12;  // Default backend
     spec.iconPath = "Resources/icon.png";
+
+    // Parse command line arguments for backend selection
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if ((arg == "--backend" || arg == "-b") && i + 1 < argc)
+        {
+            std::string backendStr = argv[++i];
+            if (backendStr == "vulkan" || backendStr == "vk")
+                spec.backend = RenderBackendType::Vulkan;
+            else if (backendStr == "dx12" || backendStr == "directx12")
+                spec.backend = RenderBackendType::DirectX12;
+        }
+        else if (arg == "--vulkan" || arg == "-vk")
+        {
+            spec.backend = RenderBackendType::Vulkan;
+        }
+        else if (arg == "--dx12")
+        {
+            spec.backend = RenderBackendType::DirectX12;
+        }
+    }
 
     Application *app = new Application(spec);
     app->PushLayer(std::make_shared<ExampleLayer>());

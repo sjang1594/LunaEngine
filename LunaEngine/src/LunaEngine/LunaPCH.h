@@ -1,10 +1,6 @@
 #pragma once
 
-// _HAS_STD_BYTE must be defined before any STL / Windows SDK header that references std::byte
-#define _HAS_STD_BYTE 0
-
 // STL
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -15,13 +11,31 @@
 #include <memory>
 #include <string>
 #include <tchar.h>
-#include <unordered_map>
 #include <vector>
 #include <windows.h>
 #include <filesystem>
 
-// Vulkan headers — only included when building the Vulkan backend
-#ifdef LUNA_VULKAN_ENABLED
+// Selective std:: usings — avoids the blanket "using namespace std" that caused
+// the std::byte / BYTE collision (P3-01).  Add to this list only as needed.
+using std::shared_ptr;
+using std::unique_ptr;
+using std::weak_ptr;
+using std::make_shared;
+using std::make_unique;
+using std::string;
+using std::wstring;
+using std::vector;
+using std::array;
+using std::map;
+using std::list;
+using std::function;
+using std::pair;
+using std::move;
+using std::forward;
+using std::static_pointer_cast;
+using std::dynamic_pointer_cast;
+
+#ifdef LUNA_ENABLE_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 
@@ -36,17 +50,16 @@
 // ImGUI
 #include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_glfw.h>
-#ifdef LUNA_VULKAN_ENABLED
+#ifdef LUNA_ENABLE_VULKAN
 #include <backends/imgui_impl_vulkan.h>
 #endif
 #include <imgui.h>
 
 #include <GLFW/glfw3.h>
-#ifdef _WIN32
-#define GLFW_EXPOSE_NATIVE_WIN32
-#endif
 #include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
+
+#include "Logger/Logger.h"
 
 // Math
 #include <DirectXColors.h>
@@ -59,34 +72,11 @@
 #include <windows.h>
 #include <wrl.h>
 
-// DirectX math types are used pervasively across all rendering code; bringing
-// them in at PCH level avoids thousands of DirectX:: qualifications.
-// Microsoft::WRL is intentionally NOT brought in wholesale — use ComPtr<> explicitly.
 using namespace DirectX;
 using namespace DirectX::PackedVector;
+using namespace Microsoft::WRL;
 using Microsoft::WRL::ComPtr;
-
-// Explicit std:: aliases — avoids "using namespace std" polluting all TUs
-// while still allowing unqualified use of the most common standard types.
-using std::array;
-using std::enable_shared_from_this;
-using std::forward;
-using std::function;
-using std::list;
-using std::make_shared;
-using std::make_unique;
-using std::map;
-using std::move;
-using std::pair;
-using std::runtime_error;
-using std::shared_ptr;
-using std::static_pointer_cast;
-using std::string;
-using std::unique_ptr;
-using std::unordered_map;
 using std::vector;
-using std::weak_ptr;
-using std::wstring;
 
 // All Type Def
 using int8 = __int8;
@@ -123,7 +113,7 @@ inline void ThrowIfDXFailed(HRESULT hr, const char* functionName, int lineNumber
 
 #define DX_CHECK(x) ThrowIfDXFailed(x, __FUNCTION__, __LINE__)
 
-#ifdef LUNA_VULKAN_ENABLED
+#ifdef LUNA_ENABLE_VULKAN
 inline void CheckIfVKFailed(VkResult error)
 {
     if (error == 0)
@@ -132,4 +122,4 @@ inline void CheckIfVKFailed(VkResult error)
     if (error < 0)
         abort();
 }
-#endif // LUNA_VULKAN_ENABLED
+#endif

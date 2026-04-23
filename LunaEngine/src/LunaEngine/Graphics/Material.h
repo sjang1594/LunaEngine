@@ -1,74 +1,49 @@
 #pragma once
-#include <DirectXMath.h>
-#include <wrl/client.h>
-#include "D3D12MemAlloc.h"
 #include "Graphics/Texture.h"
+#include <DirectXMath.h>
 #include <memory>
 
-using Microsoft::WRL::ComPtr;
+// Forward declarations to avoid pulling in D3D12 headers from Mesh.h
+struct ID3D12Resource;
 
 namespace Luna
 {
 
-// ---------------------------------------------------------------------------
-// MaterialConstants — mapped to HLSL cbuffer b1 (MaterialBuffer)
-//   float4 albedoFactor;
-//   float  metallicFactor;
-//   float  roughnessFactor;
-//   float2 _pad;
-// Must be 256-byte aligned for root CBV binding.
-// ---------------------------------------------------------------------------
+// Phase 5B: Material constant buffer — b1 in the PBR root signature.
+// Must be 256-byte aligned when placed in an UPLOAD heap CB.
 struct MaterialConstants
 {
     DirectX::XMFLOAT4 albedoFactor    = {1.0f, 1.0f, 1.0f, 1.0f};
-    float              metallicFactor  = 0.0f;
-    float              roughnessFactor = 0.5f;
+    float              metallicFactor  = 1.0f;
+    float              roughnessFactor = 1.0f;
     float              _pad[2]         = {};
+    // Total: 32 bytes — padded to 256 when allocating the CB resource
 };
-static_assert(sizeof(MaterialConstants) % 16 == 0,
-              "MaterialConstants must be 16-byte aligned");
+static_assert(sizeof(MaterialConstants) == 32, "MaterialConstants size changed");
 
-// ---------------------------------------------------------------------------
-// Material — PBR material data bound per draw call.
-//
-// Texture slots (written into _imGuiSrvHeap by MeshLoader):
-//   srvHeapStartIndex + 0 = albedo    (t0)
-//   srvHeapStartIndex + 1 = normal    (t1)
-//   srvHeapStartIndex + 2 = metalRough (t2)
-//   t3 (shadowMap) is a backend-owned resource, not part of Material.
-//
-// constantBuffer / cbMapped / cbGPUAddr store the per-material b1 CB.
-// cbAlloc must be Release()'d in the destructor (D3D12MA allocation).
-// ---------------------------------------------------------------------------
+// Phase 5B: Per-material GPU resources.
+// Owns four Texture shared_ptrs (albedo / normalMap / metalRough / emissive) and a small
+// constant buffer (MaterialConstants).  Descriptor slots [srvTableStart, srvTableStart+3]
+// in the shared SRV heap are reserved for the four SRVs.
 struct Material
 {
-    std::shared_ptr<Texture> albedo;
-    std::shared_ptr<Texture> normal;
-    std::shared_ptr<Texture> metalRough;
+    std::shared_ptr<Texture> albedo;       // SRV at t0 (srvTableStart + 0)
+    std::shared_ptr<Texture> normalMap;    // SRV at t1 (srvTableStart + 1)
+    std::shared_ptr<Texture> metalRough;   // SRV at t2 (srvTableStart + 2) — G=roughness, B=metallic
+    std::shared_ptr<Texture> emissive;     // SRV at t3 (srvTableStart + 3)
 
-    // Per-material constant buffer (HLSL b1 — MaterialBuffer)
-    ComPtr<ID3D12Resource>   constantBuffer;
-    D3D12MA::Allocation*     cbAlloc    = nullptr;
-    void*                    cbMapped   = nullptr;
+    ComPtr<ID3D12Resource>    constantBuffer;
+    void*                     cbMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbGPUAddr = 0;
 
-    // First SRV slot allocated for this material (albedo=+0, normal=+1, metalRough=+2)
-    UINT srvHeapStartIndex = 0;
+    UINT srvTableStart = 0;  // index of first of 3 consecutive SRV heap slots
 
-    Material() = default;
-    ~Material()
-    {
-        if (cbMapped && constantBuffer)
-            constantBuffer->Unmap(0, nullptr);
-        cbMapped = nullptr;
-        if (cbAlloc) { cbAlloc->Release(); cbAlloc = nullptr; }
-    }
-
-    // Non-copyable, movable
-    Material(const Material&) = delete;
+    Material()                           = default;
+    ~Material()                          = default;
+    Material(const Material&)            = delete;
     Material& operator=(const Material&) = delete;
-    Material(Material&&) = default;
-    Material& operator=(Material&&) = default;
+    Material(Material&&)                 = default;
+    Material& operator=(Material&&)      = default;
 };
 
 } // namespace Luna

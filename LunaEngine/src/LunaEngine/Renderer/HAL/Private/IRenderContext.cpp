@@ -3,10 +3,7 @@
 
 #include "Logger/Logger.h"
 #include "LunaEngine/Renderer/DX12/Public/DX12Backend.h"
-
-// Vulkan backend is gated behind LUNA_VULKAN_ENABLED.
-// Excluded from the build until the backend is production-ready.
-#ifdef LUNA_VULKAN_ENABLED
+#ifdef LUNA_ENABLE_VULKAN
 #include "LunaEngine/Renderer/Vulkan/Public/VulkanBackend.h"
 #endif
 
@@ -22,11 +19,10 @@ void IRenderContext::Initialize(RenderBackendType backendType, void *windowHandl
     switch (backendType)
     {
     case RenderBackendType::Vulkan:
-#ifdef LUNA_VULKAN_ENABLED
+#ifdef LUNA_ENABLE_VULKAN
         s_Backend = std::make_unique<VulkanBackend>();
 #else
-        LUNA_LOG_ERROR("Vulkan backend is not available in this build. "
-                       "Build with LUNA_VULKAN_ENABLED and a valid VULKAN_SDK to enable it.");
+        LUNA_LOG_ERROR("Vulkan backend not compiled (VULKAN_SDK missing). Use DirectX12.");
         return;
 #endif
         break;
@@ -118,6 +114,18 @@ void IRenderContext::ShutdownImGui()
 {
     if (s_Backend)
         s_Backend->ShutdownImGui();
+}
+
+void IRenderContext::CompositeFrame()
+{
+    if (s_Backend)
+        s_Backend->CompositeFrame();
+}
+
+void IRenderContext::FlushDraws()
+{
+    if (s_Backend)
+        s_Backend->FlushDraws();
 }
 
 void IRenderContext::SetVSync(bool vsync)

@@ -1,47 +1,74 @@
 #pragma once
 #include "Renderer/Mesh.h"
+#include <DirectXMath.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
-struct ID3D12DescriptorHeap;
 namespace D3D12MA { class Allocator; }
 
 namespace Luna
 {
 
+// Phase 5B: Raw material description extracted from a glTF/GLB file.
+// Texture pixel data is pre-decoded (RGBA8, 4 bytes per pixel) from embedded buffers.
+// An empty pixel vector means the texture is absent; the backend should use a default.
+struct MaterialCreateInfo
+{
+    // Pre-decoded RGBA8 pixel data for each map; empty = texture absent
+    std::vector<uint8_t> albedoPixels;
+    uint32_t             albedoW = 0, albedoH = 0;
+
+    std::vector<uint8_t> normalPixels;
+    uint32_t             normalW = 0, normalH = 0;
+
+    std::vector<uint8_t> metalRoughPixels;
+    uint32_t             metalRoughW = 0, metalRoughH = 0;
+
+    std::vector<uint8_t> emissivePixels;
+    uint32_t             emissiveW = 0, emissiveH = 0;
+
+    // glTF PBR metallic-roughness factors
+    DirectX::XMFLOAT4 albedoFactor    = {1.0f, 1.0f, 1.0f, 1.0f};
+    float              metallicFactor  = 1.0f;
+    float              roughnessFactor = 1.0f;
+
+    bool hasAnyTexture() const
+    {
+        return !albedoPixels.empty() || !normalPixels.empty() || !metalRoughPixels.empty();
+    }
+};
+
+// Phase 5B: Combined result from LoadGLTF
+struct LoadResult
+{
+    std::vector<std::unique_ptr<Mesh>>  meshes;
+    std::vector<MaterialCreateInfo>     materials; // indexed by Mesh::materialIndex
+};
+
 // ---------------------------------------------------------------------------
 // MeshLoader — loads glTF 2.0 / GLB files using cgltf.
-// Returns a vector of Mesh objects uploaded to DEFAULT heap via D3D12MA staging.
+// Returns Mesh objects uploaded to DEFAULT heap via D3D12MA staging, plus
+// MaterialCreateInfo for each unique glTF material referenced by a primitive.
 // The caller is responsible for executing the command list and waiting for
-// GPU completion before the staging buffers (internal to LoadGLTF) are released.
+// GPU completion before using the mesh data.
 // ---------------------------------------------------------------------------
 class MeshLoader
 {
   public:
-    // path        — file system path to .gltf or .glb
-    // srvHeap     — optional: CBV/SRV/UAV descriptor heap for material texture SRVs
-    // srvDescSize — descriptor increment size (obtained from GetDescriptorHandleIncrementSize)
-    // srvAllocIdx — in/out: next free SRV slot index; advanced by 3 per material with textures
-    //
-    // When srvHeap is non-null, cgltf materials are parsed and mesh->material is populated.
-    // Staging upload commands are recorded into cmdList; the caller must execute + wait.
-    static std::vector<std::unique_ptr<Mesh>> LoadGLTF(
+    // path — file system path to .gltf or .glb
+    // Geometry upload commands are recorded into cmdList; the caller must execute + wait.
+    // MaterialCreateInfo is returned without GPU work; the caller builds GPU resources from it.
+    static LoadResult LoadGLTF(
         const std::string&          path,
         ID3D12Device*               device,
         D3D12MA::Allocator*         allocator,
-        ID3D12GraphicsCommandList*  cmdList,
-        ID3D12DescriptorHeap*       srvHeap     = nullptr,
-        UINT                        srvDescSize = 0,
-        UINT*                       srvAllocIdx = nullptr);
+        ID3D12GraphicsCommandList*  cmdList);
 
-  private:
-    // Upload a raw CPU buffer to a DEFAULT heap D3D12 resource, recording
-    // a CopyBufferRegion + barrier into cmdList.
-    // Returns the DEFAULT resource; stagingOut receives the UPLOAD staging buffer
-    // which must remain alive until the cmdList is executed and GPU-waited.
+    // Phase 12: exposed publicly for merged geometry upload
     static ComPtr<ID3D12Resource> UploadBuffer(
         D3D12MA::Allocator*        allocator,
         ID3D12GraphicsCommandList* cmdList,

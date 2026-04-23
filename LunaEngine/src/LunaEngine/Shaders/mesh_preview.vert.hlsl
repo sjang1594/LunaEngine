@@ -29,6 +29,6 @@ VSOutput main(VSInput input)
     float4 worldPos    = mul(float4(input.position, 1.0f), model);
     output.position    = mul(mul(worldPos, view), proj);
     // Assumes uniform scale; for non-uniform scale use the inverse-transpose normal matrix
-    output.worldNormal = mul((float3x3)model, input.normal);
+    output.worldNormal = mul(input.normal, (float3x3)model);
     return output;
 }

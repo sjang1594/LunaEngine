@@ -1,25 +1,26 @@
 -- LunaExternal.lua
 
--- Prefer the environment variable; fall back to the known local install path.
-VULKAN_SDK = os.getenv("VULKAN_SDK") or "C:/VulkanSDK/1.4.328.1"
-VULKAN_ENABLED = (os.isdir(VULKAN_SDK))
-
-if VULKAN_ENABLED then
-   print("Vulkan SDK found: " .. VULKAN_SDK)
-else
-   print("NOTE: Vulkan SDK not found — Vulkan backend will be excluded from the build.")
-   print("      Set VULKAN_SDK or install to the default path.")
+VULKAN_SDK = os.getenv("VULKAN_SDK")
+LUNA_ENABLE_VULKAN = (VULKAN_SDK ~= nil and VULKAN_SDK ~= "")
+if not LUNA_ENABLE_VULKAN then
+   print("[LunaEngine] VULKAN_SDK not set — Vulkan backend disabled. Install from https://vulkan.lunarg.com/sdk/home#windows")
 end
 
 IncludeDir = {}
-IncludeDir["VulkanSDK"] = VULKAN_ENABLED and ("%{VULKAN_SDK}/Include") or ""
 IncludeDir["glm"] = "../vendor/glm"
+if LUNA_ENABLE_VULKAN then
+   IncludeDir["VulkanSDK"] = VULKAN_SDK .. "/Include"
+end
 
 LibraryDir = {}
-LibraryDir["VulkanSDK"] = VULKAN_ENABLED and ("%{VULKAN_SDK}/Lib") or ""
+if LUNA_ENABLE_VULKAN then
+   LibraryDir["VulkanSDK"] = VULKAN_SDK .. "/Lib"
+end
 
 Library = {}
-Library["Vulkan"] = VULKAN_ENABLED and ("%{LibraryDir.VulkanSDK}/vulkan-1.lib") or ""
+if LUNA_ENABLE_VULKAN then
+   Library["Vulkan"] = LibraryDir["VulkanSDK"] .. "/vulkan-1.lib"
+end
 
 group "Dependencies"
    include "vendor/imgui"

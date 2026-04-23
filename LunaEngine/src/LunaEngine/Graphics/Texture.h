@@ -31,14 +31,14 @@ class Texture
               ComPtr<ID3D12Resource>& stagingOut,
               D3D12MA::Allocation**   stagingAllocOut);
 
-    // Load an image from a memory buffer (GLB embedded textures — JPEG/PNG raw bytes).
-    // Same upload semantics as Load(); uses stbi_load_from_memory internally.
-    bool LoadFromMemory(const uint8_t* data, size_t byteSize,
-                        ID3D12Device* device,
-                        D3D12MA::Allocator* allocator,
-                        ID3D12GraphicsCommandList* cmdList,
-                        ComPtr<ID3D12Resource>& stagingOut,
-                        D3D12MA::Allocation**   stagingAllocOut);
+    // Phase 5B: Load from in-memory compressed image data (e.g. PNG/JPEG embedded in GLB).
+    // pixels_rgba8 is a pre-decoded RGBA8 buffer (4 bytes per pixel, width*height pixels).
+    bool LoadFromRGBA8(const uint8_t* pixels_rgba8, UINT width, UINT height,
+                       ID3D12Device* device,
+                       D3D12MA::Allocator* allocator,
+                       ID3D12GraphicsCommandList* cmdList,
+                       ComPtr<ID3D12Resource>& stagingOut,
+                       D3D12MA::Allocation**   stagingAllocOut);
 
     // Create a shader-resource view at dest (CPU handle, caller owns the descriptor heap slot)
     void CreateSRV(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dest);

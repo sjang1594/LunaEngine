@@ -1,6 +1,7 @@
 // pbr.frag.hlsl — Cook-Torrance BRDF pixel shader (SM 6.0)
 // Implements: D_GGX, G_SmithSchlick, F_Schlick
-// Phase 3: directional light; Phase 4: multiplied by shadow occlusion factor.
+// Phase 5B: single hardcoded directional light; shadow=1 (no shadow map yet).
+// Root signature: b0=TransformBuffer, b1=MaterialBuffer, t0-t2 SRV table, s0 static sampler.
 
 cbuffer TransformBuffer : register(b0)
 {
@@ -17,23 +18,19 @@ cbuffer MaterialBuffer : register(b1)
     float2 _pad;
 };
 
-cbuffer SceneBuffer : register(b2)
-{
-    row_major float4x4 invViewProj;   // used to reconstruct world position from depth
-    float4 lightDirection;            // xyz = toward-light direction (normalized), w = intensity
-    float4 lightColor;                // xyz = color, w = unused
-    float4 viewPosition;              // xyz = camera world-space eye position
-    float2 viewportSize;              // for shadow map sampling
-    float2 _scenePad;
-};
-
-// Material textures
+// Material textures (SRV descriptor table, params[2])
 Texture2D    albedoTex    : register(t0);
 Texture2D    normalTex    : register(t1);
 Texture2D    metalRoughTex: register(t2);
-Texture2D    shadowMap    : register(t3);  // R32_FLOAT: 1.0=lit, 0.0=shadowed (Phase 4)
 
 SamplerState linearSampler : register(s0);
+
+// ---------------------------------------------------------------------------
+// Hardcoded scene lighting (Phase 5B — no SceneBuffer b2 / shadow map t3)
+// ---------------------------------------------------------------------------
+static const float3 LIGHT_DIR      = normalize(float3(1.0, 2.0, 1.0)); // toward-light
+static const float3 LIGHT_COLOR    = float3(1.0, 1.0, 1.0);
+static const float  LIGHT_INTENSITY = 3.0;
 
 static const float PI = 3.14159265359;
 
@@ -116,8 +113,15 @@ float4 main(PSInput input) : SV_TARGET
                               normalize(input.bitanWS),
                               input.uv);
 
-    float3 V = normalize(viewPosition.xyz - input.posWS);
-    float3 L = normalize(lightDirection.xyz);  // pre-normalized toward-light direction
+    // Recover camera eye position from the view matrix (no SceneBuffer needed):
+    // viewMatrix rows = [right|tx], [up|ty], [fwd|tz], [0|0|0|1]
+    // where t = (-dot(axis, eye)) per axis → eye = R^T * (-t) = mul(-t, R)
+    float3x3 R    = float3x3(viewMatrix[0].xyz, viewMatrix[1].xyz, viewMatrix[2].xyz);
+    float3   tRow = float3(viewMatrix[0].w, viewMatrix[1].w, viewMatrix[2].w);
+    float3   eyeWS = mul(-tRow, R);
+
+    float3 V = normalize(eyeWS - input.posWS);
+    float3 L = LIGHT_DIR;
     float3 H = normalize(V + L);
 
     // ---- Fresnel base reflectivity ----
@@ -140,14 +144,12 @@ float4 main(PSInput input) : SV_TARGET
 
     // ---- Lighting ----
     float NdL       = max(dot(N, L), 0.0);
-    float3 radiance = lightColor.rgb * lightDirection.w;  // w = intensity
+    float3 radiance = LIGHT_COLOR * LIGHT_INTENSITY;
 
     float3 Lo = (diffuse + specular) * radiance * NdL;
 
-    // ---- Shadow occlusion (Phase 4 — shadow map sampled at screen UV) ----
-    float2 screenUV = input.posCS.xy / viewportSize;
-    float  shadow   = shadowMap.Sample(linearSampler, screenUV).r;  // 1.0=lit, 0.0=shadow
-
+    // ---- Shadow (Phase 5B: fully lit — shadow map wired in Phase 4) ----
+    const float shadow = 1.0;
     Lo *= shadow;
 
     // ---- Ambient (simple IBL approximation) ----

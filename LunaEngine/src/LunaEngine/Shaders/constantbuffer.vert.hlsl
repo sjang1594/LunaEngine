@@ -20,9 +20,9 @@ struct VSOutput
 VSOutput main(VSInput input)
 {
     VSOutput output;
-    float4 worldPos  = mul(modelMatrix,      float4(input.position, 1.0f));
-    float4 viewPos   = mul(viewMatrix,       worldPos);
-    output.position  = mul(projectionMatrix, viewPos);
+    float4 worldPos  = mul(float4(input.position, 1.0f), modelMatrix);
+    float4 viewPos   = mul(worldPos,  viewMatrix);
+    output.position  = mul(viewPos,   projectionMatrix);
     output.color     = input.color;
     return output;
 }

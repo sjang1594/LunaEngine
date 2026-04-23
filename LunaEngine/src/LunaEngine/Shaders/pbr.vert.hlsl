@@ -30,16 +30,17 @@ VSOutput main(VSInput input)
 {
     VSOutput output;
 
-    float4 worldPos     = mul(modelMatrix, float4(input.position, 1.0));
-    output.posCS        = mul(projectionMatrix, mul(viewMatrix, worldPos));
+    float4 worldPos     = mul(float4(input.position, 1.0), modelMatrix);
+    output.posCS        = mul(mul(worldPos, viewMatrix), projectionMatrix);
     output.posWS        = worldPos.xyz;
 
-    // Transform normals by the inverse-transpose of the model matrix (upper 3x3).
-    // For uniform-scale models, the model matrix works directly.
+    // Transform normals by the model matrix (upper 3x3).
+    // mul(v, M) is the row-vector convention matching DirectXMath storage.
+    // For uniform-scale models, the rotation part works directly for normals.
     float3x3 normalMatrix = (float3x3)modelMatrix;
-    output.normalWS  = normalize(mul(normalMatrix, input.normal));
+    output.normalWS  = normalize(mul(input.normal,       normalMatrix));
 
-    output.tangentWS = normalize(mul(normalMatrix, input.tangent.xyz));
+    output.tangentWS = normalize(mul(input.tangent.xyz,  normalMatrix));
     // Bitangent = cross(N, T) * tangent.w (w encodes handedness)
     output.bitanWS   = normalize(cross(output.normalWS, output.tangentWS) * input.tangent.w);
 

@@ -51,15 +51,13 @@ void DX12Device::CreateDXGIFactory()
         if (desc.DedicatedVideoMemory > 0)
         {
             _adapter = candidate;
-
-            // P3-04: persist the real adapter name so GetDeviceName() returns something useful
-            _adapterName = desc.Description;
-            _adapterNameNarrow.resize(_adapterName.size());
-            std::transform(_adapterName.begin(), _adapterName.end(),
-                           _adapterNameNarrow.begin(),
-                           [](wchar_t c) { return static_cast<char>(c < 128 ? c : '?'); });
-
             LUNA_LOG_INFO("Selected adapter: %ls", desc.Description);
+
+            // P3-04: Convert wide-char adapter description to narrow string for GetDeviceName()
+            int needed = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nullptr, 0, nullptr, nullptr);
+            _adapterNameA.resize(static_cast<size_t>(needed > 0 ? needed - 1 : 0));
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                                _adapterNameA.data(), needed, nullptr, nullptr);
             return;
         }
     }
@@ -78,22 +76,17 @@ void DX12Device::CreateDevice()
 void DX12Device::SetMultiSampleQualityLevels()
 {
     D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msQualityLevels;
-    msQualityLevels.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // Same As BackBuffer Format
-    msQualityLevels.SampleCount = 4;
-    msQualityLevels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+    msQualityLevels.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    msQualityLevels.SampleCount      = 4;
+    msQualityLevels.Flags            = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
     msQualityLevels.NumQualityLevels = 0;
 
     HRESULT hr = _device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
         &msQualityLevels, sizeof(msQualityLevels));
 
-    if (FAILED(hr) || msQualityLevels.NumQualityLevels == 0)
-    {
-        m4xMsaaQuality = 0;
-    }
-    else
-    {
-        m4xMsaaQuality = msQualityLevels.NumQualityLevels;
-    }
+    m4xMsaaQuality = (FAILED(hr) || msQualityLevels.NumQualityLevels == 0)
+                         ? 0
+                         : msQualityLevels.NumQualityLevels;
 }
 
 // Phase 4A: Query DXR support via ID3D12Device5::CheckFeatureSupport

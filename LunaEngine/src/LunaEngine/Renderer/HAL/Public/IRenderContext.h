@@ -32,14 +32,20 @@ class IRenderContext
     /* Records a mesh draw into the open command list (call between BeginFrame / EndFrame) */
     static void DrawMesh(const Mesh* mesh, const XMFLOAT4X4& model);
 
+    /* Phase 12: Flush recorded DrawMesh() calls — GPU cull + indirect draw */
+    static void FlushDraws();
+
+    /* Phase 7: Deferred composite — G-buffer → lighting → back buffer */
+    static void CompositeFrame();
+
+    /* VSync toggle — P2-04 */
+    static void SetVSync(bool vsync);
+
     /* IMGUI Control */
     static void InitImGui(void *windowHandler);
     static void StartImGuiFrame();
     static void RenderImGui();
     static void ShutdownImGui();
-
-    /* Vsync — delegates to backend::SetVSync(); call after Initialize() */
-    static void SetVSync(bool vsync);
 
     static IRenderBackend *GetBackend();
     static RenderBackendType GetCurrentBackendType();
