@@ -3,17 +3,11 @@
 
 namespace Luna
 {
-
-struct ShaderConstantData
-{
-    
-};
-
-class DX12Shader: public IShader
+class DX12ShaderProgram: public IShaderProgram
 {
 public:
-    DX12Shader(const std::wstring& vsPath, const std::wstring& psPath);
-    ~DX12Shader() override = default;
+    DX12ShaderProgram(const std::wstring& vsPath, const std::wstring& psPath);
+    ~DX12ShaderProgram() override = default;
 
     void Bind() override {}
     void UnBind() override {}

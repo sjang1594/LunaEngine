@@ -15,9 +15,29 @@
 #include <windows.h>
 #include <filesystem>
 
-using namespace std;
+// Selective std:: usings — avoids the blanket "using namespace std" that caused
+// the std::byte / BYTE collision (P3-01).  Add to this list only as needed.
+using std::shared_ptr;
+using std::unique_ptr;
+using std::weak_ptr;
+using std::make_shared;
+using std::make_unique;
+using std::string;
+using std::wstring;
+using std::vector;
+using std::array;
+using std::map;
+using std::list;
+using std::function;
+using std::pair;
+using std::move;
+using std::forward;
+using std::static_pointer_cast;
+using std::dynamic_pointer_cast;
 
+#ifdef LUNA_ENABLE_VULKAN
 #include <vulkan/vulkan.h>
+#endif
 
 // DX12
 #include <directx/d3d12.h>
@@ -26,13 +46,20 @@ using namespace std;
 #include <directx/d3dx12_barriers.h>
 #include <directx/d3dx12_core.h>
 #include <directx/d3dx12_root_signature.h>
+
 // ImGUI
 #include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_glfw.h>
+#ifdef LUNA_ENABLE_VULKAN
+#include <backends/imgui_impl_vulkan.h>
+#endif
 #include <imgui.h>
 
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
+
+#include "Logger/Logger.h"
 
 // Math
 #include <DirectXColors.h>
@@ -64,25 +91,35 @@ using Vec2 = XMFLOAT2;
 using Vec3 = XMFLOAT3;
 using Vec4 = XMFLOAT4;
 using Matrix = XMMATRIX;
+using Matrix4x4 = XMFLOAT4X4;
 
 enum
 {
     SWAP_CHAIN_BUFFER_COUNT = 2
 };
 
-struct WindowInfo
-{
-    HWND hwnd;     // Output Window
-    int32 width;   // Width
-    int32 height;  // Height
-    bool windowed; //
-};
-
-inline void ThrowIfFailed(HRESULT hr)
+#include <comdef.h>
+inline void ThrowIfDXFailed(HRESULT hr, const char* functionName, int lineNumber)
 {
     if (FAILED(hr))
     {
-        // Set a breakpoint on this line to catch DirectX API errors
-        throw std::exception();
+        _com_error err(hr);
+        std::cerr << "[ERROR] DirectX Error: " << err.ErrorMessage()
+                  << " | Function: " << functionName
+                  << " | Line: " << lineNumber << std::endl;
+        std::terminate();  // Immediate termination with detailed log
     }
 }
+
+#define DX_CHECK(x) ThrowIfDXFailed(x, __FUNCTION__, __LINE__)
+
+#ifdef LUNA_ENABLE_VULKAN
+inline void CheckIfVKFailed(VkResult error)
+{
+    if (error == 0)
+        return;
+    fprintf(stderr, "Vulkan Error: %d\n", error);
+    if (error < 0)
+        abort();
+}
+#endif

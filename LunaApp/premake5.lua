@@ -12,11 +12,11 @@ project "LunaApp"
       "../vendor/imgui",
       "../vendor/glfw/include",
       "../vendor/imgui/backends",
-      "../vendor/dxheaders/include",            
-      "../vendor/dxheaders/include/directx",    
+      "../vendor/dxheaders/include",
+      "../vendor/dxheaders/include/directx",
+      "../vendor/glm",
       "../LunaEngine/src",
-      "%{IncludeDir.VulkanSDK}",
-      "%{IncludeDir.glm}",
+      "../LunaEngine/src/LunaEngine",  -- needed for headers that use bare "Renderer/..." paths
    }
 
    libdirs
@@ -30,7 +30,18 @@ project "LunaApp"
    }
 
    targetdir ("bin/" .. outputdir .. "/%{prj.name}")
-   objdir ("bin-int/" .. outputdir .. "/%{prj.name}")
+   objdir    ("bin-int/" .. outputdir .. "/%{prj.name}")
+
+   -- Set VS debug working directory to the exe output folder (contains Assets/ and Resources/)
+   debugdir "%{cfg.targetdir}"
+
+   -- Mirror Assets/ and Resources/ next to the exe so the app also works when run standalone
+   filter "system:windows"
+      postbuildcommands {
+         "xcopy /E /I /Y \"%{prj.location}Assets\" \"%{cfg.targetdir}\\Assets\"",
+         "xcopy /E /I /Y \"%{prj.location}..\\Resources\" \"%{cfg.targetdir}\\Resources\"",
+      }
+   filter {}
 
    filter "system:windows"
       systemversion "latest"

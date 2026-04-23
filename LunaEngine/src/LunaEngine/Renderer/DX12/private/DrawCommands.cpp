@@ -1,6 +1,6 @@
 #include "LunaPCH.h"
-#include "Renderer/DX12/public/DrawCommands.h"
-#include "Renderer/IRenderContext.h"
+#include "Renderer/DX12/Public/DrawCommands.h"
+#include "Renderer/HAL/Public/IRenderContext.h"
 
 namespace Luna
 {

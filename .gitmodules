@@ -20,3 +20,6 @@
 	path = vendor/DirectXMath
 	url = https://github.com/microsoft/DirectXMath.git
 	branch = main
+[submodule "vendor/DirectXTex"]
+	path = vendor/DirectXTex
+	url = https://github.com/sjang1594/DirectXTex.git

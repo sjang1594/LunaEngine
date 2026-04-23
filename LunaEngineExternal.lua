@@ -1,19 +1,26 @@
 -- LunaExternal.lua
 
 VULKAN_SDK = os.getenv("VULKAN_SDK")
-if not VULKAN_SDK then 
-   error("VULKAN_SDK environment variable not set! Please Make sure you Download SDK: https://vulkan.lunarg.com/sdk/home#windows")
-end 
+LUNA_ENABLE_VULKAN = (VULKAN_SDK ~= nil and VULKAN_SDK ~= "")
+if not LUNA_ENABLE_VULKAN then
+   print("[LunaEngine] VULKAN_SDK not set — Vulkan backend disabled. Install from https://vulkan.lunarg.com/sdk/home#windows")
+end
 
 IncludeDir = {}
-IncludeDir["VulkanSDK"] = "%{VULKAN_SDK}/Include"
 IncludeDir["glm"] = "../vendor/glm"
+if LUNA_ENABLE_VULKAN then
+   IncludeDir["VulkanSDK"] = VULKAN_SDK .. "/Include"
+end
 
 LibraryDir = {}
-LibraryDir["VulkanSDK"] = "%{VULKAN_SDK}/Lib"
+if LUNA_ENABLE_VULKAN then
+   LibraryDir["VulkanSDK"] = VULKAN_SDK .. "/Lib"
+end
 
 Library = {}
-Library["Vulkan"] = "%{LibraryDir.VulkanSDK}/vulkan-1.lib"
+if LUNA_ENABLE_VULKAN then
+   Library["Vulkan"] = LibraryDir["VulkanSDK"] .. "/vulkan-1.lib"
+end
 
 group "Dependencies"
    include "vendor/imgui"
