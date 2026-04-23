@@ -1,7 +1,7 @@
 # LunaEngine
 
 <p align="center">
-    <img src="Resource/high_res_icon.png" alt="LunaEngine Logo" width="300">
+    <img src="Resources/high_res_icon.png" alt="LunaEngine Logo" width="300">
 </p>
 
 ---
@@ -12,8 +12,9 @@ In order to build this project and generate a solution, you need to download [pr
 Then download `premake5.exe` into the `vendor/bin`.  
 Since there is a license to premake, it's good practice to attach `premake5` license.txt.  
 
-### Dependencies
+# Rendering Architecture
 
-### Process 
-1. Draw Triangle
-2. 
+# Layers
+
+### Progress
+
