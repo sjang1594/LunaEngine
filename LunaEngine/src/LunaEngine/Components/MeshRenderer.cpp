@@ -12,6 +12,12 @@ MeshRenderer::MeshRenderer() : Component(ComponentType::MESH_RENDERER) {}
 
 MeshRenderer::~MeshRenderer() {}
 
+std::string MeshRenderer::GetMeshName() const
+{
+    if (_mesh && !_mesh->name.empty()) return _mesh->name;
+    return {};
+}
+
 void MeshRenderer::Render()
 {
     if (!_mesh)
@@ -20,7 +26,6 @@ void MeshRenderer::Render()
         return;
     }
 
-    // Build model matrix from this object's Transform component
     auto transform = GetTransform();
     XMMATRIX  world = transform ? transform->GetWorldMatrix() : XMMatrixIdentity();
     XMFLOAT4X4 model;

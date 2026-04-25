@@ -1,4 +1,6 @@
 #pragma once
+#include <string>
+#include <memory>
 
 namespace Luna
 {
@@ -18,15 +20,19 @@ public:
     }
 
     void Update();
-    void LoadScene(wstring sceneName);
+    void LoadScene(std::wstring sceneName);
+
+    void SetSceneAsset(const std::string& assetName) { _sceneAsset = assetName; }
+    void LoadSceneFromFile(const std::string& absolutePath);
 
     // Release the active scene before backend shutdown so D3D12MA allocations
     // in Mesh objects are freed while the allocator is still alive.
     void ResetActiveScene() { _activeScene.reset(); }
 
-    shared_ptr<Scene> GetActiveScene() { return _activeScene; }
+    std::shared_ptr<Scene> GetActiveScene() { return _activeScene; }
 private:
-    shared_ptr<Scene> _activeScene;
-    shared_ptr<Scene> LoadTestScene(); 
+    std::shared_ptr<Scene> _activeScene;
+    std::string _sceneAsset = "DamagedHelmet.glb";  // default asset
+    std::shared_ptr<Scene> LoadTestScene(); 
 };
 }

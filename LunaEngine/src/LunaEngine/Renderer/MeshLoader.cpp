@@ -11,6 +11,8 @@
 #include "Renderer/MeshLoader.h"
 #include "Renderer/Mesh.h"
 #include "Logger/Logger.h"
+#include <unordered_map>
+#include <functional>
 
 namespace Luna
 {
@@ -109,6 +111,7 @@ static bool DecodeImage(const cgltf_image* image, const std::string& gltfDir,
 
 // ---------------------------------------------------------------------------
 // LoadGLTF — parse glTF/GLB, interleave PBRVertex[], upload to GPU.
+// Phase 21: walks glTF node tree to extract per-mesh world transforms.
 // Also extracts MaterialCreateInfo for each unique material (no GPU work for textures).
 // ---------------------------------------------------------------------------
 LoadResult MeshLoader::LoadGLTF(
@@ -147,134 +150,200 @@ LoadResult MeshLoader::LoadGLTF(
     struct StagingEntry { ComPtr<ID3D12Resource> buf; D3D12MA::Allocation* alloc = nullptr; };
     std::vector<StagingEntry> stagingBuffers;
 
-    for (cgltf_size mi = 0; mi < data->meshes_count; ++mi)
+    // Phase 21: texture decode dedup cache — avoids decoding the same cgltf_image multiple times
+    struct DecodedImage { std::vector<uint8_t> pixels; uint32_t w = 0, h = 0; bool valid = false; };
+    std::unordered_map<const cgltf_image*, DecodedImage> imageCache;
+
+    auto DecodeImageCached = [&](const cgltf_image* img, std::vector<uint8_t>& outPx,
+                                  uint32_t& outW, uint32_t& outH) -> bool {
+        if (!img) return false;
+        auto it = imageCache.find(img);
+        if (it == imageCache.end()) {
+            DecodedImage decoded;
+            decoded.valid = DecodeImage(img, gltfDir, decoded.pixels, decoded.w, decoded.h);
+            it = imageCache.emplace(img, std::move(decoded)).first;
+        }
+        if (!it->second.valid) return false;
+        outPx = it->second.pixels;  // copy (shared across materials)
+        outW  = it->second.w;
+        outH  = it->second.h;
+        return true;
+    };
+
+    // Phase 21: helper to process a single primitive with a given world transform
+    auto ProcessPrimitive = [&](cgltf_mesh* gltfMesh, cgltf_size mi, cgltf_size pi,
+                                 cgltf_primitive& prim, const XMFLOAT4X4& worldTransform)
     {
-        cgltf_mesh& gltfMesh = data->meshes[mi];
+        if (prim.type != cgltf_primitive_type_triangles) return;
 
-        for (cgltf_size pi = 0; pi < gltfMesh.primitives_count; ++pi)
+        // Find accessors for POSITION / NORMAL / TEXCOORD_0 / TANGENT
+        cgltf_accessor* posAcc  = nullptr;
+        cgltf_accessor* nrmAcc  = nullptr;
+        cgltf_accessor* uvAcc   = nullptr;
+        cgltf_accessor* tanAcc  = nullptr;
+
+        for (cgltf_size ai = 0; ai < prim.attributes_count; ++ai)
         {
-            cgltf_primitive& prim = gltfMesh.primitives[pi];
-            if (prim.type != cgltf_primitive_type_triangles) continue;
+            cgltf_attribute& attr = prim.attributes[ai];
+            if      (attr.type == cgltf_attribute_type_position)  posAcc = attr.data;
+            else if (attr.type == cgltf_attribute_type_normal)    nrmAcc = attr.data;
+            else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) uvAcc  = attr.data;
+            else if (attr.type == cgltf_attribute_type_tangent)   tanAcc = attr.data;
+        }
 
-            // ----------------------------------------------------------------
-            // Find accessors for POSITION / NORMAL / TEXCOORD_0 / TANGENT
-            // ----------------------------------------------------------------
-            cgltf_accessor* posAcc  = nullptr;
-            cgltf_accessor* nrmAcc  = nullptr;
-            cgltf_accessor* uvAcc   = nullptr;
-            cgltf_accessor* tanAcc  = nullptr;
+        if (!posAcc)
+        {
+            LUNA_LOG_WARN("cgltf: primitive %zu/%zu has no POSITION — skipped", mi, pi);
+            return;
+        }
 
-            for (cgltf_size ai = 0; ai < prim.attributes_count; ++ai)
+        const cgltf_size vertCount = posAcc->count;
+        std::vector<PBRVertex> vertices(vertCount);
+
+        for (cgltf_size v = 0; v < vertCount; ++v)
+        {
+            float pos[3] = {0,0,0};
+            cgltf_accessor_read_float(posAcc, v, pos, 3);
+            vertices[v].position = {pos[0], pos[1], pos[2]};
+
+            float nrm[3] = {0,1,0};
+            if (nrmAcc) cgltf_accessor_read_float(nrmAcc, v, nrm, 3);
+            vertices[v].normal = {nrm[0], nrm[1], nrm[2]};
+
+            float uv[2] = {0,0};
+            if (uvAcc) cgltf_accessor_read_float(uvAcc, v, uv, 2);
+            vertices[v].uv = {uv[0], uv[1]};
+
+            float tan[4] = {1,0,0,1};
+            if (tanAcc) cgltf_accessor_read_float(tanAcc, v, tan, 4);
+            vertices[v].tangent = {tan[0], tan[1], tan[2], tan[3]};
+        }
+
+        // Index buffer
+        std::vector<uint32_t> indices;
+        if (prim.indices)
+        {
+            const cgltf_size idxCount = prim.indices->count;
+            indices.resize(idxCount);
+            for (cgltf_size i = 0; i < idxCount; ++i)
+                indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, i));
+        }
+        else
+        {
+            indices.resize(vertCount);
+            for (cgltf_size i = 0; i < vertCount; ++i)
+                indices[i] = static_cast<uint32_t>(i);
+        }
+
+        // Upload to DEFAULT heap
+        auto mesh = std::make_unique<Mesh>();
+
+        StagingEntry vbStaging, ibStaging;
+
+        mesh->vertexBuffer = UploadBuffer(
+            allocator, cmdList,
+            vertices.data(), vertices.size() * sizeof(PBRVertex),
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            &mesh->vbAlloc,
+            vbStaging.buf, &vbStaging.alloc);
+
+        mesh->indexBuffer = UploadBuffer(
+            allocator, cmdList,
+            indices.data(), indices.size() * sizeof(uint32_t),
+            D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            &mesh->ibAlloc,
+            ibStaging.buf, &ibStaging.alloc);
+
+        stagingBuffers.push_back(std::move(vbStaging));
+        stagingBuffers.push_back(std::move(ibStaging));
+
+        mesh->vbView.BufferLocation = mesh->vertexBuffer->GetGPUVirtualAddress();
+        mesh->vbView.SizeInBytes    = static_cast<UINT>(vertices.size() * sizeof(PBRVertex));
+        mesh->vbView.StrideInBytes  = sizeof(PBRVertex);
+
+        mesh->ibView.BufferLocation = mesh->indexBuffer->GetGPUVirtualAddress();
+        mesh->ibView.SizeInBytes    = static_cast<UINT>(indices.size() * sizeof(uint32_t));
+        mesh->ibView.Format         = DXGI_FORMAT_R32_UINT;
+
+        mesh->indexCount    = static_cast<UINT>(indices.size());
+        mesh->materialIndex = (prim.material)
+            ? static_cast<UINT>(prim.material - data->materials)
+            : 0;
+
+        // Phase 12: compute object-space bounding sphere (centroid + max radius)
+        {
+            XMVECTOR centroid = XMVectorZero();
+            for (const auto& v : vertices)
+                centroid = XMVectorAdd(centroid, XMLoadFloat3(&v.position));
+            centroid = XMVectorScale(centroid, 1.0f / (float)vertices.size());
+            XMFLOAT3 c; XMStoreFloat3(&c, centroid);
+
+            float maxR2 = 0.0f;
+            for (const auto& v : vertices)
             {
-                cgltf_attribute& attr = prim.attributes[ai];
-                if      (attr.type == cgltf_attribute_type_position)  posAcc = attr.data;
-                else if (attr.type == cgltf_attribute_type_normal)    nrmAcc = attr.data;
-                else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) uvAcc  = attr.data;
-                else if (attr.type == cgltf_attribute_type_tangent)   tanAcc = attr.data;
+                XMVECTOR diff = XMVectorSubtract(XMLoadFloat3(&v.position), centroid);
+                float r2 = XMVectorGetX(XMVector3LengthSq(diff));
+                if (r2 > maxR2) maxR2 = r2;
             }
+            mesh->boundingSphere = { c.x, c.y, c.z, sqrtf(maxR2) };
+        }
 
-            if (!posAcc)
-            {
-                LUNA_LOG_WARN("cgltf: primitive %zu/%zu has no POSITION — skipped", mi, pi);
-                continue;
-            }
+        result.meshes.push_back(std::move(mesh));
+        result.transforms.push_back(worldTransform);
 
-            const cgltf_size vertCount = posAcc->count;
-            std::vector<PBRVertex> vertices(vertCount);
+        // Build display name: "MeshName/Prim_N" or "Mesh_M/Prim_N"
+        std::string displayName;
+        if (gltfMesh->name && gltfMesh->name[0])
+            displayName = gltfMesh->name;
+        else
+            displayName = "Mesh_" + std::to_string(mi);
+        if (gltfMesh->primitives_count > 1)
+            displayName += "/Prim_" + std::to_string(pi);
+        result.meshNames.push_back(std::move(displayName));
+    };
 
-            for (cgltf_size v = 0; v < vertCount; ++v)
-            {
-                float pos[3] = {0,0,0};
-                cgltf_accessor_read_float(posAcc, v, pos, 3);
-                vertices[v].position = {pos[0], pos[1], pos[2]};
+    // Phase 21: recursive node tree traversal — extract world transforms
+    std::function<void(const cgltf_node*, XMMATRIX)> TraverseNode;
+    TraverseNode = [&](const cgltf_node* node, XMMATRIX parentWorld)
+    {
+        // Compute this node's local transform
+        float localMat[16];
+        cgltf_node_transform_local(node, localMat);
+        // cgltf returns column-major; XMMATRIX constructor takes row-major → transpose
+        XMMATRIX local = XMMatrixTranspose(XMMATRIX(localMat));
+        XMMATRIX world = XMMatrixMultiply(local, parentWorld);
 
-                float nrm[3] = {0,1,0};
-                if (nrmAcc) cgltf_accessor_read_float(nrmAcc, v, nrm, 3);
-                vertices[v].normal = {nrm[0], nrm[1], nrm[2]};
+        // If this node has a mesh, process all its primitives
+        if (node->mesh)
+        {
+            XMFLOAT4X4 worldF;
+            XMStoreFloat4x4(&worldF, world);
 
-                float uv[2] = {0,0};
-                if (uvAcc) cgltf_accessor_read_float(uvAcc, v, uv, 2);
-                vertices[v].uv = {uv[0], uv[1]};
+            cgltf_size mi = (cgltf_size)(node->mesh - data->meshes);
+            for (cgltf_size pi = 0; pi < node->mesh->primitives_count; ++pi)
+                ProcessPrimitive(node->mesh, mi, pi, node->mesh->primitives[pi], worldF);
+        }
 
-                float tan[4] = {1,0,0,1};
-                if (tanAcc) cgltf_accessor_read_float(tanAcc, v, tan, 4);
-                vertices[v].tangent = {tan[0], tan[1], tan[2], tan[3]};
-            }
+        // Recurse children
+        for (cgltf_size ci = 0; ci < node->children_count; ++ci)
+            TraverseNode(node->children[ci], world);
+    };
 
-            // ----------------------------------------------------------------
-            // Index buffer
-            // ----------------------------------------------------------------
-            std::vector<uint32_t> indices;
-            if (prim.indices)
-            {
-                const cgltf_size idxCount = prim.indices->count;
-                indices.resize(idxCount);
-                for (cgltf_size i = 0; i < idxCount; ++i)
-                    indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, i));
-            }
-            else
-            {
-                indices.resize(vertCount);
-                for (cgltf_size i = 0; i < vertCount; ++i)
-                    indices[i] = static_cast<uint32_t>(i);
-            }
-
-            // ----------------------------------------------------------------
-            // Upload to DEFAULT heap
-            // ----------------------------------------------------------------
-            auto mesh = std::make_unique<Mesh>();
-
-            StagingEntry vbStaging, ibStaging;
-
-            mesh->vertexBuffer = UploadBuffer(
-                allocator, cmdList,
-                vertices.data(), vertices.size() * sizeof(PBRVertex),
-                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                &mesh->vbAlloc,
-                vbStaging.buf, &vbStaging.alloc);
-
-            mesh->indexBuffer = UploadBuffer(
-                allocator, cmdList,
-                indices.data(), indices.size() * sizeof(uint32_t),
-                D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                &mesh->ibAlloc,
-                ibStaging.buf, &ibStaging.alloc);
-
-            stagingBuffers.push_back(std::move(vbStaging));
-            stagingBuffers.push_back(std::move(ibStaging));
-
-            mesh->vbView.BufferLocation = mesh->vertexBuffer->GetGPUVirtualAddress();
-            mesh->vbView.SizeInBytes    = static_cast<UINT>(vertices.size() * sizeof(PBRVertex));
-            mesh->vbView.StrideInBytes  = sizeof(PBRVertex);
-
-            mesh->ibView.BufferLocation = mesh->indexBuffer->GetGPUVirtualAddress();
-            mesh->ibView.SizeInBytes    = static_cast<UINT>(indices.size() * sizeof(uint32_t));
-            mesh->ibView.Format         = DXGI_FORMAT_R32_UINT;
-
-            mesh->indexCount    = static_cast<UINT>(indices.size());
-            mesh->materialIndex = (prim.material)
-                ? static_cast<UINT>(prim.material - data->materials)
-                : 0;
-
-            // Phase 12: compute object-space bounding sphere (centroid + max radius)
-            {
-                XMVECTOR centroid = XMVectorZero();
-                for (const auto& v : vertices)
-                    centroid = XMVectorAdd(centroid, XMLoadFloat3(&v.position));
-                centroid = XMVectorScale(centroid, 1.0f / (float)vertices.size());
-                XMFLOAT3 c; XMStoreFloat3(&c, centroid);
-
-                float maxR2 = 0.0f;
-                for (const auto& v : vertices)
-                {
-                    XMVECTOR diff = XMVectorSubtract(XMLoadFloat3(&v.position), centroid);
-                    float r2 = XMVectorGetX(XMVector3LengthSq(diff));
-                    if (r2 > maxR2) maxR2 = r2;
-                }
-                mesh->boundingSphere = { c.x, c.y, c.z, sqrtf(maxR2) };
-            }
-
-            result.meshes.push_back(std::move(mesh));
+    // Walk all scenes (typically just one)
+    XMMATRIX identity = XMMatrixIdentity();
+    if (data->scenes_count > 0)
+    {
+        const cgltf_scene& scene = data->scene ? *data->scene : data->scenes[0];
+        for (cgltf_size ni = 0; ni < scene.nodes_count; ++ni)
+            TraverseNode(scene.nodes[ni], identity);
+    }
+    else
+    {
+        // No scene defined — fall back to iterating root nodes
+        for (cgltf_size ni = 0; ni < data->nodes_count; ++ni)
+        {
+            if (data->nodes[ni].parent == nullptr)
+                TraverseNode(&data->nodes[ni], identity);
         }
     }
 
@@ -284,6 +353,7 @@ LoadResult MeshLoader::LoadGLTF(
 
     // -----------------------------------------------------------------------
     // Phase 5B: Extract MaterialCreateInfo for each unique glTF material
+    // Phase 21: uses texture decode cache for dedup
     // -----------------------------------------------------------------------
     result.materials.resize(data->materials_count);
     for (cgltf_size mi = 0; mi < data->materials_count; ++mi)
@@ -302,29 +372,32 @@ LoadResult MeshLoader::LoadGLTF(
 
             // Albedo / base-color texture
             if (pbr.base_color_texture.texture && pbr.base_color_texture.texture->image)
-                DecodeImage(pbr.base_color_texture.texture->image, gltfDir,
+                DecodeImageCached(pbr.base_color_texture.texture->image,
                             info.albedoPixels, info.albedoW, info.albedoH);
 
             // Metallic-roughness texture (G=roughness, B=metallic per glTF spec)
             if (pbr.metallic_roughness_texture.texture && pbr.metallic_roughness_texture.texture->image)
-                DecodeImage(pbr.metallic_roughness_texture.texture->image, gltfDir,
+                DecodeImageCached(pbr.metallic_roughness_texture.texture->image,
                             info.metalRoughPixels, info.metalRoughW, info.metalRoughH);
         }
 
         // Normal map
         if (mat.normal_texture.texture && mat.normal_texture.texture->image)
-            DecodeImage(mat.normal_texture.texture->image, gltfDir,
+            DecodeImageCached(mat.normal_texture.texture->image,
                         info.normalPixels, info.normalW, info.normalH);
 
         // Emissive texture
         if (mat.emissive_texture.texture && mat.emissive_texture.texture->image)
-            DecodeImage(mat.emissive_texture.texture->image, gltfDir,
+            DecodeImageCached(mat.emissive_texture.texture->image,
                         info.emissivePixels, info.emissiveW, info.emissiveH);
     }
 
+    LUNA_LOG_INFO("Texture cache: %zu unique images decoded (dedup savings)",
+                  imageCache.size());
+
     cgltf_free(data);
-    LUNA_LOG_INFO("Loaded %zu mesh(es) and %zu material(s) from %s",
-                  result.meshes.size(), result.materials.size(), path.c_str());
+    LUNA_LOG_INFO("Loaded %zu mesh(es), %zu material(s), %zu transforms from %s",
+                  result.meshes.size(), result.materials.size(), result.transforms.size(), path.c_str());
     return result;
 }
 

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <deque>
 #include <vector>
 
 namespace Luna
@@ -88,15 +89,15 @@ public:
                            VkImageAspectFlags   aspect = VK_IMAGE_ASPECT_COLOR_BIT);
 
     // Add a render pass; returns a PassBuilder to chain Read/Write/Execute calls.
-    // The PassBuilder is stored inside the graph — do not cache the returned reference
-    // across Reset() calls.
+    // Uses std::deque internally — references remain valid across subsequent AddPass() calls.
     PassBuilder& AddPass(const char* name);
 
     // Cull dead passes (no SideEffect and no live consumer), compute barrier schedule.
     void Compile();
 
     // Emit barriers and invoke execute callbacks in compiled order.
-    void Execute(VkCommandBuffer cmd);
+    // If profiler is non-null and enabled, auto-inserts timestamps around each pass.
+    void Execute(VkCommandBuffer cmd, class VulkanGPUProfiler* profiler = nullptr);
 
     // Discard all passes and reset image states to their imported values.
     void Reset();
@@ -109,7 +110,7 @@ private:
                      VkAccessFlags        newAccess);
 
     std::vector<ImportedImage> _images;
-    std::vector<PassBuilder>   _passes;
+    std::deque<PassBuilder>    _passes;  // deque: references stable across push_back
 };
 
 } // namespace Luna

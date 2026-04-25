@@ -49,11 +49,12 @@ void main()
     vec3 n = texelFetch(normalTex, ivec2(launchIndex), 0).xyz * 2.0 - 1.0;
     worldPos += n * 0.005;
 
-    payload.shadow = 1.0;
+    // Initialize to 0.0 (shadowed) — miss shader will set to 1.0 (lit) if no hit
+    payload.shadow = 0.0;
 
     traceRayEXT(
         tlas,
-        gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
         0xFF,
         0,
         1,

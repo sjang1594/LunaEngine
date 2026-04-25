@@ -12,8 +12,10 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std140) uniform CB {
-    uint  gFaceSize;
-    uvec3 _pad;
+    uint gFaceSize;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
 layout(set = 0, binding = 1) uniform texture2D    gEquirect;

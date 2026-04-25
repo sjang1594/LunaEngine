@@ -4,7 +4,7 @@
 **Platform:** Windows 11 · DirectX 12 · Vulkan
 **Language:** C++17
 **Build system:** Premake5 → MSBuild / Visual Studio 2022
-**Last updated:** 2026-04-22
+**Last updated:** 2026-04-25
 
 ---
 
@@ -88,9 +88,13 @@ GLFW window → DX12Device (DXGI adapter selection) → ID3D12CommandQueue
 | 17    | 2026-04-18 | Vulkan PP stack parity — TAA (taa.frag.hlsl reused; [[vk::binding]] annotations; Halton jitter; YCoCg neighbourhood clamp; per-frame UBO); bloom (bloom_bright.frag.hlsl + bloom_blur.frag.hlsl; half-res RGBA16F ping-pong; _ppRenderPass); full tonemap (tonemapping_vk_full.frag.hlsl; swapchain _tonemapRenderPass); _vkTAALayout (UBO+3SAMPLED_IMAGE+2SAMPLER); _vkPP1SRVLayout (1SAMPLED_IMAGE+1SAMPLER); _vkPP2SRVLayout (2SAMPLED_IMAGE+1SAMPLER+1SAMPLER); UpdatePPDescriptors() updates TAA history ping-pong each frame; both backends now have full feature parity |
 | 18A   | 2026-04-20 | Build verification + progress documentation — environment.hdr placement instructions; progress.md extended with Phases 15B–17 |
 | 18B   | 2026-04-20 | Screen-space motion blur (both backends) — motion_blur.frag.hlsl (8-tap exponential weight, velocity from depth+invViewProj/prevViewProj reconstruction); DX12: MotionBlur RSL + root sig; _motionBlurRT (RGBA16F, dedicated 1-slot RTV heap); per-frame MotionBlurConstants CB (256 B, UPLOAD); DrawMotionBlurPass() after SSR, before TAA; DrawTAAPass() reads _motionBlurSRVIndex when MB active; Vulkan: _mbImage (RGBA16F) + _mbFB via _ppRenderPass; per-frame UBOs + descriptor sets; DrawVKMotionBlurPass() before DrawVKTAAPass; TAA binding=1 (currentFrame) wired to _mbView when available |
-| 18C   | 2026-04-20 | Vulkan render graph — VulkanRenderGraph.h/cpp; ImportImage() tracks VkImage state (layout+stage+access); PassBuilder Read/Write/SideEffect/Execute API mirrors DX12 RenderGraph; Compile() backward flood-fill from SideEffect passes culls dead passes; Execute() emits vkCmdPipelineBarrier per transition before each pass; Reset() restores initial image states; **Note**: implemented and compiles but not yet wired into VulkanBackend frame loop (manual barriers still in use) |
+| 18C   | 2026-04-23 | Vulkan render graph wired into frame loop — VulkanRenderGraph.h/cpp; ImportImage() tracks VkImage state (layout+stage+access); PassBuilder Read/Write/SideEffect/Execute API mirrors DX12 RenderGraph; Compile() backward flood-fill from SideEffect passes culls dead passes; Execute() emits vkCmdPipelineBarrier per transition before each pass; Reset() restores initial image states; **Now wired into VulkanBackend::CompositeFrame()** — replaces 10 manual vkCmdPipelineBarrier calls (RT shadow mask, HDR/SSR compute, TAA/bloom/blur inter-pass execution dependencies); PP helper functions (DrawVKTAAPass, DrawVKBloomBrightPass, DrawVKBloomBlurPass) stripped of trailing barriers; FlushDraws() retains manual buffer barriers (graph is image-only) |
 | 18D   | 2026-04-20 | Vulkan ray tracing — VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline + VK_KHR_deferred_host_operations + VK_KHR_buffer_device_address extensions conditionally enabled in VulkanDevice.cpp; VkPhysicalDeviceFeatures2 probe chain (asFeatures+rtFeatures+bdaFeatures) before device creation; graceful retry without RT on failure; _rtSupported flag propagated to VulkanBackend; rt_shadows_vk.rgen/rmiss/rchit.glsl (GLSL 4.60 + GL_EXT_ray_tracing); full BLAS build (per-mesh, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR) + single-instance TLAS; SBT buffer (host-visible, SHADER_BINDING_TABLE_BIT + SHADER_DEVICE_ADDRESS_BIT) with 3 entries (rgen/miss/chit, handleSizeAligned stride); vkCmdTraceRaysKHR dispatched per frame after SSAO, before deferred lighting; shadow mask (R8_UNORM, GENERAL layout) written by raygen, transitioned to SHADER_READ_ONLY_OPTIMAL for fragment reads at deferred lighting binding=13; rtEnabled UBO flag selects RT shadow vs CSM fallback in deferred_lighting_ibl_vk.frag.glsl |
 | 19    | 2026-04-22 | DX12/Vulkan rendering parity bug-fix — 5 sessions of systematic diagnosis and 3 root-cause fixes achieving visual parity between backends (see Bug-Fix Sessions below) |
+| 21    | 2026-04-23 | Multi-mesh scene support — glTF node tree traversal (cgltf_node_transform_local) for per-mesh world transforms; texture decode dedup cache (std::unordered_map<cgltf_image*>); Transform::SetWorldMatrix() raw matrix override; SceneManager::SetSceneAsset() configurable asset path; --scene CLI argument; both DX12 and Vulkan backends walk the node hierarchy instead of iterating meshes directly |
+| 22    | 2026-04-24 | GPU profiler overlay — per-pass GPU timestamp queries (DX12: ID3D12QueryHeap + ResolveQueryData; Vulkan: vkCmdWriteTimestamp + vkGetQueryPoolResults); named Begin/End regions (GBuffer Fill, GPU Cull, Indirect Draw, CSM Shadows, Hi-Z Build, SSAO, Deferred Lighting, SSR, TAA, Bloom, Tonemap); ImGui overlay window with per-pass ms timings and bar chart; both backends |
+| 23    | 2026-04-25 | Hi-Z occlusion culling (both backends) — Hi-Z pyramid generation: blit depth (D32_SFLOAT) → R32_SFLOAT mip 0, then iterative min-downsample via compute (hiz_generate.comp.hlsl / hiz_generate_vk.comp.glsl, 8×8 workgroups, min of 2×2 parent texels); ~11 mip levels for 1080p; per-mip descriptor sets + GENERAL layout storage images; DX12: CreateHiZResources() (committed R32_FLOAT, UAV+SRV per mip, HiZGenerate root sig + PSO), BuildHiZPyramid() (resource barriers + Dispatch per mip), called at end of FlushDraws(); Vulkan: CreateHiZResources() (VkImage R32_SFLOAT, per-mip VkImageView, compute pipeline + descriptor pool), BuildHiZPyramid(cmd) (vkCmdBlitImage depth→mip0, then vkCmdDispatch per mip with inter-mip COMPUTE→COMPUTE barriers), called in FlushDraws() pre-cull AND CompositeFrame() post-draw with depth layout restore barrier (READ_ONLY→ATTACHMENT→TRANSFER_SRC→ATTACHMENT→READ_ONLY); gpu_cull.comp.hlsl / gpu_cull_vk.comp.glsl extended: HiZTestSphere() projects bounding sphere to screen AABB, picks mip where 1 texel covers AABB, samples 4 corners, rejects if object.z > min(occluder depths); enableHiZ push constant / CullConstants flag; _hizReady bool gates activation (first frame = frustum-only); Bug #009: depth layout mismatch fix (see Docs/bug-fix/009) |
+| 20    | 2026-04-25 | Vulkan async compute — dedicated compute queue discovery (VK_QUEUE_COMPUTE_BIT without VK_QUEUE_GRAPHICS_BIT, fallback: second queue from graphics family); per-frame VkCommandPool + VkCommandBuffer + VkSemaphore + VkFence for compute-only submissions; DispatchCullAsync() records cull dispatch on compute queue with queue ownership release barriers (srcQueueFamilyIndex=compute, dstQueueFamilyIndex=graphics) for _indirectArgBuffer and _drawCountBuffer; FlushDraws() restructured: async path dispatches cull on compute queue + records acquire barriers on graphics cmd, fallback path keeps single-queue dispatch; EndFrame() chains computeDoneSemaphore into graphics VkSubmitInfo (DRAW_INDIRECT stage wait); same-family handling uses VK_QUEUE_FAMILY_IGNORED; Hi-Z pyramid stays on graphics queue; graceful fallback when async not available |
 
 ---
 
@@ -665,6 +669,114 @@ PassBuilder&     SideEffect();                          // fluent; marks pass as
 
 ---
 
+## Phase 22 — GPU Profiler Overlay
+
+**Date:** 2026-04-24
+
+Per-pass GPU timestamp profiler with ImGui overlay for both backends.
+
+### Implementation
+
+- **DX12**: `DX12GPUProfiler` — `ID3D12QueryHeap` (TIMESTAMP type) + `ResolveQueryData` into readback buffer; `InsertBeginTimestamp`/`InsertEndTimestamp` wrap named regions; `CollectTimings` reads resolved timestamps via GPU frequency
+- **Vulkan**: `VulkanGPUProfiler` — `VkQueryPool` (TIMESTAMP type) + `vkGetQueryPoolResults`; `WriteBeginTimestamp(cmd, name)`/`WriteEndTimestamp(cmd)` insert `vkCmdWriteTimestamp` commands; per-frame query pool reset via `vkCmdResetQueryPool`
+- **ImGui overlay**: `GPUProfilerOverlay` renders a translucent window with per-pass ms timings and horizontal bar chart; colour-coded pass names; total frame GPU time
+
+### Named Regions
+
+GBuffer Fill, GPU Cull, Indirect Draw, CSM Shadows, Hi-Z Build, SSAO, SSAO Blur, Deferred Lighting, RT Shadows, SSR, Motion Blur, TAA, Bloom Bright, Bloom Blur, Tonemap
+
+---
+
+## Phase 23 — Hi-Z Occlusion Culling
+
+**Date:** 2026-04-25
+
+Two-stage GPU culling: frustum rejection (Phase 12) + Hi-Z depth-based occlusion rejection. Objects fully behind existing geometry are eliminated before any draw calls, reducing vertex and fragment workload proportional to scene depth complexity.
+
+### Architecture
+
+```
+Per frame:
+  1. BuildHiZPyramid (prev-frame depth → mip chain)
+  2. GPU Cull Dispatch:
+       for each object:
+         a. Frustum test (6-plane sphere test) → reject if outside
+         b. Hi-Z test (project sphere → AABB → sample pyramid) → reject if occluded
+         c. Survivors → atomic append indirect draw command
+  3. vkCmdDrawIndexedIndirectCount / ExecuteIndirect
+  4. BuildHiZPyramid (current-frame depth → ready for next frame)
+```
+
+### Hi-Z Pyramid Generation
+
+- **Input**: Full-res depth buffer (D32_SFLOAT)
+- **Mip 0**: Blit/copy depth → R32_SFLOAT (DX12: `CopyTextureRegion`; Vulkan: `vkCmdBlitImage`)
+- **Mip 1..N**: Compute shader `hiz_generate.comp.hlsl` / `hiz_generate_vk.comp.glsl`
+  - 8×8 workgroups, each thread reads 2×2 texels from parent mip, outputs `min()` (conservative closest surface)
+  - Push constants: `srcW, srcH, dstW, dstH`
+  - Per-mip descriptor set: source = combined image sampler (mip N-1), dest = storage image (mip N)
+  - Inter-mip barrier: `COMPUTE_WRITE → COMPUTE_READ`
+- **Mip count**: `ceil(log2(max(width,height))) + 1`, capped at 16 (HIZ_MAX_MIPS)
+- **Layout**: `VK_IMAGE_LAYOUT_GENERAL` for storage image writes; DX12 uses `UAV` state
+
+### HiZTestSphere (Cull Shader)
+
+```hlsl
+bool HiZTestSphere(float3 centreWS, float radius)
+{
+    float4 clip = mul(float4(centreWS, 1), viewProj);
+    if (clip.w <= 0) return true;  // behind near plane → visible
+    float3 ndc = clip.xyz / clip.w;
+
+    // Project sphere to screen AABB
+    float2 screenRadius = abs(radius * float2(viewProj[0][0], viewProj[1][1]) / clip.w) * 0.5;
+    float2 uv = ndc.xy * 0.5 + 0.5;  uv.y = 1 - uv.y;
+    float2 uvMin = saturate(uv - screenRadius);
+    float2 uvMax = saturate(uv + screenRadius);
+
+    // Pick mip where 1 texel covers the AABB
+    float maxDim = max((uvMax - uvMin) * screenSize);
+    uint mip = min(uint(ceil(log2(maxDim))), hizMipCount - 1);
+
+    // Sample 4 AABB corners → take min (closest occluder)
+    float occluder = min(min(
+        HiZ.SampleLevel(samp, uvMin, mip),
+        HiZ.SampleLevel(samp, uvMax, mip)),
+      min(
+        HiZ.SampleLevel(samp, float2(uvMax.x, uvMin.y), mip),
+        HiZ.SampleLevel(samp, float2(uvMin.x, uvMax.y), mip)));
+
+    return ndc.z <= occluder;  // visible if in front of occluder
+}
+```
+
+### Vulkan Depth Layout Management
+
+`BuildHiZPyramid` requires depth in `ATTACHMENT_OPTIMAL` and leaves it there. Two call sites have different postcondition requirements:
+
+| Call Site | Pre-call Layout | Post-call Need | Extra Barrier |
+|-----------|----------------|---------------|---------------|
+| `FlushDraws()` pre-cull | `ATTACHMENT_OPTIMAL` (already transitioned) | `ATTACHMENT_OPTIMAL` (re-open G-buffer pass) | None |
+| `CompositeFrame()` post-draw | `READ_ONLY_OPTIMAL` (render pass finalLayout) | `READ_ONLY_OPTIMAL` (render graph expects it) | `READ_ONLY→ATTACHMENT` before, `ATTACHMENT→READ_ONLY` after |
+
+See **Bug #009** (`Docs/bug-fix/009_hiz_depth_layout_mismatch.md`) for the crash this caused and the fix.
+
+### Files Added/Modified
+
+| File | Type | Description |
+|------|------|-------------|
+| `Shaders/hiz_generate.comp.hlsl` | New | DX12 Hi-Z mip downsample compute (SM 6.0) |
+| `Shaders/hiz_generate_vk.comp.glsl` | New | Vulkan Hi-Z mip downsample compute (GLSL 4.50) |
+| `Shaders/gpu_cull.comp.hlsl` | Modified | Added `HiZTestSphere()`, `enableHiZ` flag, Hi-Z SRV binding |
+| `Shaders/gpu_cull_vk.comp.hlsl` | Modified | Same for Vulkan variant |
+| `Shaders/gpu_cull_vk.comp.glsl` | Modified | Same for GLSL variant |
+| `DX12Backend.cpp` | Modified | `CreateHiZResources()`, `DestroyHiZResources()`, `BuildHiZPyramid()` |
+| `DX12Backend.h` | Modified | Hi-Z member variables |
+| `VulkanBackend.cpp` | Modified | `CreateHiZResources()`, `DestroyHiZResources()`, `BuildHiZPyramid(cmd)`, CompositeFrame depth restore |
+| `VulkanBackend.h` | Modified | Hi-Z member variables |
+
+---
+
 ## Bug-Fix Sessions (Phase 19 — Rendering Parity)
 
 Five systematic debugging sessions (documented in `bug-fix/001–005`) resolved all visual
@@ -736,8 +848,14 @@ Without anisotropic filtering, UV seam artifacts were amplified.
 | 17    | ★★★      | Vulkan PP stack parity (TAA + bloom + tonemap) | ✅ Done |
 | 18A   | ★☆☆      | Build verification + progress docs | ✅ Done |
 | 18B   | ★★☆      | Screen-space motion blur (both backends) | ✅ Done |
-| 18C   | ★★☆      | Vulkan render graph | ✅ Implemented (not yet wired into frame loop) |
+| 18C   | ★★☆      | Vulkan render graph | ✅ Done (wired into frame loop) |
 | 18D   | ★★★      | Vulkan ray tracing (full BLAS/TLAS/SBT + dispatch) | ✅ Done |
 | 19    | ★★★      | DX12/Vulkan rendering parity bug-fix | ✅ Done |
-| 20    | ★☆☆      | Vulkan async compute | Planned |
-| 21    | ★☆☆      | Multi-mesh scene (Sponza, Bistro) | Planned |
+| 19B   | ★☆☆      | FPS / frame-time overlay in custom title bar | ✅ Done |
+| 21    | ★★★      | Multi-mesh scene (Sponza, Bistro) | ✅ Done |
+| 22    | ★★★      | GPU profiler overlay (timestamp queries + ImGui bar chart) | ✅ Done |
+| 23    | ★★★      | Hi-Z occlusion culling (2-pass GPU cull) | ✅ Done |
+| 20    | ★★☆      | Vulkan async compute | ✅ Done |
+| 24    | ★★☆      | Clustered/tiled forward lighting (multi-light support) | Planned |
+| 25    | ★★☆      | Mesh shaders (DX12 SM 6.5 amplification + mesh shader) | Planned |
+| 26    | ★☆☆      | Vulkan render graph: transient resource aliasing | Planned |

@@ -9,6 +9,9 @@ Transform::~Transform() {}
 
 XMMATRIX Transform::GetWorldMatrix() const
 {
+    if (useRawMatrix)
+        return XMLoadFloat4x4(&rawMatrix);
+
     XMMATRIX S = XMMatrixScaling(scale.x, scale.y, scale.z);
     XMMATRIX R = XMMatrixRotationRollPitchYaw(
         XMConvertToRadians(rotation.x),

@@ -4,6 +4,7 @@
 #include "D3D12MemAlloc.h"
 #include "Renderer/Mesh.h"
 #include "Renderer/HAL/Public/IRenderBackend.h"
+#include "DX12GPUProfiler.h"
 
 namespace Luna
 {
@@ -21,12 +22,10 @@ struct FrameResource
     ComPtr<ID3D12Resource>         mvpCB;
     void*                          mvpCBMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS      mvpCBGPUAddr = 0;
-    // Phase 7: per-frame scene constants (invVP, eyePos, lightDir/Color)
     ComPtr<ID3D12Resource>         sceneCB;
     void*                          sceneCBMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS      sceneCBGPUAddr = 0;
     UINT64                         fenceValue   = 0;
-    // Phase 13: per-frame async compute command allocator
     ComPtr<ID3D12CommandAllocator> computeCmdAllocator;
     UINT64                         computeFenceValue = 0;
 };
@@ -55,9 +54,10 @@ class DX12Backend : public IRenderBackend
     void DrawMesh(const Mesh* mesh, const XMFLOAT4X4& model) override;
     void SetVSync(bool vsync) override { _vsync = vsync; }
 
-    // Load all primitives from a glTF/GLB file and store them in _sceneMeshes.
-    // Returns references (shared_ptrs) so callers can hand them to MeshRenderers.
+    IGPUProfiler* GetGPUProfiler() override { return &_gpuProfiler; }
+
     std::vector<std::shared_ptr<Mesh>> LoadMeshes(const std::string& path) override;
+    std::vector<XMFLOAT4X4> GetLastLoadTransforms() const override { return _lastLoadTransforms; }
 
     const char *GetBackendName() const override { return "DirectX 12"; }
 
@@ -71,8 +71,6 @@ class DX12Backend : public IRenderBackend
     D3D12_CPU_DESCRIPTOR_HANDLE       GetRTV(int32 index) const { return _rtvHandle[index]; }
     D3D12_CPU_DESCRIPTOR_HANDLE       GetBackBufferView();
 
-    // SRV heap slot allocation — callers get the next free CPU/GPU descriptor handle pair
-    // Returns the index so callers can refer back to it
     UINT AllocateSRVSlot(D3D12_CPU_DESCRIPTOR_HANDLE& outCPU, D3D12_GPU_DESCRIPTOR_HANDLE& outGPU);
 
     D3D12MA::Allocator* GetD3D12MAAllocator() const { return _d3d12maAllocator; }
@@ -87,19 +85,16 @@ class DX12Backend : public IRenderBackend
     bool CreateDepthBuffer();
     bool CreateVertexBuffer();
     bool CreateMVPConstantBuffer();
-    bool CreateSceneCBs();   // Phase 7: per-frame SceneConstants CB
+    bool CreateSceneCBs();
     bool InitD3D12MA();
     bool CreateShadowUAV();
-    bool CreateGBuffer();    // Phase 7: G-buffer textures + SRV/RTV descriptors
-    void DestroyGBuffer();   // Phase 7: release G-buffer resources (not SRV slot indices)
-    bool CreateCSMResources();  // Phase 8: CSM shadow map array + DSV heap + SRV slot
-    void DestroyCSMResources(); // Phase 8: release CSM resources (not SRV slot index)
-    void UpdateCSMMatrices(const XMFLOAT4X4& view, const XMFLOAT4X4& proj); // Phase 8
-    void DrawCSMPass();         // Phase 8: 4-cascade depth draw
+    bool CreateGBuffer();
+    void DestroyGBuffer();
+    bool CreateCSMResources();
+    void DestroyCSMResources();
+    void UpdateCSMMatrices(const XMFLOAT4X4& view, const XMFLOAT4X4& proj);
+    void DrawCSMPass();
 
-    // Phase 9: SSAO (declared in private section with members below)
-
-    // Phase 10: post-process — declared here (TAAConstants is in private members below)
     bool CreatePostProcessResources();
     void DestroyPostProcessResources();
     void DrawTAAPass();
@@ -152,7 +147,7 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12GraphicsCommandList> _commandList;
 
     // -----------------------------------------------------------------------
-    // Phase 13: Async compute queue — GPU cull dispatch overlaps graphics
+    // Async compute queue
     // -----------------------------------------------------------------------
     ComPtr<ID3D12CommandQueue>        _computeQueue;
     ComPtr<ID3D12GraphicsCommandList> _computeCommandList;
@@ -198,7 +193,7 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12Resource>  _depthBuffer;
 
     // -----------------------------------------------------------------------
-    // Triangle geometry (UPLOAD heap — Phase 1 legacy, replaced by D3D12MA in Phase 2C)
+    // Triangle geometry (fallback, UPLOAD heap)
     // -----------------------------------------------------------------------
     ComPtr<ID3D12Resource>   _vertexBuffer;
     D3D12_VERTEX_BUFFER_VIEW _vertexBufferView = {};
@@ -207,15 +202,16 @@ class DX12Backend : public IRenderBackend
     // -----------------------------------------------------------------------
     // Pipelines
     // -----------------------------------------------------------------------
-    std::unique_ptr<class DX12Pipeline> _cbvPipeline;           // triangle (constantbuffer shaders)
-    std::unique_ptr<class DX12Pipeline> _gbufferPipeline;       // Phase 7: G-buffer fill (PBR vert + gbuffer.frag)
-    std::unique_ptr<class DX12Pipeline> _lightingPipeline;      // Phase 7: deferred lighting (fullscreen vert + deferred_lighting.frag)
-    std::unique_ptr<class DX12Pipeline> _meshPreviewPipeline;   // PBR vertex + normal shading
+    std::unique_ptr<class DX12Pipeline> _cbvPipeline;
+    std::unique_ptr<class DX12Pipeline> _gbufferPipeline;
+    std::unique_ptr<class DX12Pipeline> _lightingPipeline;
+    std::unique_ptr<class DX12Pipeline> _meshPreviewPipeline;
 
     // -----------------------------------------------------------------------
     // Scene meshes — loaded from glTF, drawn via MeshRenderer::Render()
     // -----------------------------------------------------------------------
     std::vector<std::shared_ptr<Mesh>> _sceneMeshes;
+    std::vector<XMFLOAT4X4>            _lastLoadTransforms;
 
     // Cached camera matrices — set by UpdateMVP(), used by DrawMesh() per object
     XMFLOAT4X4 _lastView = {};
@@ -224,7 +220,7 @@ class DX12Backend : public IRenderBackend
     // -----------------------------------------------------------------------
     // Presentation
     // -----------------------------------------------------------------------
-    bool _vsync = false;  // P2-04: controlled via SetVSync()
+    bool _vsync = false;
 
     // -----------------------------------------------------------------------
     // DXR shadow map
@@ -239,12 +235,12 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12RTPipeline>     _rtPipeline;
 
     // -----------------------------------------------------------------------
-    // Phase 7: G-buffer resources
+    // G-buffer
     // -----------------------------------------------------------------------
     static constexpr UINT GBUFFER_COUNT = 3;
 
     // -----------------------------------------------------------------------
-    // Phase 8: Cascaded Shadow Maps (CSM)
+    // Cascaded Shadow Maps
     // -----------------------------------------------------------------------
     static constexpr UINT CSM_CASCADE_COUNT = 4;
     static constexpr UINT CSM_SHADOW_SIZE   = 2048;
@@ -282,7 +278,7 @@ class DX12Backend : public IRenderBackend
     UINT _shadowSRVIndex = UINT_MAX;  // read-only SRV for shadow UAV (consecutive after depth)
 
     // -----------------------------------------------------------------------
-    // Phase 9: Screen-Space Ambient Occlusion (SSAO)
+    // SSAO
     // -----------------------------------------------------------------------
     bool CreateSSAOResources();
     void DestroySSAOResources();
@@ -331,7 +327,7 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12Pipeline> _ssaoBlurPipeline;
 
     // -----------------------------------------------------------------------
-    // Phase 10: Post-process stack — HDR buffer, TAA, Bloom, ACES tone map
+    // Post-process stack — HDR, TAA, Bloom, ACES tone mapping
     // -----------------------------------------------------------------------
     struct TAAConstants
     {
@@ -380,18 +376,16 @@ class DX12Backend : public IRenderBackend
     D3D12_CPU_DESCRIPTOR_HANDLE  _bloomBlurRTV      = {};
     UINT                         _bloomBlurSRVIndex = UINT_MAX;
 
-    // Combined RTV heap for all Phase 10 targets: [HDR, hist0, hist1, bright, blurH]
     ComPtr<ID3D12DescriptorHeap> _ppRtvHeap;
 
-    // Phase 10 pipelines
-    std::unique_ptr<class DX12Pipeline> _lightingPipelineHDR;  // DeferredLighting, R16G16B16A16_FLOAT output
+    std::unique_ptr<class DX12Pipeline> _lightingPipelineHDR;
     std::unique_ptr<class DX12Pipeline> _taaPipeline;
     std::unique_ptr<class DX12Pipeline> _bloomBrightPipeline;
     std::unique_ptr<class DX12Pipeline> _bloomBlurPipeline;
     std::unique_ptr<class DX12Pipeline> _toneMappingPipeline;
 
     // -----------------------------------------------------------------------
-    // Phase 12: GPU-driven rendering — indirect draw + GPU frustum culling
+    // GPU-driven indirect rendering
     // -----------------------------------------------------------------------
     void FlushDraws() override;
     bool CreateIndirectResources();
@@ -418,8 +412,10 @@ class DX12Backend : public IRenderBackend
     std::vector<GPUObjectData> _cpuInstances;  // CPU staging list (filled by DrawMesh)
 
     // GPU object data SSBO (uploaded from _cpuInstances each frame)
-    ComPtr<ID3D12Resource>  _objectDataBuffer;
-    D3D12MA::Allocation*    _objectDataAlloc = nullptr;
+    // Per-frame to avoid CPU-GPU race (Bug #010: previous frame's GPU may still be reading)
+    ComPtr<ID3D12Resource>  _objectDataBuffer[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _objectDataAlloc[FRAMES_IN_FLIGHT] = {};
+    void*                   _objectDataMapped[FRAMES_IN_FLIGHT] = {};
 
     // Indirect argument buffer — one per frame slot to avoid compute/graphics queue race
     ComPtr<ID3D12Resource>  _indirectArgBuffer[FRAMES_IN_FLIGHT];
@@ -451,11 +447,36 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12Pipeline> _indirectGBufPipeline;
 
     // -----------------------------------------------------------------------
-    // Phase 14: IBL Environment Mapping
+    // Hi-Z Occlusion Culling
+    // -----------------------------------------------------------------------
+    bool CreateHiZResources();
+    void DestroyHiZResources();
+    void BuildHiZPyramid();  // dispatches mip-chain generation on graphics cmd list
+
+    static constexpr UINT HIZ_MAX_MIPS = 13;  // enough for up to 4096² resolution
+
+    ComPtr<ID3D12Resource>  _hizTexture;               // R32_FLOAT, full-res, multi-mip, UAV+SRV
+    D3D12MA::Allocation*    _hizTextureAlloc = nullptr;
+    UINT                    _hizMipCount = 0;          // actual mip count (computed from resolution)
+    bool                    _hizReady    = false;       // true after first pyramid build
+
+    // Per-mip SRV and UAV slot indices in _imGuiSrvHeap (for Hi-Z generation dispatches)
+    UINT _hizMipSRVIndex[HIZ_MAX_MIPS] = {};  // SRV for reading mip N
+    UINT _hizMipUAVIndex[HIZ_MAX_MIPS] = {};  // UAV for writing mip N
+
+    // Full-pyramid SRV (all mips, for cull shader sampling via SampleLevel)
+    UINT _hizFullSRVIndex = UINT_MAX;
+
+    // Hi-Z generation compute pipeline (one dispatch per mip)
+    std::unique_ptr<class DX12Pipeline> _hizGeneratePipeline;
+
+    // Non-shader-visible UAV heap for per-mip ClearUnorderedAccessViewFloat
+    ComPtr<ID3D12DescriptorHeap> _hizNonVisUAVHeap;
+
+    // -----------------------------------------------------------------------
+    // IBL Environment Mapping
     // -----------------------------------------------------------------------
 public:
-    // Load an equirectangular HDR file and kick off GPU precompute.
-    // Call once after Init(). Returns true on success.
     bool LoadHDREnvironment(const std::string& hdrPath);
 
 private:
@@ -510,7 +531,7 @@ private:
     std::unique_ptr<class DX12Pipeline> _lightingPipelineIBL;  // deferred lighting + IBL variant
 
     // -----------------------------------------------------------------------
-    // Phase 16B: Screen-Space Reflections (SSR)
+    // Screen-Space Reflections (SSR)
     // -----------------------------------------------------------------------
     bool CreateSSRResources();
     void DestroySSRResources();
@@ -531,7 +552,7 @@ private:
     void*                   _ssrCBMapped[FRAMES_IN_FLIGHT] = {};
 
     // -----------------------------------------------------------------------
-    // Phase 18B: Screen-Space Motion Blur
+    // Screen-Space Motion Blur
     // -----------------------------------------------------------------------
     bool CreateMotionBlurResources();
     void DestroyMotionBlurResources();
@@ -568,5 +589,10 @@ private:
 
     // Previous-frame view-proj (for velocity computation)
     XMFLOAT4X4 _mbLastViewProj = {};
+
+    // -----------------------------------------------------------------------
+    // GPU Profiler
+    // -----------------------------------------------------------------------
+    DX12GPUProfiler _gpuProfiler;
 };
 } // namespace Luna

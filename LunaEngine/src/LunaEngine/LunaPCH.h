@@ -15,8 +15,6 @@
 #include <windows.h>
 #include <filesystem>
 
-// Selective std:: usings — avoids the blanket "using namespace std" that caused
-// the std::byte / BYTE collision (P3-01).  Add to this list only as needed.
 using std::shared_ptr;
 using std::unique_ptr;
 using std::weak_ptr;

@@ -2,6 +2,7 @@
 
 #include <LunaEngine/LunaPCH.h>
 #include <LunaEngine/Renderer/HAL/Public/IRenderBackend.h>
+#include <LunaEngine/Renderer/Vulkan/Public/VulkanGPUProfiler.h>
 
 namespace Luna
 {
@@ -42,17 +43,16 @@ class VulkanBackend : public IRenderBackend
 
     // Load all primitives from a glTF/GLB file
     std::vector<std::shared_ptr<Mesh>> LoadMeshes(const std::string& path) override;
+    std::vector<XMFLOAT4X4> GetLastLoadTransforms() const override { return _lastLoadTransforms; }
 
     // Debug: procedural 2×2m quad (bypasses glTF, uses default white material)
     std::vector<std::shared_ptr<Mesh>> LoadDebugQuad() override;
 
-    // Phase 15B: flush accumulated DrawMesh() calls via GPU-driven indirect rendering
     void FlushDraws() override;
-
-    // Phase 15C: load equirectangular HDR + run IBL precompute on GPU
     bool LoadHDREnvironment(const std::string& hdrPath) override;
 
     const char* GetBackendName() const override { return "Vulkan"; }
+    IGPUProfiler* GetGPUProfiler() override { return &_gpuProfiler; }
 
   private:
     // ---------------------------------------------------------------------------
@@ -127,6 +127,12 @@ class VulkanBackend : public IRenderBackend
 
     VkDebugUtilsMessengerEXT _debugMessenger = VK_NULL_HANDLE;
 
+    // Device lost flag - once set, all frame operations bail out early
+    bool _deviceLost = false;
+
+    // Dedicated command pool for single-time/transfer commands (avoids race with frame pools)
+    VkCommandPool _transferCmdPool = VK_NULL_HANDLE;
+
     // ---------------------------------------------------------------------------
     // Swapchain
     // ---------------------------------------------------------------------------
@@ -173,7 +179,6 @@ class VulkanBackend : public IRenderBackend
         void*           mvpMapped  = nullptr;
         VkDescriptorSet mvpDescSet = VK_NULL_HANDLE;
 
-        // Phase 5C: Per-frame scene UBO (eyePosition + directional light) — set=0, binding=1
         VkBuffer       sceneBuffer = VK_NULL_HANDLE;
         VkDeviceMemory sceneMemory = VK_NULL_HANDLE;
         void*          sceneMapped = nullptr;
@@ -228,7 +233,7 @@ class VulkanBackend : public IRenderBackend
         float    viewMatrix[16];               //  64 B — camera view matrix
         float    lightVP[4][16];               // 256 B — per-cascade light VP
         float    cascadeSplits[4];             //  16 B
-        uint32_t rtEnabled;    uint32_t _p2[3]; //  16 B — Phase 18D RT shadow flag
+        uint32_t rtEnabled;    uint32_t _p2[3]; //  16 B
     };
 
     VkDescriptorSetLayout _deferredSceneLayout = VK_NULL_HANDLE; // set=0: scene UBO
@@ -333,7 +338,7 @@ class VulkanBackend : public IRenderBackend
     VkSampler _ssaoBilinearClamp= VK_NULL_HANDLE;
 
     // ---------------------------------------------------------------------------
-    // Phase 15B: GPU-driven indirect rendering
+    // GPU-driven indirect rendering
     // ---------------------------------------------------------------------------
     static constexpr uint32_t MAX_GPU_OBJECTS = 1024;
 
@@ -412,7 +417,55 @@ class VulkanBackend : public IRenderBackend
                               const std::vector<std::vector<uint32_t>>& allIdxs);
 
     // ---------------------------------------------------------------------------
-    // Phase 15C: IBL environment lighting
+    // Hi-Z Occlusion Culling
+    // ---------------------------------------------------------------------------
+    bool CreateHiZResources();
+    void DestroyHiZResources();
+    void BuildHiZPyramid(VkCommandBuffer cmd);  // dispatches mip-chain generation
+
+    // ---------------------------------------------------------------------------
+    // Async Compute
+    // ---------------------------------------------------------------------------
+    bool _asyncComputeReady = false;
+    bool _computeSubmittedThisFrame = false;  // per-frame flag for EndFrame semaphore wait
+
+    struct VkComputeFrameResource
+    {
+        VkCommandPool   cmdPool   = VK_NULL_HANDLE;
+        VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+        VkSemaphore     doneSemaphore = VK_NULL_HANDLE;  // signaled by compute submit, waited by graphics
+        VkFence         fence     = VK_NULL_HANDLE;       // CPU wait for compute completion
+    };
+    VkComputeFrameResource _computeFrames[FRAMES_IN_FLIGHT];
+
+    bool CreateAsyncComputeResources();
+    void DestroyAsyncComputeResources();
+    void DispatchCullAsync();  // record + submit cull on compute queue
+
+    static constexpr uint32_t HIZ_MAX_MIPS = 13;
+
+    VkImage        _hizImage        = VK_NULL_HANDLE;   // R32_SFLOAT, multi-mip
+    VkDeviceMemory _hizMemory       = VK_NULL_HANDLE;
+    VkImageView    _hizMipView[HIZ_MAX_MIPS] = {};     // per-mip views for compute read/write
+    VkImageView    _hizFullView     = VK_NULL_HANDLE;   // all-mip view for cull shader sampling
+    uint32_t       _hizMipCount     = 0;
+    bool           _hizReady        = false;
+
+    // Hi-Z generation compute pipeline
+    VkDescriptorSetLayout _hizGenDescLayout = VK_NULL_HANDLE;  // binding 0: sampledImage, binding 1: storageImage
+    VkDescriptorPool      _hizGenDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet       _hizGenDescSet[HIZ_MAX_MIPS] = {};   // one per mip transition
+    VkPipelineLayout      _hizGenPipeLayout = VK_NULL_HANDLE;
+    VkPipeline            _hizGenPipeline   = VK_NULL_HANDLE;
+    VkSampler             _hizSampler       = VK_NULL_HANDLE;  // point-clamp for Hi-Z reads
+
+    // Hi-Z UBO for cull shader (viewProj + screenSize)
+    VkBuffer       _hizParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory _hizParamsMem    = VK_NULL_HANDLE;
+    void*          _hizParamsMapped = nullptr;
+
+    // ---------------------------------------------------------------------------
+    // IBL environment lighting
     // ---------------------------------------------------------------------------
     bool _iblReady = false;
 
@@ -482,7 +535,7 @@ class VulkanBackend : public IRenderBackend
         VkDeviceMemory  uboMem    = VK_NULL_HANDLE;
         void*           uboMapped = nullptr;
         VkDescriptorSet descSet   = VK_NULL_HANDLE;
-        uint32_t        bindlessIndex = 0;  // Phase 15B: index into bindless texture arrays
+        uint32_t        bindlessIndex = 0;
         // Scalar PBR factors (for GPU-driven material SSBO)
         float albedoFactor[4]  = {1,1,1,1};
         float metallicFactor   = 0.0f;
@@ -496,13 +549,14 @@ class VulkanBackend : public IRenderBackend
         VkBuffer        indexBuffer  = VK_NULL_HANDLE;
         VkDeviceMemory  indexMemory  = VK_NULL_HANDLE;
         uint32_t        indexCount   = 0;
-        XMFLOAT4        boundingSphere = {0,0,0,0};  // Phase 15B: object-space bounding sphere
+        XMFLOAT4        boundingSphere = {0,0,0,0};
         std::shared_ptr<VkMaterial> material;
     };
 
     std::vector<std::shared_ptr<VkSceneMesh>> _vkSceneMeshes;
+    std::vector<XMFLOAT4X4>                  _lastLoadTransforms;
 
-    // Phase 18D: per-mesh info cache for AS build (populated in BuildMergedGeometry)
+    // Per-mesh info cache for acceleration structure build (populated in BuildMergedGeometry)
     struct MeshASInfo { uint32_t indexCount; uint32_t firstIndex; int32_t vertexOffset; uint32_t vertexCount; };
     std::vector<MeshASInfo> _meshASInfoCache;
 
@@ -522,8 +576,17 @@ class VulkanBackend : public IRenderBackend
     uint32_t _height = 0;
     bool     _vsync  = false;  // false=MAILBOX/IMMEDIATE, true=FIFO
 
+    // Deferred resize — applied at the start of BeginFrame to avoid
+    // destroying framebuffers while a command buffer is recording.
+    bool     _pendingResize  = false;
+    uint32_t _pendingResizeW = 0;
+    uint32_t _pendingResizeH = 0;
+
+    // Frames since last resize — RT is disabled for a few frames after resize to stabilize
+    uint32_t _framesSinceResize = 100;  // Start high so RT is enabled immediately
+
     // ---------------------------------------------------------------------------
-    // Phase 10: Post-process stack — HDR, TAA, Bloom, ACES
+    // Post-process stack — HDR, TAA, Bloom, ACES
     // ---------------------------------------------------------------------------
     struct VKTAAConstants        // must match taa.frag.hlsl cbuffer (160 B)
     {
@@ -618,7 +681,7 @@ class VulkanBackend : public IRenderBackend
     void*          _vkTaaCBMapped[FRAMES_IN_FLIGHT] = {};
 
     // ---------------------------------------------------------------------------
-    // Phase 16C: SSR + HDR RT intermediate
+    // SSR + HDR render target
     // ---------------------------------------------------------------------------
     // SSR image (R16G16B16A16_SFLOAT, STORAGE | SAMPLED, kept in GENERAL)
     VkImage        _ssrImage  = VK_NULL_HANDLE;
@@ -648,7 +711,7 @@ class VulkanBackend : public IRenderBackend
     VkPipeline            _vkSSRTonemapPipeline   = VK_NULL_HANDLE;
 
     // ---------------------------------------------------------------------------
-    // Phase 18B: Screen-Space Motion Blur (Vulkan)
+    // Screen-Space Motion Blur
     // ---------------------------------------------------------------------------
     struct VKMotionBlurConstants  // 152 B → padded to 256 B in UBO
     {
@@ -681,14 +744,11 @@ class VulkanBackend : public IRenderBackend
     XMFLOAT4X4     _vkMBLastVP = {};  // previous-frame VP for motion vectors
 
     // ---------------------------------------------------------------------------
-    // Phase 18C: Vulkan Render Graph
+    // Render Graph
     // ---------------------------------------------------------------------------
-    // VulkanRenderGraph is used in CompositeFrame() to automatically schedule barriers.
-    // Included inline here to avoid header dependency in the public interface.
-    // The actual graph object is forward-declared and instantiated in the .cpp.
 
     // ---------------------------------------------------------------------------
-    // Phase 18D: Vulkan Ray Tracing
+    // Ray Tracing
     // ---------------------------------------------------------------------------
     struct VKAccelStruct
     {
@@ -741,6 +801,9 @@ class VulkanBackend : public IRenderBackend
     void DestroyAccelerationStructures();
     bool CreateRTPipeline();
     void DestroyRTPipeline();
+
+    // ── GPU Profiler ──
+    VulkanGPUProfiler _gpuProfiler;
 };
 
 } // namespace Luna

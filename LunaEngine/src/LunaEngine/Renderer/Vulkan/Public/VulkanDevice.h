@@ -18,9 +18,12 @@ public:
     VkPhysicalDevice GetPhysicalDevice() const { return _physicalDevice; }
     VkQueue GetGraphicsQueue() const { return _graphicsQueue; }
     VkQueue GetPresentQueue() const { return _presentQueue; }
+    VkQueue GetComputeQueue() const { return _computeQueue; }
     uint32_t GetGraphicsQueueFamily() const { return _graphicsQueueFamily; }
     uint32_t GetPresentQueueFamily()  const { return _presentQueueFamily; }
-    bool     IsRTSupported()          const { return _rtSupported; }  // Phase 18D
+    uint32_t GetComputeQueueFamily()  const { return _computeQueueFamily; }
+    bool     IsRTSupported()          const { return _rtSupported; }
+    bool     IsAsyncComputeSupported() const { return _asyncComputeSupported; }
     
 private:
     bool PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface);
@@ -32,8 +35,11 @@ private:
     VkDevice            _device = VK_NULL_HANDLE;
     VkQueue             _graphicsQueue;
     VkQueue             _presentQueue;
+    VkQueue             _computeQueue = VK_NULL_HANDLE;
     uint32_t            _graphicsQueueFamily;
     uint32_t            _presentQueueFamily;
-    bool                _rtSupported = false;  // Phase 18D: set in CreateLogicalDevice
+    uint32_t            _computeQueueFamily = UINT32_MAX;
+    bool                _rtSupported = false;
+    bool                _asyncComputeSupported = false;
 };
 }

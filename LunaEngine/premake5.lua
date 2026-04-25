@@ -81,16 +81,16 @@ project "LunaEngine"
 
    -- Vendor files that must not use the project PCH
    filter { "files:../vendor/d3d12ma/src/D3D12MemAlloc.cpp" }
-      flags { "NoPCH" }
+      enablepch "Off"
 
    filter { "files:../vendor/imgui/backends/imgui_impl_dx12.cpp" }
-      flags { "NoPCH" }
+      enablepch "Off"
 
    filter { "files:../vendor/imgui/backends/imgui_impl_glfw.cpp" }
-      flags { "NoPCH" }
+      enablepch "Off"
 
     filter { "files:../vendor/imgui/backends/imgui_impl_vulkan.cpp" }
-      flags { "NoPCH" }
+      enablepch "Off"
 
    -- DX12Shader.cpp: unused FXC-era stub (DX12Shader != DX12ShaderProgram); exclude from build
    filter { "files:src/LunaEngine/Renderer/DX12/Private/DX12Shader.cpp" }

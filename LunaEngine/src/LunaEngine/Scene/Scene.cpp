@@ -1,9 +1,13 @@
 ﻿#include "LunaPCH.h"
 #include "Scene/Scene.h"
 #include "Components/GameObject.h"
+#include "Components/CameraComponent.h"
+#include "Components/LightComponent.h"
 
 namespace Luna
 {
+// ...existing code...
+
 void Scene::Awake()
 {
     for (const shared_ptr<GameObject>& gameObject : _gameObjects)
@@ -48,6 +52,26 @@ void Scene::RemoveGameObject(shared_ptr<GameObject> gameObject)
     {
         _gameObjects.erase(findIt);
     }
+}
+
+shared_ptr<CameraComponent> Scene::GetMainCamera() const
+{
+    for (const auto& go : _gameObjects)
+    {
+        auto comp = go->GetComponentByType(ComponentType::CAMERA);
+        if (comp) return std::static_pointer_cast<CameraComponent>(comp);
+    }
+    return nullptr;
+}
+
+shared_ptr<LightComponent> Scene::GetDirectionalLight() const
+{
+    for (const auto& go : _gameObjects)
+    {
+        auto comp = go->GetComponentByType(ComponentType::LIGHT);
+        if (comp) return std::static_pointer_cast<LightComponent>(comp);
+    }
+    return nullptr;
 }
 
 }

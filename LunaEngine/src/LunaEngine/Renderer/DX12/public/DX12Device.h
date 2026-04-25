@@ -17,7 +17,6 @@ public:
     IDXGIAdapter*         GetAdapter()       const { return _adapter.Get(); }
     UINT                  GetMSAAQuality()   const { return m4xMsaaQuality; }
 
-    // Phase 4A: DXR capability check
     bool SupportsDXR() const;
 
 private:

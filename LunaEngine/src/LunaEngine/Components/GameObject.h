@@ -7,7 +7,6 @@ class MeshRenderer;
 
 namespace Luna
 {
-// UNITY Style
 class GameObject : public std::enable_shared_from_this<GameObject>
 {
 public:
@@ -22,6 +21,12 @@ public:
     void LateUpdate();
 
     shared_ptr<Transform> GetTransform() const;
+    shared_ptr<Component> GetComponentByType(ComponentType type) const
+    {
+        uint8_t idx = static_cast<uint8_t>(type);
+        if (idx < FIXED_COMPONENT_COUNT) return _components[idx];
+        return nullptr;
+    }
     void AddComponent(shared_ptr<Component> shared);
     
 private:

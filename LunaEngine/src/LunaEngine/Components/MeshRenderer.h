@@ -13,6 +13,8 @@ public:
 
     virtual void Update() override { Render(); }
     void SetMesh(const shared_ptr<Mesh>& mesh) { _mesh = mesh; }
+    shared_ptr<Mesh> GetMesh() const { return _mesh; }
+    std::string GetMeshName() const;
 
     void Render();
 

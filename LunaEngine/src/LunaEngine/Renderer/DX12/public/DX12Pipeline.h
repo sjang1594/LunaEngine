@@ -34,7 +34,6 @@ class DX12Pipeline : public IPipeline
 #endif
 
   private:
-    // Phase 2B: DXC-based shader compilation (SM 6.0+, HLSL source)
     bool LoadShaderDXC(const std::wstring &path, const std::wstring &target,
                        ComPtr<IDxcBlob> &outBlob);
 

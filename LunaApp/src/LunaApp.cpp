@@ -1,4 +1,17 @@
+#include <LunaEngine/LunaPCH.h>
 #include <LunaEngine/Application/Application.h>
+#include <LunaEngine/Manager/SceneManager.h>
+#include <LunaEngine/Utils/FileDialog.h>
+#include <LunaEngine/UI/ViewGizmo.h>
+#include <LunaEngine/UI/TransformGizmo.h>
+#include <LunaEngine/UI/Selection.h>
+#include <LunaEngine/Utils/MathUtils.h>
+#include <Scene/Scene.h>
+#include <Components/GameObject.h>
+#include <Components/Transform.h>
+#include <Components/MeshRenderer.h>
+#include <Components/CameraComponent.h>
+#include <Components/LightComponent.h>
 #include <imgui.h>
 
 namespace Luna
@@ -13,19 +26,192 @@ class ExampleLayer : public Layer
 
     virtual void OnUpdate(float /*dt*/) override
     {
-        // Camera is updated automatically in Application::Run() each frame.
-        // Place per-frame game logic here.
+        std::string dialogPath;
+        if (Luna::PollFileDialogResult(dialogPath) && !dialogPath.empty())
+            Luna::SceneManager::GetInstance()->LoadSceneFromFile(dialogPath);
     }
 
     virtual void OnUIRender() override
     {
-        // Camera debug overlay
-        ImGui::Begin("Camera");
         Luna::Application& app = Luna::Application::Get();
-        Luna::Camera& cam = app.GetCamera();
+        auto scene = Luna::SceneManager::GetInstance()->GetActiveScene();
+        auto sceneCam = scene ? scene->GetMainCamera() : nullptr;
+
+        ImGui::Begin("Camera");
         ImGui::Text("Left-drag: orbit | Scroll: zoom");
-        XMFLOAT3 eye = cam.GetEyePosition();
-        ImGui::Text("Eye: (%.2f, %.2f, %.2f)", eye.x, eye.y, eye.z);
+        if (sceneCam)
+        {
+            XMFLOAT3 eye = sceneCam->GetEyePosition();
+            ImGui::Text("Eye: (%.2f, %.2f, %.2f)", eye.x, eye.y, eye.z);
+        }
+        ImGui::End();
+
+        if (sceneCam)
+            Luna::DrawViewGizmo(*sceneCam);
+        else
+            Luna::DrawViewGizmo(app.GetCamera());
+
+        static bool gizmoLocalSpace = false;
+        {
+            auto& sel = Luna::GetSelection();
+
+            if (!ImGui::GetIO().WantTextInput)
+            {
+                if (ImGui::IsKeyPressed(ImGuiKey_W)) Luna::SetGizmoMode(Luna::GizmoMode::Translate);
+                if (ImGui::IsKeyPressed(ImGuiKey_E)) Luna::SetGizmoMode(Luna::GizmoMode::Rotate);
+                if (ImGui::IsKeyPressed(ImGuiKey_R)) Luna::SetGizmoMode(Luna::GizmoMode::Scale);
+            }
+
+            if (sel.HasSelection())
+            {
+                auto selTransform = sel.selectedObject->GetTransform();
+                if (selTransform)
+                {
+                    if (sceneCam)
+                        Luna::DrawTransformGizmo(*sceneCam, *selTransform, gizmoLocalSpace);
+                    else
+                        Luna::DrawTransformGizmo(app.GetCamera(), *selTransform, gizmoLocalSpace);
+                }
+            }
+
+            ImGui::Begin("Gizmo");
+            auto mode = Luna::GetGizmoMode();
+            if (ImGui::RadioButton("Translate (W)", mode == Luna::GizmoMode::Translate))
+                Luna::SetGizmoMode(Luna::GizmoMode::Translate);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Rotate (E)", mode == Luna::GizmoMode::Rotate))
+                Luna::SetGizmoMode(Luna::GizmoMode::Rotate);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Scale (R)", mode == Luna::GizmoMode::Scale))
+                Luna::SetGizmoMode(Luna::GizmoMode::Scale);
+            ImGui::Checkbox("Local Space", &gizmoLocalSpace);
+            ImGui::End();
+        }
+
+        ImGui::Begin("Scene Inspector");
+        if (scene)
+        {
+            const auto& objects = scene->GetGameObjects();
+            ImGui::Text("Objects: %d", (int)objects.size());
+            ImGui::Separator();
+
+            auto& sel = Luna::GetSelection();
+            static int prevSelectedIndex = -1;
+            bool selectionChanged = (sel.selectedIndex != prevSelectedIndex);
+            prevSelectedIndex = sel.selectedIndex;
+            for (int idx = 0; idx < (int)objects.size(); ++idx)
+            {
+                const auto& go = objects[idx];
+                if (!go) continue;
+                auto transform = go->GetTransform();
+                if (!transform) continue;
+
+                std::string displayName;
+                auto camComp = std::dynamic_pointer_cast<Luna::CameraComponent>(
+                    go->GetComponentByType(Luna::ComponentType::CAMERA));
+                auto lightComp = std::dynamic_pointer_cast<Luna::LightComponent>(
+                    go->GetComponentByType(Luna::ComponentType::LIGHT));
+                auto mr = std::dynamic_pointer_cast<Luna::MeshRenderer>(
+                    go->GetComponentByType(Luna::ComponentType::MESH_RENDERER));
+
+                if (camComp)
+                    displayName = "Main Camera";
+                else if (lightComp)
+                    displayName = "Directional Light";
+                else if (mr)
+                {
+                    std::string meshName = mr->GetMeshName();
+                    displayName = meshName.empty() ? "Mesh " + std::to_string(idx) : meshName;
+                }
+                else
+                    displayName = "Object " + std::to_string(idx);
+
+                const char* icon = camComp ? "[Cam] " : lightComp ? "[Light] " : "[Mesh] ";
+                char label[128];
+                snprintf(label, sizeof(label), "%s%s##%d", icon, displayName.c_str(), idx);
+
+                bool isSelected = (sel.selectedIndex == idx);
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow;
+                if (isSelected) flags |= ImGuiTreeNodeFlags_Selected;
+
+                // Auto-expand tree node when newly selected
+                if (isSelected && selectionChanged)
+                    ImGui::SetNextItemOpen(true);
+
+                bool nodeOpen = ImGui::TreeNodeEx(label, flags);
+
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                {
+                    sel.selectedIndex = idx;
+                    sel.selectedObject = go;
+                }
+
+                if (nodeOpen)
+                {
+                    XMFLOAT3 pos, scl;
+                    XMFLOAT3 rot;
+                    if (transform->useRawMatrix)
+                    {
+                        XMMATRIX world = XMLoadFloat4x4(&transform->rawMatrix);
+                        XMVECTOR sv, rv, tv;
+                        XMMatrixDecompose(&sv, &rv, &tv, world);
+                        XMStoreFloat3(&pos, tv);
+                        XMStoreFloat3(&scl, sv);
+                        XMFLOAT4 q; XMStoreFloat4(&q, rv);
+                        rot = Luna::QuatToEulerDegrees(q);
+                    }
+                    else
+                    {
+                        pos = transform->position;
+                        rot = transform->rotation;
+                        scl = transform->scale;
+                    }
+
+                    bool changed = false;
+                    changed |= ImGui::DragFloat3("Position", &pos.x, 0.01f);
+                    changed |= ImGui::DragFloat3("Rotation", &rot.x, 0.5f);
+                    changed |= ImGui::DragFloat3("Scale",    &scl.x, 0.01f);
+                    if (changed)
+                    {
+                        transform->useRawMatrix = false;
+                        transform->position = pos;
+                        transform->rotation = rot;
+                        transform->scale    = scl;
+                    }
+
+                    if (camComp)
+                    {
+                        ImGui::Separator();
+                        ImGui::Text("Camera Properties");
+                        float fov = camComp->GetFovDegrees();
+                        if (ImGui::DragFloat("FOV", &fov, 0.5f, 10.0f, 120.0f))
+                            camComp->_fovRad = XMConvertToRadians(fov);
+                        ImGui::DragFloat("Near", &camComp->_nearZ, 0.01f, 0.001f, 10.0f);
+                        ImGui::DragFloat("Far",  &camComp->_farZ, 1.0f, 10.0f, 10000.0f);
+                        float radius = camComp->GetRadius();
+                        ImGui::Text("Orbit Radius: %.2f", radius);
+                    }
+
+                    if (lightComp)
+                    {
+                        ImGui::Separator();
+                        ImGui::Text("Light Properties");
+                        XMFLOAT3 dir = lightComp->GetDirection();
+                        if (ImGui::DragFloat3("Direction", &dir.x, 0.01f))
+                            lightComp->SetDirection(dir);
+                        ImGui::ColorEdit3("Color", &lightComp->color.x);
+                        ImGui::DragFloat("Intensity", &lightComp->intensity, 0.1f, 0.0f, 50.0f);
+                    }
+
+                    ImGui::TreePop();
+                }
+            }
+        }
+        else
+        {
+            ImGui::TextDisabled("No active scene");
+        }
+
         ImGui::End();
     }
 };
@@ -36,10 +222,11 @@ Application *Luna::CreateApplication(int argc, char **argv)
     spec.name    = "LunaApp";
     spec.width   = 1600;
     spec.height  = 900;
-    spec.backend = RenderBackendType::DirectX12;  // Default backend
+    spec.backend = RenderBackendType::DirectX12;
     spec.iconPath = "Resources/icon.png";
 
-    // Parse command line arguments for backend selection
+    std::string sceneAsset;
+
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
@@ -59,13 +246,28 @@ Application *Luna::CreateApplication(int argc, char **argv)
         {
             spec.backend = RenderBackendType::DirectX12;
         }
+        else if ((arg == "--scene" || arg == "-s") && i + 1 < argc)
+        {
+            sceneAsset = argv[++i];
+        }
     }
+
+    if (!sceneAsset.empty())
+        Luna::SceneManager::GetInstance()->SetSceneAsset(sceneAsset);
 
     Application *app = new Application(spec);
     app->PushLayer(std::make_shared<ExampleLayer>());
     app->SetMenubarCallback([app]() {
         if (ImGui::BeginMenu("File"))
         {
+            if (ImGui::MenuItem("Import Scene (glTF/GLB)...", nullptr, false,
+                                !Luna::IsFileDialogOpen()))
+            {
+                Luna::OpenFileDialogAsync(
+                    "Import glTF Scene",
+                    "glTF Files\0*.gltf;*.glb\0All Files\0*.*\0");
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Exit"))
                 app->Close();
             ImGui::EndMenu();

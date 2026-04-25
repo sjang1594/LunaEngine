@@ -26,6 +26,22 @@ bool VulkanDevice::Initialize(VkInstance instance, VkSurfaceKHR surface)
 
     vkGetDeviceQueue(_device, _graphicsQueueFamily, 0, &_graphicsQueue);
     vkGetDeviceQueue(_device, _presentQueueFamily, 0, &_presentQueue);
+
+    // Phase 20: Get compute queue
+    if (_asyncComputeSupported)
+    {
+        if (_computeQueueFamily == _graphicsQueueFamily)
+            vkGetDeviceQueue(_device, _computeQueueFamily, 1, &_computeQueue);  // second queue in same family
+        else
+            vkGetDeviceQueue(_device, _computeQueueFamily, 0, &_computeQueue);
+        LUNA_LOG_INFO("Phase 20: Async compute queue acquired (family %u, %s)",
+                      _computeQueueFamily,
+                      _computeQueueFamily != _graphicsQueueFamily ? "dedicated" : "shared family");
+    }
+    else
+    {
+        LUNA_LOG_INFO("Phase 20: No async compute queue — cull on graphics queue");
+    }
     return true;
 }
 
@@ -70,19 +86,45 @@ bool VulkanDevice::PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
 
 bool VulkanDevice::CreateLogicalDevice()
 {
-    float queuePriority = 1.0f;
+    float queuePriorities[2] = { 1.0f, 1.0f };
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     VkDeviceQueueCreateInfo queueCreateInfo {};
     queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     queueCreateInfo.queueFamilyIndex = _graphicsQueueFamily;
-    queueCreateInfo.queueCount = 1;
-    queueCreateInfo.pQueuePriorities = &queuePriority;
+
+    // Phase 20: If compute queue is from the same family, request 2 queues
+    if (_asyncComputeSupported && _computeQueueFamily == _graphicsQueueFamily)
+    {
+        queueCreateInfo.queueCount = 2;
+        queueCreateInfo.pQueuePriorities = queuePriorities;
+    }
+    else
+    {
+        queueCreateInfo.queueCount = 1;
+        queueCreateInfo.pQueuePriorities = queuePriorities;
+    }
     queueCreateInfos.push_back(queueCreateInfo);
 
     if (_graphicsQueueFamily != _presentQueueFamily)
     {
-        queueCreateInfo.queueFamilyIndex = _presentQueueFamily;
-        queueCreateInfos.push_back(queueCreateInfo);
+        VkDeviceQueueCreateInfo presentQueueInfo{};
+        presentQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        presentQueueInfo.queueFamilyIndex = _presentQueueFamily;
+        presentQueueInfo.queueCount = 1;
+        presentQueueInfo.pQueuePriorities = queuePriorities;
+        queueCreateInfos.push_back(presentQueueInfo);
+    }
+
+    // Phase 20: Dedicated compute family (different from graphics and present)
+    if (_asyncComputeSupported && _computeQueueFamily != _graphicsQueueFamily
+        && _computeQueueFamily != _presentQueueFamily)
+    {
+        VkDeviceQueueCreateInfo computeQueueInfo{};
+        computeQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        computeQueueInfo.queueFamilyIndex = _computeQueueFamily;
+        computeQueueInfo.queueCount = 1;
+        computeQueueInfo.pQueuePriorities = queuePriorities;
+        queueCreateInfos.push_back(computeQueueInfo);
     }
 
     // Phase 18D: probe RT support before enabling extensions
@@ -201,6 +243,8 @@ bool VulkanDevice::FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surfa
 
     bool graphicsFound = false;
     bool presentFound = false;
+    _computeQueueFamily = UINT32_MAX;
+    _asyncComputeSupported = false;
 
     for (uint32_t i = 0; i < queueFamilies.size(); i++)
     {
@@ -217,12 +261,31 @@ bool VulkanDevice::FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surfa
             presentFound = true;
         }
 
-        if (graphicsFound && presentFound) {
-            return true;
+        if (graphicsFound && presentFound) break;
+    }
+
+    if (!graphicsFound || !presentFound) return false;
+
+    // Phase 20: Find dedicated compute queue family (COMPUTE but NOT GRAPHICS)
+    for (uint32_t i = 0; i < queueFamilies.size(); i++)
+    {
+        if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+        {
+            _computeQueueFamily = i;
+            _asyncComputeSupported = true;
+            break;
         }
     }
 
-    return false;
+    // Fallback: use a second queue from the graphics family
+    if (!_asyncComputeSupported && queueFamilies[_graphicsQueueFamily].queueCount > 1)
+    {
+        _computeQueueFamily = _graphicsQueueFamily;
+        _asyncComputeSupported = true;
+    }
+
+    return true;
 }
 
 }

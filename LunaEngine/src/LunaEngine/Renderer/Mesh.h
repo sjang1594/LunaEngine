@@ -8,7 +8,6 @@ using namespace DirectX;
 namespace Luna
 {
 
-// Phase 12: Per-instance data uploaded to a GPU SSBO for indirect drawing + GPU culling.
 struct GPUObjectData
 {
     XMFLOAT4X4 model;           // 64 B — world transform
@@ -19,7 +18,7 @@ struct GPUObjectData
 };
 static_assert(sizeof(GPUObjectData) == 96, "GPUObjectData must be 96 bytes");
 
-// Phase 12: Per-mesh geometry info (offsets into merged VB/IB). Uploaded once at load time.
+// Per-mesh geometry offsets into the merged VB/IB for indirect drawing.
 struct MeshDrawInfo
 {
     UINT indexCount;    // number of indices
@@ -29,12 +28,7 @@ struct MeshDrawInfo
 };
 static_assert(sizeof(MeshDrawInfo) == 16, "MeshDrawInfo must be 16 bytes");
 
-// Phase 12: Layout must match D3D12 command signature byte order:
-//   [0] materialCBAddr (CBV, root param 1)      — offset  0 (8 B)
-//   [1] materialIndex  (CONSTANT, root param 2) — offset  8
-//   [2] objectIndex    (CONSTANT, root param 3) — offset 12
-//   [3] DRAW_INDEXED (IndexCountPerInstance … StartInstanceLocation) — offset 16
-//   pad to 40 B
+// Layout must match D3D12 command signature byte order (materialCBAddr, materialIndex, objectIndex, DRAW_INDEXED).
 struct IndirectDrawCommand
 {
     D3D12_GPU_VIRTUAL_ADDRESS materialCBAddr;     // offset  0 — CBV root param 1 (b1)
@@ -60,6 +54,8 @@ struct PBRVertex
 
 struct Mesh
 {
+    std::string name;  // display name (from glTF mesh/node name)
+
     ComPtr<ID3D12Resource> vertexBuffer;
     ComPtr<ID3D12Resource> indexBuffer;
     D3D12MA::Allocation*   vbAlloc = nullptr;
@@ -70,10 +66,8 @@ struct Mesh
     UINT                     indexCount    = 0;
     UINT                     materialIndex = 0;  // index into scene material array
 
-    // Phase 12: object-space bounding sphere (xyz=centre, w=radius), computed at load time
-    XMFLOAT4                 boundingSphere = {0,0,0,0};
+    XMFLOAT4                 boundingSphere = {0,0,0,0};  // object-space (xyz=centre, w=radius)
 
-    // Phase 5B: owning pointer to the GPU material (textures + CB).
     // Null = use mesh_preview (normal-diffuse) fallback pipeline.
     std::shared_ptr<Material> material;
 

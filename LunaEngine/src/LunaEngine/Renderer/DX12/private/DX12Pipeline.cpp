@@ -594,20 +594,30 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
     }
     else if (_desc.rootLayout == RootSignatureLayout::GPUCull)
     {
-        // Phase 12: GPU frustum cull compute root signature
-        //   params[0] b0 — 28 inline root constants (6 frustum planes + objectCount + pad = 28 DWORDs)
+        // Phase 12+23: GPU frustum + Hi-Z occlusion cull compute root signature
+        //   params[0] b0 — 48 inline root constants (frustum planes + objectCount + hizFlags + viewProj + screenSize = 48 DWORDs)
         //   params[1]    — SRV t0: StructuredBuffer<GPUObjectData>
         //   params[2]    — SRV t1: StructuredBuffer<MeshDrawInfo>
         //   params[3]    — UAV u0: RWStructuredBuffer<IndirectDrawCommand>
         //   params[4]    — UAV u1: RWByteAddressBuffer (draw count)
-        CD3DX12_ROOT_PARAMETER params[5];
-        params[0].InitAsConstants(28, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: CullConstants
+        //   params[5]    — SRV table t2: Texture2D<float> Hi-Z pyramid (Phase 23)
+        //   s0 = point-clamp sampler (for Hi-Z sampling)
+        CD3DX12_DESCRIPTOR_RANGE hizSrvRange;
+        hizSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
+
+        CD3DX12_ROOT_PARAMETER params[6];
+        params[0].InitAsConstants(48, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: CullConstants (192 B)
         params[1].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // t0: objects
         params[2].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);  // t1: meshInfo
         params[3].InitAsUnorderedAccessView(0, 0, D3D12_SHADER_VISIBILITY_ALL); // u0: drawArgs
         params[4].InitAsUnorderedAccessView(1, 0, D3D12_SHADER_VISIBILITY_ALL); // u1: drawCount
+        params[5].InitAsDescriptorTable(1, &hizSrvRange, D3D12_SHADER_VISIBILITY_ALL); // t2: Hi-Z
 
-        rootSigDesc.Init(5, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        CD3DX12_STATIC_SAMPLER_DESC sampler;
+        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+                     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
+        rootSigDesc.Init(6, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::PBRIndirect)
     {
@@ -878,6 +888,29 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::HiZGenerate)
+    {
+        // Phase 23: Hi-Z depth pyramid generation compute root signature
+        //   params[0] b0 — 4 inline root constants (srcW, srcH, dstW, dstH)
+        //   params[1]    — SRV table t0: source mip (Texture2D<float>)
+        //   params[2]    — UAV table u0: destination mip (RWTexture2D<float>)
+        //   s0 = point-clamp (compute-visible)
+        CD3DX12_DESCRIPTOR_RANGE srvRange;
+        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        CD3DX12_DESCRIPTOR_RANGE uavRange;
+        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+
+        CD3DX12_ROOT_PARAMETER params[3];
+        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: 4 DWORDs
+        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL); // t0
+        params[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL); // u0
+
+        CD3DX12_STATIC_SAMPLER_DESC sampler;
+        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+                     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
         rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }

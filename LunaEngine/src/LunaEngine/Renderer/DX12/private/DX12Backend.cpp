@@ -17,9 +17,6 @@
 namespace Luna
 {
 
-// ---------------------------------------------------------------------------
-// Test geometry — simple triangle kept from Phase 1 as a fallback visual
-// ---------------------------------------------------------------------------
 struct TriangleVertex
 {
     Vec3 position;
@@ -40,7 +37,6 @@ struct MVPConstants
     XMFLOAT4X4 proj;
 };
 
-// Phase 7+8: Scene-level constants for the deferred lighting pass.
 // Must match cbuffer SceneConstants in deferred_lighting.frag.hlsl.
 struct SceneConstants
 {
@@ -50,18 +46,13 @@ struct SceneConstants
     XMFLOAT3   lightDir;     //  12 B — toward-light, normalised
     float      _padLight;    //   4 B
     XMFLOAT4   lightColor;   //  16 B — xyz=color, w=intensity
-    // Phase 8: CSM
     XMFLOAT4X4 viewMatrix;   //  64 B — camera view matrix (for view-space depth)
     XMFLOAT4X4 lightVP[4];   // 256 B — light-space VP per cascade, row-major
     XMFLOAT4   cascadeSplits;//  16 B — view-space Z far plane per cascade
 };  // 448 B → round up to 512-byte aligned CB
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-// Constructor defined here (not in .h) so MSVC can see the complete types of
-// DX12AccelStructure and DX12RTPipeline when it instantiates the unique_ptr
-// members' destructors for exception-cleanup paths.
+// Constructor is defined here (not in .h) so MSVC sees complete types for DX12AccelStructure
+// and DX12RTPipeline when instantiating unique_ptr destructor exception-cleanup paths.
 DX12Backend::DX12Backend() = default;
 
 DX12Backend::~DX12Backend()
@@ -78,7 +69,8 @@ void DX12Backend::Shutdown()
         _fenceEvent = nullptr;
     }
 
-    // Phase 13: clean up async compute
+    _gpuProfiler.Shutdown();
+
     if (_computeFenceEvent)
     {
         CloseHandle(_computeFenceEvent);
@@ -86,16 +78,13 @@ void DX12Backend::Shutdown()
     }
     _asyncComputeReady = false;
 
-    // Phase 12: release GPU-driven rendering resources before D3D12MA allocator
+    // Release all render resources before destroying the D3D12MA allocator.
     DestroyIndirectResources();
-    // Phase 14: release IBL resources before D3D12MA allocator
+    DestroyHiZResources();
     DestroyIBLResources();
-    // Phase 9: release SSAO resources before CSM / G-buffer (all before D3D12MA allocator)
-    DestroyPostProcessResources();  // Phase 10: must be before D3D12MA allocator
+    DestroyPostProcessResources();
     DestroySSAOResources();
-    // Phase 8: release CSM resources before G-buffer (both before D3D12MA allocator)
     DestroyCSMResources();
-    // Phase 7: release G-buffer before D3D12MA allocator is destroyed
     DestroyGBuffer();
 
     // Release D3D12MA allocations before destroying the allocator.
@@ -254,6 +243,10 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
         LUNA_LOG_WARN("Post-process stack init failed — Phase 9 LDR path active");
     XMStoreFloat4x4(&_ppPrevVP, XMMatrixIdentity());  // safe initial value for TAA
 
+    // Phase 22: GPU profiler
+    if (!_gpuProfiler.Init(_device.Get(), _commandQueue.Get()))
+        LUNA_LOG_WARN("GPU profiler init failed — timing disabled");
+
     LUNA_LOG_INFO("DX12 backend initialized (frames-in-flight: %u)", FRAMES_IN_FLIGHT);
     return true;
 }
@@ -363,6 +356,20 @@ bool DX12Backend::CreateCommandQueueAndFenceEvent()
                 LUNA_LOG_INFO("Phase 13: Async compute queue created");
             else
                 LUNA_LOG_WARN("Phase 13: Async compute init failed — fallback to graphics queue");
+        }
+
+        // Phase 23/Bug #010: Disable async compute — the current implementation uses
+        // _commandQueue->Wait() which is a queue-level wait that blocks the ENTIRE next
+        // ExecuteCommandLists call. This means CSM/RT shadows can't overlap with the compute
+        // cull at all (zero GPU overlap), while introducing cross-queue race conditions on
+        // the Hi-Z texture and shared _objectDataBuffer. Force the single-queue fallback path
+        // which is race-free and produces identical GPU behavior.
+        // TODO: Redesign async compute to submit cull as a separate command list before the
+        //       main frame's command list for true overlap.
+        if (_asyncComputeReady)
+        {
+            LUNA_LOG_INFO("Phase 13: Async compute disabled (Bug #010 — queue-level Wait prevents overlap; use single-queue path)");
+            _asyncComputeReady = false;
         }
     }
 
@@ -1219,6 +1226,9 @@ void DX12Backend::BeginFrame()
     WaitForFrame(_frameIndex);
     WaitForComputeFrame(_frameIndex);  // Phase 13: also wait for async compute
 
+    // Phase 22: GPU profiler frame start
+    _gpuProfiler.BeginFrame();
+
     FrameResource& fr = _frames[_frameIndex];
     fr.cmdAllocator->Reset();
     _commandList->Reset(fr.cmdAllocator.Get(), nullptr);
@@ -1306,9 +1316,11 @@ void DX12Backend::DrawFrame()
           // this graph and culls the pass every frame.
           .SideEffect()
           .Write(csmHdl, D3D12_RESOURCE_STATE_DEPTH_WRITE)
-          .Execute([this](ID3D12GraphicsCommandList*)
+          .Execute([this](ID3D12GraphicsCommandList* cmd)
           {
+              _gpuProfiler.InsertBeginTimestamp(cmd, "CSM Shadows");
               DrawCSMPass();
+              _gpuProfiler.InsertEndTimestamp(cmd);
           });
     }
 
@@ -1318,8 +1330,9 @@ void DX12Backend::DrawFrame()
         rg.AddPass("DXR Shadows")
           .Read (depthHdl,  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
           .Write(shadowHdl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-          .Execute([this](ID3D12GraphicsCommandList*)
+          .Execute([this](ID3D12GraphicsCommandList* cmd)
           {
+              _gpuProfiler.InsertBeginTimestamp(cmd, "DXR Shadows");
               ComPtr<ID3D12GraphicsCommandList4> cmd4;
               _commandList.As(&cmd4);
               if (cmd4)
@@ -1332,6 +1345,7 @@ void DX12Backend::DrawFrame()
                                                static_cast<UINT>(_screenHeight),
                                                _frames[_frameIndex].mvpCBGPUAddr);
               }
+              _gpuProfiler.InsertEndTimestamp(cmd);
           });
     }
 
@@ -1352,6 +1366,7 @@ void DX12Backend::DrawFrame()
 
         pb.Execute([this](ID3D12GraphicsCommandList* cmd)
         {
+            _gpuProfiler.InsertBeginTimestamp(cmd, "GBuffer Fill");
             cmd->RSSetViewports(1, &_screenViewport);
             cmd->RSSetScissorRects(1, &_scissorRect);
 
@@ -1367,6 +1382,7 @@ void DX12Backend::DrawFrame()
             D3D12_CPU_DESCRIPTOR_HANDLE rtvs[GBUFFER_COUNT] = { _gbufferRTV[0], _gbufferRTV[1], _gbufferRTV[2] };
             cmd->OMSetRenderTargets(GBUFFER_COUNT, rtvs, FALSE, &_dsvHandle);
             // DrawMesh() calls write geometry here via _gbufferPipeline after Execute().
+            // Note: GBuffer Fill end timestamp deferred to FlushDraws/CompositeFrame
         });
     }
 
@@ -1433,10 +1449,12 @@ void DX12Backend::CompositeFrame()
            .SideEffect()
            .Read(depthHdl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
            .Read(gb1Hdl,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-           .Execute([this](ID3D12GraphicsCommandList*)
+           .Execute([this](ID3D12GraphicsCommandList* cmd)
            {
+               _gpuProfiler.InsertBeginTimestamp(cmd, "SSAO");
                DrawSSAOPass();
                DrawSSAOBlurPass();
+               _gpuProfiler.InsertEndTimestamp(cmd);
            });
     }
 
@@ -1470,6 +1488,8 @@ void DX12Backend::CompositeFrame()
 
         pb.Execute([this, backIdx, hdrHdl](ID3D12GraphicsCommandList* cmd)
         {
+            _gpuProfiler.InsertBeginTimestamp(cmd, "Deferred Lighting");
+            
             // Phase 10: bind HDR RTV; Phase 9 fallback: bind back buffer RTV
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = (hdrHdl != RG_NULL_HANDLE) ? _hdrRTV : _rtvHandle[backIdx];
             cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -1519,6 +1539,7 @@ void DX12Backend::CompositeFrame()
             }
 
             cmd->DrawInstanced(3, 1, 0, 0);
+            _gpuProfiler.InsertEndTimestamp(cmd);
         });
     }
 
@@ -1533,16 +1554,35 @@ void DX12Backend::CompositeFrame()
         // DrawSkyboxPass();
 
         // Phase 16B: SSR compute + additive blend into _hdrRT
-        if (_ssrComputePipeline) DrawSSRPass();
+        if (_ssrComputePipeline)
+        {
+            _gpuProfiler.InsertBeginTimestamp(_commandList.Get(), "SSR");
+            DrawSSRPass();
+            _gpuProfiler.InsertEndTimestamp(_commandList.Get());
+        }
 
         // Phase 18B: motion blur (_hdrRT → _motionBlurRT; TAA reads motionBlur output)
-        if (_motionBlurPipeline) DrawMotionBlurPass();
+        if (_motionBlurPipeline)
+        {
+            _gpuProfiler.InsertBeginTimestamp(_commandList.Get(), "Motion Blur");
+            DrawMotionBlurPass();
+            _gpuProfiler.InsertEndTimestamp(_commandList.Get());
+        }
 
+        _gpuProfiler.InsertBeginTimestamp(_commandList.Get(), "TAA");
         DrawTAAPass();
+        _gpuProfiler.InsertEndTimestamp(_commandList.Get());
+
+        _gpuProfiler.InsertBeginTimestamp(_commandList.Get(), "Bloom");
         DrawBloomBrightPass();
         DrawBloomBlurPass(true);    // H blur: bloomBright → bloomBlur
         DrawBloomBlurPass(false);   // V blur: bloomBlur → bloomBright (final bloom)
+        _gpuProfiler.InsertEndTimestamp(_commandList.Get());
+
+        _gpuProfiler.InsertBeginTimestamp(_commandList.Get(), "Tonemap");
         DrawToneMappingPass(backIdx);
+        _gpuProfiler.InsertEndTimestamp(_commandList.Get());
+
         _taaHistoryIndex = 1 - _taaHistoryIndex;  // flip ping-pong for next frame
     }
     // Command list remains open; back buffer in RENDER_TARGET for ImGui.
@@ -1550,6 +1590,9 @@ void DX12Backend::CompositeFrame()
 
 void DX12Backend::EndFrame()
 {
+    // Phase 22: Resolve GPU timestamp queries before closing command list
+    _gpuProfiler.ResolveQueries(_commandList.Get());
+
     UINT backIdx = _swapChain->GetCurrentBackBufferIndex();
     D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         _rtvBuffer[backIdx].Get(),
@@ -1567,6 +1610,10 @@ void DX12Backend::EndFrame()
     ++_globalFenceValue;
     _commandQueue->Signal(_fence.Get(), _globalFenceValue);
     _frames[_frameIndex].fenceValue = _globalFenceValue;
+
+    // Phase 22: Signal profiler fence (must be after ExecuteCommandLists)
+    _gpuProfiler.SignalFence(_commandQueue.Get());
+    _gpuProfiler.EndFrame();
 
     // Advance ring buffer index
     _frameIndex = (_frameIndex + 1) % FRAMES_IN_FLIGHT;
@@ -1627,6 +1674,11 @@ void DX12Backend::Resize(uint32_t width, uint32_t height)
     if (!CreatePostProcessResources())
         LUNA_LOG_WARN("Failed to recreate post-process resources on resize");
     _taaHistoryIndex = 0;   // history is stale after resize — reset ping-pong
+
+    // Phase 23: recreate Hi-Z pyramid at new resolution
+    DestroyHiZResources();
+    if (_gpuDrivenReady && !CreateHiZResources())
+        LUNA_LOG_WARN("Failed to recreate Hi-Z resources on resize — frustum-only culling");
 }
 
 // ---------------------------------------------------------------------------
@@ -1652,9 +1704,9 @@ void DX12Backend::UpdateMVP(const XMFLOAT4X4& model, const XMFLOAT4X4& view,
             for (; i > 0; i /= b, f /= float(b)) r += f * float(i % b);
             return r;
         };
-        int idx = int(_ppFrameCount % 64);
-        _ppCurJitter.x = (Halton(idx + 1, 2) - 0.5f) * 2.0f / float(_screenWidth);
-        _ppCurJitter.y = (Halton(idx + 1, 3) - 0.5f) * 2.0f / float(_screenHeight);
+        int idx = int(_ppFrameCount % 16);
+        _ppCurJitter.x = (Halton(idx + 1, 2) - 0.5f) * 1.0f / float(_screenWidth);
+        _ppCurJitter.y = (Halton(idx + 1, 3) - 0.5f) * 1.0f / float(_screenHeight);
     }
     else
     {
@@ -1933,11 +1985,14 @@ std::vector<std::shared_ptr<Mesh>> DX12Backend::LoadMeshes(const std::string& pa
     // --- Convert unique_ptr → shared_ptr, assign materials ---
     _sceneMeshes.clear();
     _sceneMeshes.reserve(loaded.meshes.size());
-    for (auto& m : loaded.meshes)
+    _lastLoadTransforms = std::move(loaded.transforms); // Phase 21
+    for (size_t i = 0; i < loaded.meshes.size(); ++i)
     {
-        auto sp = std::shared_ptr<Mesh>(std::move(m));
+        auto sp = std::shared_ptr<Mesh>(std::move(loaded.meshes[i]));
         if (sp->materialIndex < gpuMaterials.size())
             sp->material = gpuMaterials[sp->materialIndex];
+        if (i < loaded.meshNames.size())
+            sp->name = loaded.meshNames[i];
         _sceneMeshes.push_back(sp);
     }
 
@@ -1948,6 +2003,8 @@ std::vector<std::shared_ptr<Mesh>> DX12Backend::LoadMeshes(const std::string& pa
     {
         if (!CreateIndirectResources())
             LUNA_LOG_WARN("Phase 12: GPU-driven rendering init failed — using legacy per-draw path");
+        else if (!CreateHiZResources())
+            LUNA_LOG_WARN("Phase 23: Hi-Z occlusion culling init failed — frustum-only culling");
     }
 
     return _sceneMeshes;
@@ -2092,6 +2149,12 @@ void DX12Backend::RenderImGui()
     if (!CheckIfImGuiData()) return;
 #endif
 
+    // Explicitly bind backbuffer RTV for ImGui rendering
+    UINT backIdx = _swapChain->GetCurrentBackBufferIndex();
+    _commandList->OMSetRenderTargets(1, &_rtvHandle[backIdx], FALSE, nullptr);
+    _commandList->RSSetViewports(1, &_screenViewport);
+    _commandList->RSSetScissorRects(1, &_scissorRect);
+
     ID3D12DescriptorHeap *heaps[] = {_imGuiSrvHeap.Get()};
     _commandList->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), _commandList.Get());
@@ -2105,6 +2168,9 @@ void DX12Backend::RenderImGui()
 
 void DX12Backend::ShutdownImGui()
 {
+    // Flush all in-flight GPU work before releasing ImGui's DX12 resources
+    WaitAllFrames();
+
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
@@ -3003,21 +3069,22 @@ void DX12Backend::ExtractFrustumPlanes(const XMFLOAT4X4& view, const XMFLOAT4X4&
     XMMATRIX VP = XMMatrixMultiply(V, P);
 
     // Extract Gribb-Hartmann frustum planes from the composite matrix.
-    // VP is row-major → column extraction: VP._1N, VP._2N, VP._3N, VP._4N is row N.
+    // For row-major where clip = world * VP, we extract from columns.
+    // Column N in XMFLOAT4X4 is (_1N, _2N, _3N, _4N)
     XMFLOAT4X4 m;
     XMStoreFloat4x4(&m, VP);
 
-    // Left:   row3 + row0
+    // Left:   col3 + col0 (x + w >= 0)
     planes[0] = { m._14 + m._11, m._24 + m._21, m._34 + m._31, m._44 + m._41 };
-    // Right:  row3 - row0
+    // Right:  col3 - col0 (w - x >= 0)
     planes[1] = { m._14 - m._11, m._24 - m._21, m._34 - m._31, m._44 - m._41 };
-    // Bottom: row3 + row1
+    // Bottom: col3 + col1 (y + w >= 0)
     planes[2] = { m._14 + m._12, m._24 + m._22, m._34 + m._32, m._44 + m._42 };
-    // Top:    row3 - row1
+    // Top:    col3 - col1 (w - y >= 0)
     planes[3] = { m._14 - m._12, m._24 - m._22, m._34 - m._32, m._44 - m._42 };
-    // Near:   row2
+    // Near:   col2 (z >= 0 for DX left-handed)
     planes[4] = { m._13, m._23, m._33, m._43 };
-    // Far:    row3 - row2
+    // Far:    col3 - col2 (w - z >= 0)
     planes[5] = { m._14 - m._13, m._24 - m._23, m._34 - m._33, m._44 - m._43 };
 
     // Normalise each plane
@@ -3179,15 +3246,20 @@ bool DX12Backend::CreateIndirectResources()
     if (!_mergedVB || !_mergedIB || !_meshInfoBuffer) return false;
 
     // Object data buffer (GPU-visible UPLOAD for simplicity — written each frame)
+    // Per-frame to avoid CPU-GPU race (Bug #010 fix)
     const UINT objBufSize = MAX_GPU_OBJECTS * sizeof(GPUObjectData);
     D3D12_HEAP_PROPERTIES uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
     D3D12_RESOURCE_DESC bufDesc = CD3DX12_RESOURCE_DESC::Buffer(objBufSize);
-    HRESULT hr = _device->CreateCommittedResource(
-        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&_objectDataBuffer));
-    if (FAILED(hr)) { LUNA_LOG_ERROR("Phase 12: object data buffer creation failed"); return false; }
-    D3D12_RANGE r = { 0, 0 };
-    _objectDataBuffer->Map(0, &r, nullptr); // keep mapped
+    HRESULT hr = S_OK;
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    {
+        hr = _device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&_objectDataBuffer[i]));
+        if (FAILED(hr)) { LUNA_LOG_ERROR("Phase 12: object data buffer[%u] creation failed", i); return false; }
+        D3D12_RANGE r = { 0, 0 };
+        _objectDataBuffer[i]->Map(0, &r, &_objectDataMapped[i]); // keep mapped, store pointer
+    }
 
     // Indirect argument buffer + draw count buffer — one per frame slot to avoid
     // compute/graphics queue race (cull_F1 writes while draw_F0 reads the same buffer).
@@ -3206,13 +3278,13 @@ bool DX12Backend::CreateIndirectResources()
         bufDesc = CD3DX12_RESOURCE_DESC::Buffer(argBufSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         hr = _device->CreateCommittedResource(
             &defaultHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_indirectArgBuffer[i]));
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&_indirectArgBuffer[i]));
         if (FAILED(hr)) { LUNA_LOG_ERROR("Phase 12: indirect arg buffer[%u] creation failed", i); return false; }
 
         bufDesc = CD3DX12_RESOURCE_DESC::Buffer(4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         hr = _device->CreateCommittedResource(
             &defaultHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&_drawCountBuffer[i]));
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&_drawCountBuffer[i]));
         if (FAILED(hr)) { LUNA_LOG_ERROR("Phase 12: draw count buffer[%u] creation failed", i); return false; }
 
         D3D12_DESCRIPTOR_HEAP_DESC nonVisDesc = {};
@@ -3323,9 +3395,9 @@ void DX12Backend::DestroyIndirectResources()
     _gpuCullPipeline.reset();
     _indirectGBufPipeline.reset();
 
-    _objectDataBuffer.Reset();
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
     {
+        _objectDataBuffer[i].Reset();
         _indirectArgBuffer[i].Reset();
         _drawCountBuffer[i].Reset();
         _drawCountNonVisHeap[i].Reset();
@@ -3346,6 +3418,206 @@ void DX12Backend::DestroyIndirectResources()
     _meshInfoBuffer.Reset();
 }
 
+// ===========================================================================
+// Phase 23: Hi-Z Occlusion Culling
+// ===========================================================================
+
+bool DX12Backend::CreateHiZResources()
+{
+    if (_screenWidth <= 0 || _screenHeight <= 0) return false;
+
+    // Compute mip count: floor(log2(max(w,h))) + 1
+    UINT w = (UINT)_screenWidth;
+    UINT h = (UINT)_screenHeight;
+    _hizMipCount = 1;
+    { UINT t = std::max(w, h); while (t > 1) { t >>= 1; _hizMipCount++; } }
+    _hizMipCount = std::min(_hizMipCount, HIZ_MAX_MIPS);
+
+    // Create Hi-Z texture: R32_FLOAT, full-res, full mip chain, UAV+SRV
+    D3D12MA::ALLOCATION_DESC allocDesc = {};
+    allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width              = w;
+    rd.Height             = h;
+    rd.DepthOrArraySize   = 1;
+    rd.MipLevels          = (UINT16)_hizMipCount;
+    rd.Format             = DXGI_FORMAT_R32_FLOAT;
+    rd.SampleDesc.Count   = 1;
+    rd.Flags              = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    HRESULT hr = _d3d12maAllocator->CreateResource(
+        &allocDesc, &rd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        nullptr, &_hizTextureAlloc, IID_PPV_ARGS(&_hizTexture));
+    if (FAILED(hr)) { LUNA_LOG_ERROR("Phase 23: Hi-Z texture creation failed"); return false; }
+    _hizTexture->SetName(L"Phase23_HiZ_Pyramid");
+
+    // Allocate per-mip SRV and UAV descriptors in _imGuiSrvHeap
+    for (UINT m = 0; m < _hizMipCount; ++m)
+    {
+        // SRV for this mip
+        D3D12_CPU_DESCRIPTOR_HANDLE srvCPU;
+        D3D12_GPU_DESCRIPTOR_HANDLE srvGPU;
+        _hizMipSRVIndex[m] = AllocateSRVSlot(srvCPU, srvGPU);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format                  = DXGI_FORMAT_R32_FLOAT;
+        srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MostDetailedMip = m;
+        srvDesc.Texture2D.MipLevels       = 1;
+        _device->CreateShaderResourceView(_hizTexture.Get(), &srvDesc, srvCPU);
+
+        // UAV for this mip
+        D3D12_CPU_DESCRIPTOR_HANDLE uavCPU;
+        D3D12_GPU_DESCRIPTOR_HANDLE uavGPU;
+        _hizMipUAVIndex[m] = AllocateSRVSlot(uavCPU, uavGPU);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format              = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension       = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uavDesc.Texture2D.MipSlice  = m;
+        _device->CreateUnorderedAccessView(_hizTexture.Get(), nullptr, &uavDesc, uavCPU);
+    }
+
+    // Full-pyramid SRV (all mips) for cull shader sampling
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE srvCPU;
+        D3D12_GPU_DESCRIPTOR_HANDLE srvGPU;
+        _hizFullSRVIndex = AllocateSRVSlot(srvCPU, srvGPU);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format                  = DXGI_FORMAT_R32_FLOAT;
+        srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels       = _hizMipCount;
+        _device->CreateShaderResourceView(_hizTexture.Get(), &srvDesc, srvCPU);
+    }
+
+    // Create Hi-Z generate compute pipeline
+    {
+        PipelineStateDesc desc;
+        desc.computeShader = true;
+        desc.rootLayout    = RootSignatureLayout::HiZGenerate;
+        _hizGeneratePipeline = std::make_unique<DX12Pipeline>();
+        if (!_hizGeneratePipeline->Initialize(_device, L"hiz_generate.comp.hlsl", L"", desc))
+        { LUNA_LOG_ERROR("Phase 23: Hi-Z generate pipeline creation failed"); return false; }
+    }
+
+    LUNA_LOG_INFO("Phase 23: Hi-Z pyramid created — %ux%u, %u mips", w, h, _hizMipCount);
+    return true;
+}
+
+void DX12Backend::DestroyHiZResources()
+{
+    _hizReady = false;
+    _hizGeneratePipeline.reset();
+    if (_hizTextureAlloc) { _hizTextureAlloc->Release(); _hizTextureAlloc = nullptr; }
+    _hizTexture.Reset();
+    _hizNonVisUAVHeap.Reset();
+    _hizMipCount = 0;
+    _hizFullSRVIndex = UINT_MAX;
+}
+
+void DX12Backend::BuildHiZPyramid()
+{
+    if (!_hizTexture || _hizMipCount < 2) return;
+
+    auto* cmd = _commandList.Get();
+    ID3D12DescriptorHeap* heaps[] = { _imGuiSrvHeap.Get() };
+    cmd->SetDescriptorHeaps(1, heaps);
+
+    _gpuProfiler.InsertBeginTimestamp(cmd, "Hi-Z Build");
+
+    // Copy depth buffer (mip 0 of Hi-Z) from the main depth buffer
+    // Transition depth → COPY_SOURCE, Hi-Z mip 0 → COPY_DEST
+    {
+        D3D12_RESOURCE_BARRIER barriers[2] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(_depthBuffer.Get(),
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(_hizTexture.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                0),  // subresource 0 = mip 0
+        };
+        cmd->ResourceBarrier(2, barriers);
+    }
+
+    // Copy mip-0: depth (D32_FLOAT) → Hi-Z mip 0 (R32_FLOAT) — same bit layout
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = _depthBuffer.Get();
+        src.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = _hizTexture.Get();
+        dst.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+
+        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    // Transition: depth → DEPTH_WRITE, Hi-Z mip 0 → SRV
+    {
+        D3D12_RESOURCE_BARRIER barriers[2] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(_depthBuffer.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            CD3DX12_RESOURCE_BARRIER::Transition(_hizTexture.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                0),
+        };
+        cmd->ResourceBarrier(2, barriers);
+    }
+
+    // Generate remaining mips via compute dispatch
+    cmd->SetPipelineState(_hizGeneratePipeline->GetPSO());
+    cmd->SetComputeRootSignature(_hizGeneratePipeline->GetRootSignature().Get());
+
+    UINT srcW = (UINT)_screenWidth;
+    UINT srcH = (UINT)_screenHeight;
+
+    D3D12_GPU_DESCRIPTOR_HANDLE heapBase = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+
+    for (UINT m = 1; m < _hizMipCount; ++m)
+    {
+        UINT dstW = std::max(srcW >> 1, 1u);
+        UINT dstH = std::max(srcH >> 1, 1u);
+
+        // Transition Hi-Z mip m → UAV
+        D3D12_RESOURCE_BARRIER toUAV = CD3DX12_RESOURCE_BARRIER::Transition(_hizTexture.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, m);
+        cmd->ResourceBarrier(1, &toUAV);
+
+        // Set root constants: srcW, srcH, dstW, dstH
+        UINT constants[4] = { srcW, srcH, dstW, dstH };
+        cmd->SetComputeRoot32BitConstants(0, 4, constants, 0);
+
+        // Bind source mip SRV (mip m-1) and destination mip UAV (mip m)
+        D3D12_GPU_DESCRIPTOR_HANDLE srcSrv;
+        srcSrv.ptr = heapBase.ptr + _hizMipSRVIndex[m - 1] * _srvDescriptorSize;
+        cmd->SetComputeRootDescriptorTable(1, srcSrv);
+
+        D3D12_GPU_DESCRIPTOR_HANDLE dstUav;
+        dstUav.ptr = heapBase.ptr + _hizMipUAVIndex[m] * _srvDescriptorSize;
+        cmd->SetComputeRootDescriptorTable(2, dstUav);
+
+        cmd->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
+
+        // Transition Hi-Z mip m → SRV (for next iteration or cull shader)
+        D3D12_RESOURCE_BARRIER toSRV = CD3DX12_RESOURCE_BARRIER::Transition(_hizTexture.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m);
+        cmd->ResourceBarrier(1, &toSRV);
+
+        srcW = dstW;
+        srcH = dstH;
+    }
+
+    _gpuProfiler.InsertEndTimestamp(cmd);
+    _hizReady = true;
+}
+
 // Phase 13: Dispatch GPU frustum cull on the async compute queue
 void DX12Backend::DispatchCullAsync()
 {
@@ -3353,13 +3625,11 @@ void DX12Backend::DispatchCullAsync()
 
     const UINT instanceCount = static_cast<UINT>(_cpuInstances.size());
 
-    // Upload object data (UPLOAD heap — CPU-visible, no command list needed)
-    void* dst = nullptr;
-    D3D12_RANGE noRead = { 0, 0 };
-    _objectDataBuffer->Map(0, &noRead, &dst);
-    memcpy(dst, _cpuInstances.data(), instanceCount * sizeof(GPUObjectData));
-    D3D12_RANGE written = { 0, instanceCount * sizeof(GPUObjectData) };
-    _objectDataBuffer->Unmap(0, &written);
+    // Bug #010 fix: _objectDataBuffer is now per-frame to avoid CPU-GPU race.
+    // No need to wait for previous frame's compute since each frame has its own buffer.
+
+    // Upload object data (UPLOAD heap — CPU-visible, use pre-mapped pointer)
+    memcpy(_objectDataMapped[_frameIndex], _cpuInstances.data(), instanceCount * sizeof(GPUObjectData));
 
     // Open compute command list
     auto* ccmd = _computeCommandList.Get();
@@ -3379,19 +3649,43 @@ void DX12Backend::DispatchCullAsync()
     ccmd->SetPipelineState(_gpuCullPipeline->GetPSO());
     ccmd->SetComputeRootSignature(_gpuCullPipeline->GetRootSignature().Get());
 
+    // Phase 23: Expanded CullConstants (48 DWORDs = 192 bytes)
     struct CullConstants {
-        XMFLOAT4 planes[6];
-        UINT objectCount;
-        UINT _pad[3];
-    } cullCB;
+        XMFLOAT4   planes[6];
+        UINT       objectCount;
+        UINT       enableHiZ;
+        UINT       hizMipCount;
+        UINT       _pad0;
+        XMFLOAT4X4 viewProj;
+        float      screenW;
+        float      screenH;
+        float      _pad1[2];
+    } cullCB{};
     ExtractFrustumPlanes(_lastView, _lastProj, cullCB.planes);
     cullCB.objectCount = instanceCount;
-    cullCB._pad[0] = cullCB._pad[1] = cullCB._pad[2] = 0;
-    ccmd->SetComputeRoot32BitConstants(0, 28, &cullCB, 0);
-    ccmd->SetComputeRootShaderResourceView(1, _objectDataBuffer->GetGPUVirtualAddress());
+    cullCB.enableHiZ   = _hizReady ? 1 : 0;
+    cullCB.hizMipCount = _hizMipCount;
+    {
+        XMMATRIX V = XMLoadFloat4x4(&_lastView);
+        XMMATRIX P = XMLoadFloat4x4(&_lastProj);
+        XMStoreFloat4x4(&cullCB.viewProj, XMMatrixMultiply(V, P));
+    }
+    cullCB.screenW = (float)_screenWidth;
+    cullCB.screenH = (float)_screenHeight;
+    ccmd->SetComputeRoot32BitConstants(0, 48, &cullCB, 0);
+    ccmd->SetComputeRootShaderResourceView(1, _objectDataBuffer[_frameIndex]->GetGPUVirtualAddress());
     ccmd->SetComputeRootShaderResourceView(2, _meshInfoBuffer->GetGPUVirtualAddress());
     ccmd->SetComputeRootUnorderedAccessView(3, _indirectArgBuffer[_frameIndex]->GetGPUVirtualAddress());
     ccmd->SetComputeRootUnorderedAccessView(4, _drawCountBuffer[_frameIndex]->GetGPUVirtualAddress());
+
+    // Phase 23: Bind Hi-Z pyramid SRV for occlusion test
+    if (_hizReady && _hizFullSRVIndex != UINT_MAX)
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE heapBase = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE hizSrv;
+        hizSrv.ptr = heapBase.ptr + _hizFullSRVIndex * _srvDescriptorSize;
+        ccmd->SetComputeRootDescriptorTable(5, hizSrv);
+    }
 
     UINT groups = (instanceCount + 63) / 64;
     ccmd->Dispatch(groups, 1, 1);
@@ -3405,6 +3699,17 @@ void DX12Backend::DispatchCullAsync()
 
     // Close and execute on compute queue
     ccmd->Close();
+
+    // Phase 23 fix: ensure previous frame's graphics work (including BuildHiZPyramid)
+    // has completed before the compute queue reads the Hi-Z texture.
+    // Without this, the compute cull can race with the graphics Hi-Z write.
+    if (_hizReady)
+    {
+        UINT prevFI = (_frameIndex == 0) ? (FRAMES_IN_FLIGHT - 1) : (_frameIndex - 1);
+        if (_frames[prevFI].fenceValue > 0)
+            _computeQueue->Wait(_fence.Get(), _frames[prevFI].fenceValue);
+    }
+
     ID3D12CommandList* lists[] = { ccmd };
     _computeQueue->ExecuteCommandLists(1, lists);
 
@@ -3447,17 +3752,14 @@ void DX12Backend::FlushDraws()
     else
     {
         // Fallback: dispatch cull on graphics queue (Phase 12 legacy path)
-        void* dst = nullptr;
-        D3D12_RANGE noRead = { 0, 0 };
-        _objectDataBuffer->Map(0, &noRead, &dst);
-        memcpy(dst, _cpuInstances.data(), instanceCount * sizeof(GPUObjectData));
-        D3D12_RANGE written = { 0, instanceCount * sizeof(GPUObjectData) };
-        _objectDataBuffer->Unmap(0, &written);
+        // Use pre-mapped pointer (buffer stays mapped permanently)
+        memcpy(_objectDataMapped[_frameIndex], _cpuInstances.data(), instanceCount * sizeof(GPUObjectData));
 
         ViewProjCB vp;
         vp.view = _lastView;
         vp.proj = _lastProj;
         memcpy(_viewProjCBMapped[_frameIndex], &vp, sizeof(ViewProjCB));
+
 
         // Clear draw count using per-frame UAV descriptors
         ID3D12DescriptorHeap* heaps[] = { _imGuiSrvHeap.Get() };
@@ -3472,19 +3774,79 @@ void DX12Backend::FlushDraws()
         cmd->SetPipelineState(_gpuCullPipeline->GetPSO());
         cmd->SetComputeRootSignature(_gpuCullPipeline->GetRootSignature().Get());
 
+        // Phase 23: Expanded CullConstants (48 DWORDs = 192 bytes)
         struct CullConstants {
-            XMFLOAT4 planes[6];
-            UINT objectCount;
-            UINT _pad[3];
-        } cullCB;
-        ExtractFrustumPlanes(_lastView, _lastProj, cullCB.planes);
+            XMFLOAT4   planes[6];     // 96 B
+            UINT       objectCount;   //  4 B
+            UINT       enableHiZ;     //  4 B
+            UINT       hizMipCount;   //  4 B
+            UINT       _pad0;         //  4 B → 112 B
+            XMFLOAT4X4 viewProj;      // 64 B → 176 B
+            float      screenW;       //  4 B
+            float      screenH;       //  4 B
+            float      _pad1[2];      //  8 B → 192 B = 48 DWORDs
+        } cullCB{};
+        
+        // Inline frustum plane extraction (same as Vulkan approach)
+        {
+            XMMATRIX V = XMLoadFloat4x4(&_lastView);
+            XMMATRIX P = XMLoadFloat4x4(&_lastProj);
+            XMMATRIX VP = XMMatrixMultiply(V, P);
+            XMFLOAT4X4 m;
+            XMStoreFloat4x4(&m, VP);
+            
+            // Extract columns: colN = (_1N, _2N, _3N, _4N)
+            // Left:   col3 + col0
+            cullCB.planes[0] = { m._14 + m._11, m._24 + m._21, m._34 + m._31, m._44 + m._41 };
+            // Right:  col3 - col0
+            cullCB.planes[1] = { m._14 - m._11, m._24 - m._21, m._34 - m._31, m._44 - m._41 };
+            // Bottom: col3 + col1
+            cullCB.planes[2] = { m._14 + m._12, m._24 + m._22, m._34 + m._32, m._44 + m._42 };
+            // Top:    col3 - col1
+            cullCB.planes[3] = { m._14 - m._12, m._24 - m._22, m._34 - m._32, m._44 - m._42 };
+            // Near:   col2
+            cullCB.planes[4] = { m._13, m._23, m._33, m._43 };
+            // Far:    col3 - col2
+            cullCB.planes[5] = { m._14 - m._13, m._24 - m._23, m._34 - m._33, m._44 - m._43 };
+            
+            // Normalize planes
+            for (int i = 0; i < 6; ++i)
+            {
+                XMVECTOR p = XMLoadFloat4(&cullCB.planes[i]);
+                float len = XMVectorGetX(XMVector3Length(p));
+                if (len > 0.0001f)
+                {
+                    p = XMVectorScale(p, 1.0f / len);
+                    XMStoreFloat4(&cullCB.planes[i], p);
+                }
+            }
+            
+            // Store viewProj
+            XMStoreFloat4x4(&cullCB.viewProj, VP);
+        }
+        
         cullCB.objectCount = instanceCount;
-        cullCB._pad[0] = cullCB._pad[1] = cullCB._pad[2] = 0;
-        cmd->SetComputeRoot32BitConstants(0, 28, &cullCB, 0);
-        cmd->SetComputeRootShaderResourceView(1, _objectDataBuffer->GetGPUVirtualAddress());
+        // Bug #010: Hi-Z disabled - single-instance _hizTexture has cross-frame race.
+        // Frame N may still be writing Hi-Z when Frame N+1 reads it.
+        // TODO: Double-buffer _hizTexture to fix.
+        cullCB.enableHiZ   = 0;
+        cullCB.hizMipCount = _hizMipCount;
+        cullCB.screenW = (float)_screenWidth;
+        cullCB.screenH = (float)_screenHeight;
+        cmd->SetComputeRoot32BitConstants(0, 48, &cullCB, 0);
+        cmd->SetComputeRootShaderResourceView(1, _objectDataBuffer[_frameIndex]->GetGPUVirtualAddress());
         cmd->SetComputeRootShaderResourceView(2, _meshInfoBuffer->GetGPUVirtualAddress());
         cmd->SetComputeRootUnorderedAccessView(3, _indirectArgBuffer[_frameIndex]->GetGPUVirtualAddress());
         cmd->SetComputeRootUnorderedAccessView(4, _drawCountBuffer[_frameIndex]->GetGPUVirtualAddress());
+
+        // Phase 23: Bind Hi-Z pyramid SRV for occlusion test
+        if (_hizReady && _hizFullSRVIndex != UINT_MAX)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE heapBase = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+            D3D12_GPU_DESCRIPTOR_HANDLE hizSrv;
+            hizSrv.ptr = heapBase.ptr + _hizFullSRVIndex * _srvDescriptorSize;
+            cmd->SetComputeRootDescriptorTable(5, hizSrv);
+        }
 
         UINT groups = (instanceCount + 63) / 64;
         cmd->Dispatch(groups, 1, 1);
@@ -3513,13 +3875,18 @@ void DX12Backend::FlushDraws()
         cmd->RSSetViewports(1, &_screenViewport);
         cmd->RSSetScissorRects(1, &_scissorRect);
 
+        // Bug #010: Explicitly re-bind G-buffer RTVs + depth before ExecuteIndirect
+        // The compute dispatch might have affected GPU pipeline state on some drivers
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[GBUFFER_COUNT] = { _gbufferRTV[0], _gbufferRTV[1], _gbufferRTV[2] };
+        cmd->OMSetRenderTargets(GBUFFER_COUNT, rtvs, FALSE, &_dsvHandle);
+
         cmd->IASetVertexBuffers(0, 1, &_mergedVBView);
         cmd->IASetIndexBuffer(&_mergedIBView);
 
         cmd->SetDescriptorHeaps(1, heaps);
 
         cmd->SetGraphicsRootConstantBufferView(0, _viewProjCBGPUAddr[_frameIndex]);
-        cmd->SetGraphicsRootShaderResourceView(4, _objectDataBuffer->GetGPUVirtualAddress());
+        cmd->SetGraphicsRootShaderResourceView(4, _objectDataBuffer[_frameIndex]->GetGPUVirtualAddress());
         D3D12_GPU_DESCRIPTOR_HANDLE heapBase = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart();
         cmd->SetGraphicsRootDescriptorTable(5, heapBase);
 
@@ -3538,6 +3905,10 @@ void DX12Backend::FlushDraws()
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     };
     cmd->ResourceBarrier(2, restore);
+
+    // Phase 23: Build Hi-Z pyramid from current frame's depth buffer (ready for next frame's cull)
+    if (_hizTexture)
+        BuildHiZPyramid();
 
     _cpuInstances.clear();
 }

@@ -7,6 +7,7 @@
 #ifdef LUNA_ENABLE_VULKAN
 
 #include "LunaEngine/Renderer/Vulkan/Public/VulkanRenderGraph.h"
+#include "LunaEngine/Renderer/Vulkan/Public/VulkanGPUProfiler.h"
 #include "Logger/Logger.h"
 
 namespace Luna
@@ -90,8 +91,7 @@ void VulkanRenderGraph::Compile()
     }
 
     // Remove dead passes (preserve order of live passes)
-    std::vector<PassBuilder> kept;
-    kept.reserve(_passes.size());
+    std::deque<PassBuilder> kept;
     for (size_t i = 0; i < _passes.size(); ++i)
     {
         if (live[i]) kept.push_back(std::move(_passes[i]));
@@ -135,7 +135,7 @@ void VulkanRenderGraph::EmitBarrier(VkCommandBuffer cmd, ImportedImage& img,
     img.current = { newLayout, newStage, newAccess };
 }
 
-void VulkanRenderGraph::Execute(VkCommandBuffer cmd)
+void VulkanRenderGraph::Execute(VkCommandBuffer cmd, VulkanGPUProfiler* profiler)
 {
     for (auto& pass : _passes)
     {
@@ -151,8 +151,13 @@ void VulkanRenderGraph::Execute(VkCommandBuffer cmd)
             if (wr.handle == VKRG_NULL_HANDLE || wr.handle >= _images.size()) continue;
             EmitBarrier(cmd, _images[wr.handle], wr.layout, wr.stage, wr.access);
         }
+        // Auto-insert profiler timestamps around the pass
+        if (profiler && profiler->IsEnabled())
+            profiler->WriteBeginTimestamp(cmd, pass._name.c_str());
         // Execute the pass
         if (pass._executeFn) pass._executeFn(cmd);
+        if (profiler && profiler->IsEnabled())
+            profiler->WriteEndTimestamp(cmd);
     }
 }
 
