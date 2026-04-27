@@ -42,6 +42,7 @@ private:
 // ---------------------------------------------------------------------------
 // RenderGraph — data-driven barrier scheduling for a single frame.
 //
+// Phase 14 additions over Phase 6:
 //   • DAG cull  — passes whose outputs are never consumed (and have no side
 //                 effects) are skipped at Execute() time.
 //   • Transient resource aliasing — resources declared with

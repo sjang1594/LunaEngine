@@ -2,13 +2,27 @@
 
 **Dual-Backend Real-Time Rendering Engine**
 
-DX12 + Vulkan | DXR Hybrid Shadows | GPU-Driven Rendering | PBR + IBL | TAA/SSAO/SSR/Bloom
+GPU-Driven Rendering | DXR Ray Tracing | DX12 + Vulkan | PBR + IBL | Render Graph
+
+---
+
+## Key Technical Achievements
+
+| Feature | Complexity | Description |
+|---------|------------|-------------|
+| **GPU-Driven Rendering** | ★★★ | Compute frustum/Hi-Z cull → ExecuteIndirect, single draw call |
+| **DXR Hybrid Shadows** | ★★★ | BLAS/TLAS, RTPSO, shader table, TraceRay integration |
+| **Dual Backend Parity** | ★★★ | DX12 + Vulkan feature-identical implementation |
+| **Render Graph** | ★★☆ | DAG barrier scheduling, transient resource aliasing |
+| **Hi-Z Occlusion Culling** | ★★☆ | Hierarchical-Z pyramid, GPU sphere-AABB test |
+| **Full IBL Pipeline** | ★★☆ | Equirect→Cube→Irradiance→Prefilter→BRDF LUT |
+| **Async Compute** | ★★☆ | Cross-queue fence sync, overlapped cull dispatch |
 
 ---
 
 ## Overview
 
-LunaEngine은 DirectX 12와 Vulkan 듀얼 백엔드를 지원하는 실시간 렌더링 엔진이다. DXR 기반 하이브리드 섀도우, GPU-Driven 렌더링, 풀 PBR 파이프라인을 구현하며, 23개 Phase에 걸친 점진적 개발 과정을 거쳤다.
+LunaEngine은 DirectX 12와 Vulkan 듀얼 백엔드를 지원하는 실시간 렌더링 엔진이다. 23개 Phase에 걸친 점진적 개발을 통해 GPU-Driven 렌더링, DXR 레이트레이싱, 풀 PBR 파이프라인을 구현했다.
 
 ```
 Platform:    Windows 11
@@ -46,77 +60,25 @@ LunaEngine-source/
 
 ---
 
-## Features
+## Technical Deep Dives
 
-### Rendering Pipeline
-
-| Feature | Description |
-|---------|-------------|
-| **Deferred Shading** | G-Buffer (Albedo, Normal, MetalRough, Emissive, Depth) |
-| **PBR / Cook-Torrance** | GGX NDF, Smith-Schlick G, Fresnel-Schlick |
-| **IBL** | Split-sum approximation: Irradiance + Prefiltered Env + BRDF LUT |
-| **Cascaded Shadow Maps** | 4-cascade CSM with PCF filtering |
-| **DXR Hybrid Shadows** | Ray-traced shadow rays for soft shadows (DX12) |
-| **SSAO** | Screen-space ambient occlusion with blur pass |
-| **SSR** | Screen-space reflections via Hi-Z ray marching |
-| **TAA** | Temporal anti-aliasing with YCoCg neighbourhood clamping |
-| **Bloom** | Threshold + multi-pass Gaussian blur |
-| **Motion Blur** | Velocity buffer based |
-| **Tonemapping** | ACES Filmic (hue-preserving) |
-
-### GPU-Driven Rendering
-
-| Component | Description |
-|-----------|-------------|
-| **Compute Culling** | Frustum + Hi-Z occlusion culling in compute shader |
-| **Indirect Draw** | `ExecuteIndirect` / `vkCmdDrawIndexedIndirect` |
-| **Merged Geometry** | Single VB/IB for entire scene |
-| **Object Buffer** | Per-instance data in structured buffer |
-
-### Engine Features
-
-| Feature | Description |
-|---------|-------------|
-| **Dual Backend** | DX12 / Vulkan parity for all features |
-| **Render Graph** | DAG-based pass scheduling, resource aliasing (DX12) |
-| **GPU Profiler** | Per-pass timestamp queries, overlay UI |
-| **Transform Gizmo** | Isaac Sim-style universal gizmo (translate/rotate/scale) |
-| **Custom Title Bar** | Windows borderless with draggable title area |
-| **glTF Loader** | cgltf-based, PBR material support |
-
----
-
-## Technical Highlights
-
-### Frames-in-Flight
-
-```cpp
-static constexpr UINT FRAMES_IN_FLIGHT = 2;
-struct FrameResource {
-    ComPtr<ID3D12CommandAllocator> cmdAllocator;
-    ComPtr<ID3D12Resource>         mvpCB;
-    void*                          mvpCBMapped;
-    UINT64                         fenceValue;
-};
-```
-
-CPU-GPU overlap을 위한 링 버퍼 패턴. `BeginFrame()`에서 가장 오래된 프레임 대기, `EndFrame()`에서 fence signal.
-
-### D3D12MA / VMA
-
-DEFAULT heap으로 GPU 리소스 생성. UPLOAD heap staging → CopyBufferRegion → barrier 패턴.
+### 1. GPU-Driven Rendering Pipeline
 
 ```
-Allocate DEFAULT buffer (D3D12MA)
-Allocate UPLOAD staging
-Map → memcpy → Unmap
-CopyBufferRegion(default ← staging)
-Barrier: COPY_DEST → target state
-Execute → Fence wait
-Release staging
+CPU: Upload GPUObjectData[] (model, bounding sphere, mesh/material index)
+     ↓
+GPU: Compute Cull Dispatch
+     ├─ Frustum Test (6-plane sphere)
+     ├─ Hi-Z Occlusion Test (project → AABB → sample pyramid)
+     └─ Atomic append survivors → IndirectDrawCommand[]
+     ↓
+GPU: ExecuteIndirect / vkCmdDrawIndexedIndirectCount
+     └─ Single draw call for entire scene
 ```
 
-### DXR Pipeline
+**핵심**: CPU는 인스턴스 데이터만 업로드. 모든 컬링과 드로우 결정은 GPU에서 수행.
+
+### 2. DXR Ray Tracing Integration
 
 ```hlsl
 [shader("raygeneration")] void RayGen() {
@@ -127,20 +89,93 @@ Release staging
 }
 ```
 
-### Vulkan Render Graph
+**구성**: Per-mesh BLAS → Scene TLAS → RTPSO (lib_6_5) → Shader Table (RayGen/Miss/Hit)
+
+### 3. Render Graph (DAG + Resource Aliasing)
 
 ```cpp
-auto hDepth  = rg.ImportImage(_depthImage, VK_IMAGE_LAYOUT_...);
-auto hOutput = rg.CreateImage("output", ...);
-
 rg.AddPass("SSAO")
-    .Read(hDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ...)
-    .Write(hOutput, ...)
-    .Execute([](VkCommandBuffer cmd) { ... });
+    .Read(hDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    .Write(hSSAO, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    .SideEffect()
+    .Execute([](ID3D12GraphicsCommandList* cmd) { ... });
 
-rg.Compile();
-rg.Execute(cmd);
+rg.Compile();  // DAG cull + barrier scheduling + aliasing slot assignment
+rg.Execute();  // Emit barriers + run passes
 ```
+
+**기능**: Dead pass cull, automatic barrier insertion, transient resource memory reuse
+
+### 4. Hi-Z Occlusion Culling
+
+```hlsl
+bool HiZTestSphere(float3 centre, float radius) {
+    float4 clip = mul(float4(centre, 1), viewProj);
+    float2 screenRadius = abs(radius * float2(P[0][0], P[1][1]) / clip.w);
+    uint mip = ceil(log2(max(screenRadius * screenSize)));
+    float occluder = min(HiZ.SampleLevel(uvMin, mip), ...);
+    return ndc.z <= occluder;  // visible if in front
+}
+```
+
+**파이프라인**: Depth → Mip 0 blit → Compute min-downsample → 11 mips (1080p)
+
+---
+
+## Rendering Features
+
+| Category | Features |
+|----------|----------|
+| **Shading** | Deferred G-Buffer, Cook-Torrance PBR, IBL (split-sum) |
+| **Shadows** | 4-cascade CSM (PCF), DXR ray-traced shadows |
+| **Post-Process** | TAA (YCoCg clamp), SSAO, SSR (Hi-Z march), Bloom, Motion Blur |
+| **Culling** | GPU Frustum + Hi-Z Occlusion |
+| **Tonemapping** | ACES Filmic (hue-preserving) |
+
+---
+
+## Development Phases (Chronological)
+
+### Foundation (Phase 1-5)
+| Phase | Feature |
+|-------|---------|
+| 1 | DX12 device, depth buffer, MVP CB, first triangle |
+| 2 | Frames-in-flight, DXC SM 6.x, D3D12MA DEFAULT heap |
+| 3 | Orbital camera, cgltf loader, Cook-Torrance PBR |
+| 4 | DXR BLAS/TLAS, RTPSO, hybrid shadow rays |
+| 5 | Vulkan backend parity |
+
+### Core Rendering (Phase 6-10)
+| Phase | Feature |
+|-------|---------|
+| 6 | Render graph barrier scheduling |
+| 7 | Deferred rendering (G-buffer + lighting pass) |
+| 8 | Cascaded Shadow Maps (4-cascade, PCF) |
+| 9 | SSAO (half-res, 16-tap, blur) |
+| 10 | Post-process: HDR, TAA (Halton jitter), Bloom |
+
+### Advanced GPU (Phase 11-14)
+| Phase | Feature |
+|-------|---------|
+| 11 | Bindless textures (unbounded SRV array) |
+| 12 | GPU-driven rendering (merged VB/IB, compute cull, ExecuteIndirect) |
+| 13 | Async compute (cross-queue fence sync) |
+| 14 | Render graph: DAG cull + transient resource aliasing |
+
+### Vulkan Parity (Phase 15-18)
+| Phase | Feature |
+|-------|---------|
+| 15 | Vulkan GPU-driven + IBL precompute |
+| 16 | SSAO + SSR (both backends) |
+| 17 | Vulkan PP stack (TAA, bloom, tonemap) |
+| 18 | Motion blur, VK render graph, VK ray tracing |
+
+### Polish (Phase 19-23)
+| Phase | Feature |
+|-------|---------|
+| 19-21 | DX12/VK parity bug-fix, multi-mesh scene |
+| 22 | GPU profiler overlay (timestamp queries) |
+| 23 | Hi-Z occlusion culling |
 
 ---
 
@@ -148,17 +183,14 @@ rg.Execute(cmd);
 
 | Shader | Stage | Purpose |
 |--------|-------|---------|
-| `pbr.vert/frag.hlsl` | Raster | Forward PBR (fallback) |
-| `gbuffer.vert/frag.hlsl` | Raster | Deferred G-buffer fill |
-| `deferred_lighting_ibl.frag.hlsl` | Fullscreen | Deferred lighting + IBL |
-| `shadows.hlsl` | DXR lib_6_5 | RayGen/Miss/ClosestHit |
 | `gpu_cull.comp.hlsl` | Compute | Frustum + Hi-Z culling |
+| `shadows.hlsl` | DXR lib_6_5 | RayGen/Miss/ClosestHit |
 | `hiz_generate.comp.hlsl` | Compute | Hi-Z pyramid generation |
-| `ssao.frag.hlsl` | Fullscreen | SSAO sampling |
-| `ssr.frag.hlsl` | Fullscreen | SSR ray march |
+| `deferred_lighting_ibl.frag.hlsl` | Fullscreen | Deferred lighting + IBL |
+| `gbuffer.vert/frag.hlsl` | Raster | Deferred G-buffer fill |
 | `taa.frag.hlsl` | Fullscreen | Temporal resolve |
-| `bloom_*.frag.hlsl` | Fullscreen | Bloom threshold + blur |
-| `tonemapping.frag.hlsl` | Fullscreen | ACES + gamma |
+| `ssr.frag.hlsl` | Fullscreen | SSR ray march |
+| `ssao.frag.hlsl` | Fullscreen | SSAO sampling |
 
 ---
 
@@ -169,96 +201,52 @@ rg.Execute(cmd);
 | Library | Version | Location |
 |---------|---------|----------|
 | Vulkan SDK | 1.3+ | `$VULKAN_SDK` |
-| DirectX Headers | latest | `vendor/dxheaders/` |
 | DXC | 1.8+ | `vendor/dxc/` |
 | D3D12MA | 2.x | `vendor/d3d12ma/` |
 | GLFW | 3.4 | `vendor/glfw/` |
 | ImGui | 1.91+ | `vendor/imgui/` |
 | cgltf | 1.14 | `vendor/cgltf/` |
-| stb_image | 2.29 | `vendor/stb_image/` |
 
 ### Commands
 
 ```powershell
-# Generate VS solution
 .\premake5.exe vs2022
-
-# Build
 MSBuild LunaApp.sln /p:Configuration=Release /p:Platform=x64 /m
 
-# Run (DX12 default)
+# DX12
 .\LunaApp\bin\Release-windows-x86_64\LunaApp\LunaApp.exe
 
-# Run (Vulkan)
+# Vulkan
 .\LunaApp\bin\Release-windows-x86_64\LunaApp\LunaApp.exe --vulkan
 ```
 
 ---
 
-## Development Phases
+## Bug Fix Log
 
-| Phase | Description |
-|-------|-------------|
-| 1 | Device init, first triangle |
-| 2 | Frames-in-flight, DXC SM 6.x, D3D12MA |
-| 3 | Orbital camera, glTF loader, PBR pipeline |
-| 4 | DXR BLAS/TLAS, shadow rays |
-| 5 | Vulkan backend parity |
-| 6 | Scene graph, MeshRenderer |
-| 7-10 | CSM shadows, SSAO |
-| 11-14 | Deferred shading, IBL precompute |
-| 15-17 | SSR, bloom, TAA, motion blur |
-| 18-20 | GPU-driven rendering (merged geometry, compute cull) |
-| 21-23 | Hi-Z pyramid, occlusion culling, profiler |
+10개 주요 버그 수정. 상세: [bug-fix/README.md](bug-fix/README.md)
+
+| # | Root Cause | Impact |
+|---|------------|--------|
+| 001 | TAA YCoCg Co/Cg swap | 색상 스크램블 |
+| 002-004 | VK TAA jitter 미적용 | 대각선 줄무늬 |
+| 005 | DX12 IBL 미샘플링 | 렌더링 불일치 |
+| 006-008 | VK resize/init race | Device lost |
+| 009 | Hi-Z depth layout | Device lost |
+| 010 | Frustum plane NaN | DX12 flickering |
 
 ---
 
-## Bug Fix History
-
-10개 주요 버그 수정 기록. 상세 내용은 [bug-fix/README.md](bug-fix/README.md) 참조.
-
-| # | Issue | Status |
-|---|-------|--------|
-| 001 | TAA YCoCg 채널 스왑 | ✅ |
-| 002-004 | Vulkan diagonal stripe | ✅ |
-| 005 | DX12/Vulkan 렌더링 패리티 | ✅ |
-| 006-007 | Vulkan device lost (resize/IBL) | ✅ |
-| 008 | Custom title bar init order | ✅ |
-| 009 | Hi-Z depth layout mismatch | ✅ |
-| 010 | DX12 GPU-driven flickering | ⚠️ Hi-Z disabled |
-
----
-
-## Known Issues & TODO
+## TODO
 
 | Priority | Item |
 |----------|------|
-| HIGH | Hi-Z double-buffer로 occlusion culling 재활성화 |
-| MEDIUM | Async compute separate command lists |
-| MEDIUM | VulkanBackend god-object decomposition |
-| LOW | VMA 적용 (Vulkan memory allocator) |
-| LOW | Vulkan shutdown validation 에러 정리 |
-
----
-
-## Evaluation Summary
-
-> "The codebase is solid for a portfolio project. The core rendering pipeline is correct, the dual-backend parity is impressive, and the phased development approach is well-documented."
-
-**Strengths:**
-- Clean `IRenderBackend` abstraction
-- DX12/Vulkan feature parity (RT, SSR, SSAO, TAA, Hi-Z 등)
-- DAG-based render graph with resource aliasing
-- GPU-driven rendering pipeline
-
-**Areas for Improvement:**
-- VulkanBackend ~800 lines → subsystem extraction 필요
-- Raw Vulkan handles → RAII wrapper 또는 VMA
-- Single-threaded → multi-threaded command recording
+| HIGH | Hi-Z double-buffer (occlusion culling 재활성화) |
+| MEDIUM | VulkanBackend subsystem extraction |
+| LOW | Clustered forward lighting |
 
 ---
 
 ## License
 
 Portfolio project. Not for production use.
-

@@ -17,6 +17,7 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
         return;
     }
 
+    // Enable/disable toggle + controls
     bool enabled = profiler->IsEnabled();
     if (ImGui::Checkbox("Enable Profiling", &enabled))
         profiler->SetEnabled(enabled);
@@ -39,6 +40,7 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
     const auto& results = profiler->GetResults();
     float totalMs = profiler->GetTotalGpuTimeMs();
 
+    // Total frame time header
     ImGui::Text("Total GPU: %.3f ms (%.1f FPS)", totalMs, totalMs > 0.0001f ? 1000.0f / totalMs : 0.0f);
     ImGui::Separator();
 
@@ -49,6 +51,7 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
         return;
     }
 
+    // Optionally sort by time
     std::vector<size_t> order(results.size());
     for (size_t i = 0; i < results.size(); ++i) order[i] = i;
     if (_sortMode == 1)
@@ -58,10 +61,12 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
         });
     }
 
+    // Calculate max time for bar scaling
     float maxTime = 0.0f;
     for (auto& r : results) maxTime = std::max(maxTime, r.avgGpuTimeMs);
     if (maxTime < 0.001f) maxTime = 1.0f;
 
+    // Colour palette for passes (cycle through)
     static const ImVec4 kColors[] = {
         ImVec4(0.4f, 0.7f, 1.0f, 1.0f),   // blue
         ImVec4(0.4f, 0.9f, 0.5f, 1.0f),   // green
@@ -74,6 +79,7 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
     };
     constexpr size_t kColorCount = sizeof(kColors) / sizeof(kColors[0]);
 
+    // Stacked bar (horizontal)
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 cursorStart = ImGui::GetCursorScreenPos();
     float barHeight = 24.0f;
@@ -98,6 +104,7 @@ void GPUProfilerOverlay::Render(IGPUProfiler* profiler)
                       ImGui::ColorConvertFloat4ToU32(ImVec4(0.3f, 0.3f, 0.3f, 1.0f)));
     ImGui::Dummy(ImVec2(barWidth, barHeight + 4.0f));
 
+    // Table of passes
     if (ImGui::BeginTable("##GPUTimings", _showPercentage ? 4 : 3,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
     {

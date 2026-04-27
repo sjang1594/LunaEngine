@@ -12,6 +12,7 @@ public:
     LightComponent();
     virtual ~LightComponent() = default;
 
+    // Returns normalized toward-light direction (derived from rotation or explicit direction)
     XMFLOAT3 GetDirection() const { return _direction; }
     void     SetDirection(const XMFLOAT3& dir);
 
@@ -20,7 +21,7 @@ public:
     float     intensity = 3.0f;
 
 private:
-    XMFLOAT3 _direction = {0.4082f, 0.8165f, 0.4082f};
+    XMFLOAT3 _direction = {0.4082f, 0.8165f, 0.4082f}; // normalize(1,2,1)
 };
 
 } // namespace Luna

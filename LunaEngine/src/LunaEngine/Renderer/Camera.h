@@ -4,6 +4,13 @@ using namespace DirectX;
 
 namespace Luna
 {
+// ---------------------------------------------------------------------------
+// Orbital camera — quaternion-based to avoid gimbal lock.
+//   Orbit()  — mouse drag (yaw / pitch in degrees)
+//   Zoom()   — scroll wheel (adjusts orbit radius)
+//   SetAspect() — called on window resize
+//   SetOrientation() / GetOrientation() — for gizmo snap-to-view
+// ---------------------------------------------------------------------------
 class Camera
 {
   public:
@@ -12,13 +19,17 @@ class Camera
 
     void SetAspect(float aspect);
 
+    // delta values are in degrees
     void Orbit(float dYaw, float dPitch);
+
+    // positive delta zooms in; negative zooms out
     void Zoom(float delta);
 
     XMMATRIX  GetViewMatrix()       const;
     XMMATRIX  GetProjectionMatrix() const;
     XMFLOAT3  GetEyePosition()      const;
 
+    // Quaternion orientation access (for gizmo snap-to-view)
     XMVECTOR  GetOrientation()      const { return XMLoadFloat4(&_orientation); }
     void      SetOrientation(XMVECTOR quat);
 
@@ -28,8 +39,8 @@ class Camera
   private:
     XMFLOAT3 ComputeEye() const;
 
-    XMFLOAT4 _orientation;
-    float    _radius = 3.0f;
+    XMFLOAT4 _orientation;         // unit quaternion
+    float    _radius =   3.0f;     // orbit radius
 
     XMFLOAT3 _target = {0.0f, 0.0f, 0.0f};
 

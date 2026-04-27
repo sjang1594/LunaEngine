@@ -4,6 +4,7 @@
 #include "Logger/Logger.h"
 #include "Renderer/Vulkan/Public/VulkanDevice.h"
 #include "Renderer/Mesh.h"
+#include "Renderer/Meshlet.h"        // Phase 27: meshlet generation
 #include "LunaEngine/Utils/FileSystemUtil.h"
 #include "stb_image.h"
 #include "cgltf.h"
@@ -100,6 +101,8 @@ static bool CompileGLSLtoSPIRV(const std::wstring& glslPath, std::vector<uint32_
     if      (glslPath.find(L".vert.")  != std::wstring::npos) stage = L"vertex";
     else if (glslPath.find(L".frag.")  != std::wstring::npos) stage = L"fragment";
     else if (glslPath.find(L".comp.")  != std::wstring::npos) stage = L"compute";
+    else if (glslPath.find(L".task.")  != std::wstring::npos) stage = L"task";     // Phase 27
+    else if (glslPath.find(L".mesh.")  != std::wstring::npos) stage = L"mesh";     // Phase 27
     else if (glslPath.find(L".rgen.")  != std::wstring::npos) stage = L"rgen";
     else if (glslPath.find(L".rmiss.") != std::wstring::npos) stage = L"rmiss";
     else if (glslPath.find(L".rchit.") != std::wstring::npos) stage = L"rchit";
@@ -196,6 +199,14 @@ bool VulkanBackend::Init(void* windowHandler, uint32_t width, uint32_t height)
     _device = std::make_unique<VulkanDevice>();
     if (!_device->Initialize(_instance, _surface)) return false;
     _rtSupported = _device->IsRTSupported();  // Phase 18D
+
+    // Initialize VulkanCore wrapper ??provides VulkanCore* interface to subsystems
+    if (!_core.InitFromDevice(_device.get()))
+    {
+        LUNA_LOG_ERROR("VK: Failed to initialize VulkanCore from device");
+        return false;
+    }
+
     if (_rtSupported)
     {
         VkDevice dev = _device->GetDevice();
@@ -215,17 +226,125 @@ bool VulkanBackend::Init(void* windowHandler, uint32_t width, uint32_t height)
         else { LUNA_LOG_INFO("VK RT: function pointers loaded"); }
     }
     if (!CreateImGuiDescriptorPool())   return false;
-    if (!CreateSwapchain(width, height)) return false;
-    if (!CreateDepthResources())        return false;
-    if (!CreateRenderPass())            return false;
-    if (!CreateFramebuffers())          return false;
+    {
+        VulkanSwapchain::CreateInfo sci;
+        sci.core    = &_core;
+        sci.surface = _surface;
+        sci.width   = width;
+        sci.height  = height;
+        sci.vsync   = _vsync;
+        if (!_vkSwapchain.Create(sci)) return false;
+    }
     if (!CreateFrameResources())        return false;
+
+    // Transition all swapchain images from UNDEFINED → PRESENT_SRC_KHR so the
+    // ImGui overlay render pass (LOAD_OP_LOAD, initialLayout=PRESENT_SRC_KHR) is valid
+    // on their first use before the tonemap pass has written to them.
+    {
+        VkCommandBuffer initCmd = BeginSingleTimeCommands();
+        if (initCmd)
+        {
+            for (uint32_t i = 0; i < _vkSwapchain.GetImageCount(); ++i)
+            {
+                VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image               = _vkSwapchain.GetImage(i);
+                b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdPipelineBarrier(initCmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &b);
+            }
+            EndSingleTimeCommands(initCmd);
+        }
+    }
+
+    {
+        VulkanGBuffer::CreateInfo gbInfo;
+        gbInfo.core = &_core;
+        gbInfo.extent = _vkSwapchain.GetExtent();
+        gbInfo.depthView = _vkSwapchain.GetDepthView();
+        gbInfo.depthFormat = _vkSwapchain.GetDepthFormat();
+        if (!_gBuffer.Create(gbInfo)) return false;
+    }
+    if (!CreateRenderPass())            return false;
     if (!CreatePipeline())              return false;
-    if (!CreateGBufferResources())      return false;
-    if (!CreateCSMResources())          { LUNA_LOG_WARN("VK: CSM init failed ??shadows disabled"); }
-    if (!CreateSSAOResources())         { LUNA_LOG_WARN("VK: SSAO init failed ??AO disabled"); }
+    { VulkanShadows::CreateInfo ci{}; ci.core = &_core;
+      if (!_shadows.Create(ci)) { LUNA_LOG_WARN("VK: CSM init failed ??shadows disabled"); } }
+
+    // Create point-clamp sampler (shared by SSAO and deferred pipeline)
+    if (_pointClampSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo si{};
+        si.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter    = si.minFilter = VK_FILTER_NEAREST;
+        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxAnisotropy = 1.0f;
+        vkCreateSampler(_device->GetDevice(), &si, nullptr, &_pointClampSampler);
+    }
+
+    // Create linear sampler (shared by materials, SSR, TAA, Bloom, Tonemap)
+    // Must use REPEAT + anisotropic 8x to match DX12 and prevent UV seam artifacts (bug-fix/005)
+    if (_linearSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo si{};
+        si.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter    = VK_FILTER_LINEAR;
+        si.minFilter    = VK_FILTER_LINEAR;
+        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.anisotropyEnable = VK_TRUE;
+        si.maxAnisotropy    = 8.0f;
+        si.maxLod           = 0.0f;
+        vkCreateSampler(_device->GetDevice(), &si, nullptr, &_linearSampler);
+    }
+
+    // Initialize VulkanSSAO subsystem
+    {
+        VulkanSSAO::CreateInfo ssaoInfo;
+        ssaoInfo.core = &_core;
+        ssaoInfo.extent = _vkSwapchain.GetExtent();
+        ssaoInfo.depthView = _vkSwapchain.GetDepthView();
+        ssaoInfo.normalView = _gBuffer.GetNormalView();
+        ssaoInfo.pointClampSampler = _pointClampSampler;
+        ssaoInfo.framesInFlight = FRAMES_IN_FLIGHT;
+        
+        if (!_ssao.Create(ssaoInfo)) {
+            LUNA_LOG_WARN("VK: SSAO init failed ??AO disabled");
+        }
+    }
+
+    // Phase 24: Clustered lighting resources (must be before CreateDeferredPipeline for set=2 layout)
+    CreateClusteredLightingResources();  // non-fatal: _clusteredLightingReady gates usage
+
     if (!CreateDeferredPipeline())      return false;
-    if (!CreatePPResources())           { LUNA_LOG_WARN("VK: PP resources failed — SSR disabled"); }
+
+    // Initialize VulkanPostProcess subsystem
+    {
+        VulkanPostProcess::CreateInfo ppInfo;
+        ppInfo.core = &_core;
+        ppInfo.extent = _vkSwapchain.GetExtent();
+        ppInfo.swapchainFormat = _vkSwapchain.GetFormat();
+        ppInfo.depthView = _vkSwapchain.GetDepthView();
+        ppInfo.normalView = _gBuffer.GetNormalView();
+        ppInfo.metalRoughView = _gBuffer.GetMetalRoughView();
+        ppInfo.linearSampler = _linearSampler;
+        ppInfo.pointClampSampler = _pointClampSampler;
+
+        if (!_postProcess.Create(ppInfo)) {
+            LUNA_LOG_WARN("VK: PostProcess init failed — PP disabled");
+        }
+        // SetTonemapFramebuffers is called AFTER CreateFramebuffers() below
+    }
+
+    // Create tonemap framebuffers (must be after CreateRenderPass which creates _tonemapRenderPass)
+    if (!CreateFramebuffers()) {
+        LUNA_LOG_ERROR("VK: CreateFramebuffers failed");
+        return false;
+    }
+    // Now that _tonemapFramebuffers is populated, pass it to PostProcess
+    _postProcess.SetTonemapFramebuffers(_tonemapFramebuffers);
 
     // GPU Profiler
     _gpuProfiler.Init(_device->GetDevice(), _device->GetPhysicalDevice(), _device->GetGraphicsQueue());
@@ -254,11 +373,46 @@ void VulkanBackend::Shutdown()
 {
     if (!_device || _device->GetDevice() == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(_device->GetDevice());
+
+    VkDevice dev = _device->GetDevice();
+
+    // Reset ALL command pools to release recorded resource references, then destroy them.
+    // vkResetCommandPool returns command buffers to initial state, clearing any implicit
+    // references to buffers/pipelines/descriptor sets. This prevents validation errors
+    // about resources being "in use" by command buffers during subsequent cleanup.
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+        if (_frames[i].cmdPool) {
+            vkResetCommandPool(dev, _frames[i].cmdPool, 0);
+            vkDestroyCommandPool(dev, _frames[i].cmdPool, nullptr);
+            _frames[i].cmdPool = VK_NULL_HANDLE;
+            _frames[i].cmdBuffer = VK_NULL_HANDLE;
+        }
+        if (_computeFrames[i].cmdPool) {
+            vkResetCommandPool(dev, _computeFrames[i].cmdPool, 0);
+            vkDestroyCommandPool(dev, _computeFrames[i].cmdPool, nullptr);
+            _computeFrames[i].cmdPool = VK_NULL_HANDLE;
+            _computeFrames[i].cmdBuffer = VK_NULL_HANDLE;
+        }
+    }
+    if (_transferCmdPool) {
+        vkResetCommandPool(dev, _transferCmdPool, 0);
+        vkDestroyCommandPool(dev, _transferCmdPool, nullptr);
+        _transferCmdPool = VK_NULL_HANDLE;
+    }
+    _core.Shutdown();  // Destroys VulkanCore's _transferCmdPool; device pointer stays valid
+
+    // Now safe to destroy subsystems and resources
+    _shadows.Destroy();
+    _hiZ.Destroy();
+    _ibl.Destroy();
+    _ssao.Destroy();
+    _postProcess.Destroy();
+    DestroyClusteredLightingResources();  // Phase 24
+
     _gpuProfiler.Shutdown();
     ShutdownImGui();
 
-    VkDevice dev = _device->GetDevice();
-    // Destroy materials first (deduplicated to avoid double-free on shared materials)
+    // Destroy materials (deduplicated to avoid double-free on shared materials)
     {
         std::set<VkMaterial*> destroyedMats;
         for (auto& m : _vkSceneMeshes) {
@@ -294,16 +448,13 @@ void VulkanBackend::Shutdown()
         if (_frames[i].mvpMemory)   vkFreeMemory(dev, _frames[i].mvpMemory, nullptr);
         if (_frames[i].sceneBuffer) vkDestroyBuffer(dev, _frames[i].sceneBuffer, nullptr);
         if (_frames[i].sceneMemory) vkFreeMemory(dev, _frames[i].sceneMemory, nullptr);
-        if (_frames[i].cmdPool)     vkDestroyCommandPool(dev, _frames[i].cmdPool, nullptr);
+        // cmdPool already destroyed above
         if (_frames[i].fence)       vkDestroyFence(dev, _frames[i].fence, nullptr);
         if (_frames[i].imageReady)  vkDestroySemaphore(dev, _frames[i].imageReady, nullptr);
         if (_frames[i].renderDone)  vkDestroySemaphore(dev, _frames[i].renderDone, nullptr);
     }
-    if (_transferCmdPool) { vkDestroyCommandPool(dev, _transferCmdPool, nullptr); _transferCmdPool = VK_NULL_HANDLE; }
     if (_imguiDescriptorPool) { vkDestroyDescriptorPool(dev, _imguiDescriptorPool, nullptr); _imguiDescriptorPool = VK_NULL_HANDLE; }
-    DestroyDepthResources();
-    DestroySwapchain();
-    if (_renderPass)         { vkDestroyRenderPass(dev, _renderPass,         nullptr); _renderPass         = VK_NULL_HANDLE; }
+    _vkSwapchain.Destroy();
     if (_hdrFramebuffer)     { vkDestroyFramebuffer(dev, _hdrFramebuffer,    nullptr); _hdrFramebuffer     = VK_NULL_HANDLE; }
     if (_hdrRenderPass)      { vkDestroyRenderPass(dev, _hdrRenderPass,      nullptr); _hdrRenderPass      = VK_NULL_HANDLE; }
     if (_ppRenderPass)       { vkDestroyRenderPass(dev, _ppRenderPass,       nullptr); _ppRenderPass       = VK_NULL_HANDLE; }
@@ -331,7 +482,7 @@ void VulkanBackend::BeginFrame()
 
     VkDevice dev = _device->GetDevice();
 
-    // Handle deferred resize (safe — no command buffer is recording yet)
+    // Handle deferred resize (safe ??no command buffer is recording yet)
     if (_pendingResize)
     {
         _pendingResize = false;
@@ -358,7 +509,7 @@ void VulkanBackend::BeginFrame()
         ImGui_ImplVulkan_SetMinImageCount(2);
 
         // Clear imagesInFlight to avoid stale fence references after swapchain recreation
-        for (auto& f : _imagesInFlight) f = VK_NULL_HANDLE;
+        for (uint32_t ii = 0; ii < _vkSwapchain.GetImageCount(); ++ii) _vkSwapchain.SetImageFence(ii, VK_NULL_HANDLE);
 
         // Reset resize cooldown - RT will be skipped for a few frames
         _framesSinceResize = 0;
@@ -383,8 +534,7 @@ void VulkanBackend::BeginFrame()
         return;
     }
 
-    VkResult r = vkAcquireNextImageKHR(dev, _swapchain, UINT64_MAX,
-                                        frame.imageReady, VK_NULL_HANDLE, &_imageIndex);
+    VkResult r = _vkSwapchain.AcquireNextImage(frame.imageReady, &_imageIndex);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
     {
         // Wait for ALL in-flight frames before recreation
@@ -404,7 +554,7 @@ void VulkanBackend::BeginFrame()
         vkDeviceWaitIdle(dev);
         RecreateSwapchain();
         // Clear imagesInFlight to avoid stale fence references
-        for (auto& f : _imagesInFlight) f = VK_NULL_HANDLE;
+        for (uint32_t ii = 0; ii < _vkSwapchain.GetImageCount(); ++ii) _vkSwapchain.SetImageFence(ii, VK_NULL_HANDLE);
         _framesSinceResize = 0;  // Reset resize cooldown
         return;
     }
@@ -417,9 +567,10 @@ void VulkanBackend::BeginFrame()
     if (r != VK_SUCCESS) { LUNA_LOG_ERROR("vkAcquireNextImageKHR failed: %d", (int)r); return; }
 
     // Wait for any previous frame that was using this swapchain image
-    if (_imagesInFlight[_imageIndex] != VK_NULL_HANDLE)
+    VkFence imgFence = _vkSwapchain.GetImageFence(_imageIndex);
+    if (imgFence != VK_NULL_HANDLE)
     {
-        VkResult wr = vkWaitForFences(dev, 1, &_imagesInFlight[_imageIndex], VK_TRUE, UINT64_MAX);
+        VkResult wr = vkWaitForFences(dev, 1, &imgFence, VK_TRUE, UINT64_MAX);
         if (wr == VK_ERROR_DEVICE_LOST)
         {
             LUNA_LOG_ERROR("VK: Device lost during image-in-flight fence wait");
@@ -428,12 +579,12 @@ void VulkanBackend::BeginFrame()
         }
     }
     // Mark this image as being used by this frame's fence
-    _imagesInFlight[_imageIndex] = frame.fence;
+    _vkSwapchain.SetImageFence(_imageIndex, frame.fence);
 
     vkResetFences(dev, 1, &frame.fence);
 
     // Update ping-pong index and per-frame TAA descriptor (after fence ??safe to update GPU resources)
-    UpdatePPDescriptors();
+    _postProcess.UpdateDescriptors(_frameIndex);
 
     vkResetCommandBuffer(frame.cmdBuffer, 0);
 
@@ -447,11 +598,20 @@ void VulkanBackend::BeginFrame()
     _gpuProfiler.ResetQueryPool(frame.cmdBuffer);
 
     // CSM shadow depth pre-pass (uses previous frame's cached model matrices)
-    if (_csmPipeline && !_lastMeshModels.empty())
+    if (_shadows.GetArrayView() && !_lastMeshModels.empty())
     {
         _gpuProfiler.WriteBeginTimestamp(frame.cmdBuffer, "CSM Shadows");
-        UpdateCSMMatrices(_lastView, _lastProj);
-        DrawCSMPass(frame.cmdBuffer);
+        _shadows.UpdateMatrices(_lastView, _lastProj);
+
+        // Build ShadowDraw list from cached mesh data
+        std::vector<VulkanShadows::ShadowDraw> draws;
+        draws.reserve(_vkSceneMeshes.size());
+        for (size_t mi = 0; mi < _vkSceneMeshes.size() && mi < _lastMeshModels.size(); ++mi) {
+            auto& m = _vkSceneMeshes[mi];
+            if (!m) continue;
+            draws.push_back({ m->vertexBuffer, m->indexBuffer, m->indexCount, _lastMeshModels[mi] });
+        }
+        _shadows.DrawPass(frame.cmdBuffer, draws);
         _gpuProfiler.WriteEndTimestamp(frame.cmdBuffer);
     }
 
@@ -463,18 +623,18 @@ void VulkanBackend::BeginFrame()
 
     VkRenderPassBeginInfo rpi{};
     rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpi.renderPass        = _gbRenderPass;
-    rpi.framebuffer       = _gbFramebuffer;
-    rpi.renderArea.extent = _swapchainExtent;
+    rpi.renderPass        = _gBuffer.GetRenderPass();
+    rpi.framebuffer       = _gBuffer.GetFramebuffer();
+    rpi.renderArea.extent = _vkSwapchain.GetExtent();
     rpi.clearValueCount   = 4;
     rpi.pClearValues      = gbClears;
     vkCmdBeginRenderPass(frame.cmdBuffer, &rpi, VK_SUBPASS_CONTENTS_INLINE);
 
     VkViewport vp{ 0, 0,
-        (float)_swapchainExtent.width, (float)_swapchainExtent.height, 0, 1 };
+        (float)_vkSwapchain.GetExtent().width, (float)_vkSwapchain.GetExtent().height, 0, 1 };
     vkCmdSetViewport(frame.cmdBuffer, 0, 1, &vp);
 
-    VkRect2D sc{ {0,0}, _swapchainExtent };
+    VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
     vkCmdSetScissor(frame.cmdBuffer, 0, 1, &sc);
 
     _frameActive = true;
@@ -485,7 +645,7 @@ void VulkanBackend::BeginFrame()
 
 void VulkanBackend::DrawFrame() {} // SceneManager calls DrawMesh directly
 
-// CompositeFrame: end G-buffer pass → render graph → open ImGui pass
+// CompositeFrame: end G-buffer pass ??render graph ??open ImGui pass
 void VulkanBackend::CompositeFrame()
 {
     if (!_frameActive || _deviceLost) return;
@@ -493,26 +653,25 @@ void VulkanBackend::CompositeFrame()
     VkCommandBuffer cmd = frame.cmdBuffer;
     VkDevice dev = _device->GetDevice();
 
-    // ━━ End G-buffer render pass ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // G-buffer colour attachments transition to SHADER_READ_ONLY_OPTIMAL,
-    // depth transitions to DEPTH_STENCIL_READ_ONLY_OPTIMAL (via render pass finalLayout).
+    // End G-buffer render pass
     vkCmdEndRenderPass(cmd);
 
-    // ━━ Phase 23: Build Hi-Z pyramid from current frame's depth ━━━━━━━━━━━━━
+
+    // ─── Phase 23: Build Hi-Z pyramid from current frame's depth ───
     // After the G-buffer pass ends, depth is in DEPTH_STENCIL_READ_ONLY_OPTIMAL.
-    // Transition to DEPTH_STENCIL_ATTACHMENT_OPTIMAL so BuildHiZPyramid can use it,
+    // Transition to DEPTH_STENCIL_ATTACHMENT_OPTIMAL so BuildPyramid can use it,
     // then build the Hi-Z pyramid so it's ready for next frame's occlusion cull.
     // Finally, restore depth to DEPTH_STENCIL_READ_ONLY_OPTIMAL for the render graph.
-    if (_hizImage && _hizMipCount >= 2)
+    if (_hiZ.GetMipCount() >= 2)
     {
-        // READ_ONLY → ATTACHMENT (BuildHiZPyramid expects ATTACHMENT_OPTIMAL)
+        // READ_ONLY ??ATTACHMENT (BuildPyramid expects ATTACHMENT_OPTIMAL)
         VkImageMemoryBarrier depthBar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         depthBar.srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         depthBar.dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
                                   | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         depthBar.oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         depthBar.newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depthBar.image            = _depthImage;
+        depthBar.image            = _vkSwapchain.GetDepthImage();
         depthBar.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
         depthBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         depthBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -521,16 +680,18 @@ void VulkanBackend::CompositeFrame()
             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
             0, 0, nullptr, 0, nullptr, 1, &depthBar);
 
-        BuildHiZPyramid(cmd);
+        _gpuProfiler.WriteBeginTimestamp(cmd, "Hi-Z Build");
+        _hiZ.BuildPyramid(cmd, _vkSwapchain.GetDepthImage(), _vkSwapchain.GetExtent());
+        _gpuProfiler.WriteEndTimestamp(cmd);
 
-        // ATTACHMENT → READ_ONLY (restore for render graph + downstream SSAO/lighting/SSR)
+        // ATTACHMENT ??READ_ONLY (restore for render graph + downstream SSAO/lighting/SSR)
         VkImageMemoryBarrier restoreBar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         restoreBar.srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
                                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         restoreBar.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
         restoreBar.oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         restoreBar.newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        restoreBar.image            = _depthImage;
+        restoreBar.image            = _vkSwapchain.GetDepthImage();
         restoreBar.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
         restoreBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         restoreBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -540,7 +701,7 @@ void VulkanBackend::CompositeFrame()
             0, 0, nullptr, 0, nullptr, 1, &restoreBar);
     }
 
-    // ━━ Update deferred scene UBO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ?�━ Update deferred scene UBO ?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━?�━
     // Compute invViewProj = inverse(view * proj) using DirectXMath.
     {
         XMMATRIX V   = XMLoadFloat4x4(&_deferredView);
@@ -568,27 +729,31 @@ void VulkanBackend::CompositeFrame()
 
         // CSM data: viewMatrix, lightVP[4], cascadeSplits
         memcpy(ubo.viewMatrix, &_deferredView, 64);
-        for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++)
-            memcpy(ubo.lightVP[c], &_csmLightVP[c], 64);
-        memcpy(ubo.cascadeSplits, _csmSplits, 16);
+        const XMFLOAT4X4* lightVPs = _shadows.GetLightVPs();
+        for (uint32_t c = 0; c < VulkanShadows::CASCADE_COUNT; c++)
+            memcpy(ubo.lightVP[c], &lightVPs[c], 64);
+        memcpy(ubo.cascadeSplits, _shadows.GetCascadeSplits(), 16);
 
         // Phase 18D: enable RT shadow in shader when pipeline and shadow mask are ready
         ubo.rtEnabled = (_rtSupported && _vkRTPipeline != VK_NULL_HANDLE
                          && _vkShadowMaskView != VK_NULL_HANDLE) ? 1u : 0u;
+        // Phase 24: point light count
+        ubo.numPointLights = _clusteredLightingReady ? (uint32_t)std::min((size_t)MAX_POINT_LIGHTS, _pointLights.size()) : 0u;
 
         memcpy(_deferredSceneCBMapped[_frameIndex], &ubo, sizeof(ubo));
     }
 
     // PP resources are required; if missing, open ImGui pass and return early (black frame).
-    bool ppReady = _vkPPResourcesValid && _deferredHDRFramebuffer && _vkSSRTonemapPipeline;
+    bool ppReady = _postProcess.IsReady();
     if (!ppReady)
     {
-        // PP resources not ready → open ImGui pass and bail (black frame as error state)
-        if (_ssaoPipeline) {
-            DrawSSAOPass(cmd);
-            DrawSSAOBlurPass(cmd);
+        // PP resources not ready ??open ImGui pass and bail (black frame as error state)
+        // Draw SSAO if the subsystem is ready
+        if (_ssao.GetBlurredView() != VK_NULL_HANDLE) {
+            _ssao.Draw(cmd, _frameIndex, _lastView, _lastProj);
+            _ssao.DrawBlur(cmd);
         }
-        // Swapchain image is UNDEFINED after acquire; _renderPass expects PRESENT_SRC_KHR.
+        // Swapchain image is UNDEFINED after acquire; _vkSwapchain.GetRenderPass() expects PRESENT_SRC_KHR.
         // Transition the swapchain image to PRESENT_SRC_KHR so the ImGui overlay pass layout is valid.
         {
             VkImageMemoryBarrier swapBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -596,7 +761,7 @@ void VulkanBackend::CompositeFrame()
             swapBarrier.newLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             swapBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             swapBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            swapBarrier.image               = _swapchainImages[_imageIndex];
+            swapBarrier.image               = _vkSwapchain.GetImage(_imageIndex);
             swapBarrier.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             swapBarrier.srcAccessMask       = 0;
             swapBarrier.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -605,37 +770,42 @@ void VulkanBackend::CompositeFrame()
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &swapBarrier);
         }
+        VkClearValue clears[2]{};
+        clears[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        clears[1].depthStencil = {1.0f, 0};
         VkRenderPassBeginInfo irpi{};
         irpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        irpi.renderPass = _renderPass; irpi.framebuffer = _framebuffers[_imageIndex];
-        irpi.renderArea.extent = _swapchainExtent; irpi.clearValueCount = 0;
+        irpi.renderPass = _vkSwapchain.GetRenderPass(); irpi.framebuffer = _vkSwapchain.GetFramebuffer(_imageIndex);
+        irpi.renderArea.extent = _vkSwapchain.GetExtent(); irpi.clearValueCount = 2; irpi.pClearValues = clears;
         vkCmdBeginRenderPass(cmd, &irpi, VK_SUBPASS_CONTENTS_INLINE);
         return;
     }
 
     // ===================================================================
-    // Phase 18C: VulkanRenderGraph — data-driven barrier scheduling
-    // Replaces all manual vkCmdPipelineBarrier calls between post-G-buffer
-    // passes with automatic state tracking and barrier emission.
+    // Phase 18C + Phase 26: VulkanRenderGraph — data-driven barrier
+    // scheduling with transient resource aliasing support.
+    // Phase 26: device + physicalDevice passed to enable CreateTransientImage().
+    // Currently all images are imported (persistent); aliasing infrastructure
+    // is ready for future migration of short-lived intermediates.
     // ===================================================================
-    VulkanRenderGraph rg;
+    VulkanRenderGraph rg(_device->GetDevice(), _device->GetPhysicalDevice());
 
     // -- Import images with their post-G-buffer-pass states --
-    // G-buffer: colour → SHADER_READ_ONLY (render pass finalLayout),
-    //           depth  → DEPTH_STENCIL_READ_ONLY (render pass finalLayout).
-    auto hGBAlbedo = rg.ImportImage(_gbAlbedoImage,
+    // G-buffer: colour ??SHADER_READ_ONLY (render pass finalLayout),
+    //           depth  ??DEPTH_STENCIL_READ_ONLY (render pass finalLayout).
+    auto hGBAlbedo = rg.ImportImage(_gBuffer.GetAlbedoImage(),
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    auto hGBNormal = rg.ImportImage(_gbNormalImage,
+    auto hGBNormal = rg.ImportImage(_gBuffer.GetNormalImage(),
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    auto hGBMR = rg.ImportImage(_gbMetalRoughImage,
+    auto hGBMR = rg.ImportImage(_gBuffer.GetMetalRoughImage(),
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    auto hDepth = rg.ImportImage(_depthImage,
+    auto hDepth = rg.ImportImage(_vkSwapchain.GetDepthImage(),
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -644,11 +814,11 @@ void VulkanBackend::CompositeFrame()
     // SSAO intermediates (only if SSAO pipeline exists)
     VKRGHandle hSSAORT   = VKRG_NULL_HANDLE;
     VKRGHandle hSSAOBlur = VKRG_NULL_HANDLE;
-    if (_ssaoPipeline)
+    if (_ssao.IsReady())
     {
-        hSSAORT = rg.ImportImage(_ssaoRTImage,
+        hSSAORT = rg.ImportImage(_ssao.GetRawImage(),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
-        hSSAOBlur = rg.ImportImage(_ssaoBlurImage,
+        hSSAOBlur = rg.ImportImage(_ssao.GetBlurredImage(),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
     }
 
@@ -665,56 +835,56 @@ void VulkanBackend::CompositeFrame()
     }
 
     // HDR intermediate
-    auto hHDR = rg.ImportImage(_hdrImage,
+    auto hHDR = rg.ImportImage(_postProcess.GetHDRImage(),
         VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
 
     // SSR image (kept in GENERAL)
     VKRGHandle hSSR = VKRG_NULL_HANDLE;
-    if (_vkSSRPipeline)
+    if (_postProcess.IsSSRReady())
     {
-        hSSR = rg.ImportImage(_ssrImage,
+        hSSR = rg.ImportImage(_postProcess.GetSSRImage(),
             VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
 
     // Motion blur
     VKRGHandle hMB = VKRG_NULL_HANDLE;
-    bool mbActive = _vkMBPipeline && _mbView && _vkTAAPipeline;
+    bool mbActive = _postProcess.IsMotionBlurReady() && _postProcess.IsTAAReady();
     if (mbActive)
     {
-        hMB = rg.ImportImage(_mbImage,
+        hMB = rg.ImportImage(_postProcess.GetMotionBlurImage(),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
     }
 
     // TAA history (ping-pong)
     VKRGHandle hTAARead  = VKRG_NULL_HANDLE;
     VKRGHandle hTAAWrite = VKRG_NULL_HANDLE;
-    bool taaActive = _vkTAAPipeline != VK_NULL_HANDLE;
+    bool taaActive = _postProcess.IsTAAReady();
     if (taaActive)
     {
-        int readIdx  = 1 - _vkTaaHistoryIndex;
-        int writeIdx = _vkTaaHistoryIndex;
-        hTAARead = rg.ImportImage(_taaHistoryImage[readIdx],
+        int writeIdx = _postProcess.GetTAAHistoryWriteIndex();
+        int readIdx  = 1 - writeIdx;
+        hTAARead = rg.ImportImage(_postProcess.GetTAAHistoryImage(readIdx),
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT);
-        hTAAWrite = rg.ImportImage(_taaHistoryImage[writeIdx],
+        hTAAWrite = rg.ImportImage(_postProcess.GetTAAHistoryImage(writeIdx),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
     }
 
     // Bloom
     VKRGHandle hBloomBright = VKRG_NULL_HANDLE;
     VKRGHandle hBloomBlur   = VKRG_NULL_HANDLE;
-    if (taaActive && _vkBloomBrightPipeline)
+    if (taaActive && _postProcess.GetBloomBrightImage())
     {
-        hBloomBright = rg.ImportImage(_bloomBrightImage,
+        hBloomBright = rg.ImportImage(_postProcess.GetBloomBrightImage(),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
-        hBloomBlur = rg.ImportImage(_bloomBlurImage,
+        hBloomBlur = rg.ImportImage(_postProcess.GetBloomBlurImage(),
             VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
     }
 
-    // ── Pass 1: SSAO ──
-    if (_ssaoPipeline)
+    // ?�?� Pass 1: SSAO ?�?�
+    if (_ssao.IsReady())
     {
         rg.AddPass("SSAO")
             .Read(hDepth,    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
@@ -724,11 +894,11 @@ void VulkanBackend::CompositeFrame()
             .Write(hSSAORT,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
             .SideEffect()
-            .Execute([this](VkCommandBuffer c) { DrawSSAOPass(c); });
+            .Execute([this](VkCommandBuffer c) { _ssao.Draw(c, _frameIndex, _lastView, _lastProj); });
     }
 
-    // ── Pass 2: SSAO Blur ──
-    if (_ssaoPipeline)
+    // ?�?� Pass 2: SSAO Blur ?�?�
+    if (_ssao.IsReady())
     {
         rg.AddPass("SSAO Blur")
             .Read(hSSAORT,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -736,10 +906,10 @@ void VulkanBackend::CompositeFrame()
             .Write(hSSAOBlur,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
             .SideEffect()
-            .Execute([this](VkCommandBuffer c) { DrawSSAOBlurPass(c); });
+            .Execute([this](VkCommandBuffer c) { _ssao.DrawBlur(c); });
     }
 
-    // ── Pass 3: RT Shadows ──
+    // ?�?� Pass 3: RT Shadows ?�?�
     if (rtActive)
     {
         // Update RT scene UBO for this frame
@@ -773,7 +943,17 @@ void VulkanBackend::CompositeFrame()
                 vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, _vkRTPipeLayout,
                                          0, 1, &_vkRTDescSet[_frameIndex], 0, nullptr);
                 pfn_vkCmdTraceRaysKHR(c, &_vkRgenRegion, &_vkMissRegion, &_vkHitRegion, &_vkCallRegion,
-                                       _swapchainExtent.width, _swapchainExtent.height, 1);
+                                       _vkSwapchain.GetExtent().width, _vkSwapchain.GetExtent().height, 1);
+            });
+    }
+
+    // ── Pass 3.5: Cluster Assign (compute — Phase 24) ──
+    if (_clusteredLightingReady && !_pointLights.empty())
+    {
+        rg.AddPass("Cluster Assign")
+            .SideEffect()
+            .Execute([this](VkCommandBuffer c) {
+                DispatchClusterAssign(c);
             });
     }
 
@@ -792,7 +972,7 @@ void VulkanBackend::CompositeFrame()
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
             .SideEffect();
 
-        if (_ssaoPipeline)
+        if (_ssao.IsReady())
             deferredPass.Read(hSSAOBlur, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         if (rtActive)
@@ -805,66 +985,63 @@ void VulkanBackend::CompositeFrame()
 
             VkRenderPassBeginInfo lrpi{};
             lrpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            lrpi.renderPass        = _ppRenderPass;
-            lrpi.framebuffer       = _deferredHDRFramebuffer;
-            lrpi.renderArea.extent = _swapchainExtent;
+            lrpi.renderPass        = _postProcess.GetPPRenderPass();
+            lrpi.framebuffer       = _postProcess.GetDeferredHDRFramebuffer();
+            lrpi.renderArea.extent = _vkSwapchain.GetExtent();
             lrpi.clearValueCount   = 1;
             lrpi.pClearValues      = &ltClear;
             vkCmdBeginRenderPass(c, &lrpi, VK_SUBPASS_CONTENTS_INLINE);
 
-            VkViewport vp{ 0, 0, (float)_swapchainExtent.width, (float)_swapchainExtent.height, 0, 1 };
+            VkViewport vp{ 0, 0, (float)_vkSwapchain.GetExtent().width, (float)_vkSwapchain.GetExtent().height, 0, 1 };
             vkCmdSetViewport(c, 0, 1, &vp);
-            VkRect2D sc{ {0,0}, _swapchainExtent };
+            VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
             vkCmdSetScissor(c, 0, 1, &sc);
 
-            VkPipeline activeDeferredPipeline = (_iblReady && _deferredIBLPipeline)
+            VkPipeline activeDeferredPipeline = (_ibl.IsReady() && _deferredIBLPipeline)
                                                 ? _deferredIBLPipeline : _deferredPipeline;
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, activeDeferredPipeline);
-            VkDescriptorSet dSets[] = { _deferredSceneDescSet[_frameIndex], _deferredGbufDescSet };
-            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                     _deferredPipeLayout, 0, 2, dSets, 0, nullptr);
+            // Phase 24: bind all 3 sets in one call if set=2 is available
+            if (_clusterLightDescSet) {
+                VkDescriptorSet dSets3[] = { _deferredSceneDescSet[_frameIndex], _deferredGbufDescSet, _clusterLightDescSet };
+                vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                         _deferredPipeLayout, 0, 3, dSets3, 0, nullptr);
+            } else {
+                VkDescriptorSet dSets[] = { _deferredSceneDescSet[_frameIndex], _deferredGbufDescSet };
+                vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                         _deferredPipeLayout, 0, 2, dSets, 0, nullptr);
+            }
             vkCmdDraw(c, 3, 1, 0, 0);
             vkCmdEndRenderPass(c);
         });
     }
 
-    // ── Pass 5: SSR Compute ──
-    if (_vkSSRPipeline)
+    // ── Phase 28: Atmosphere sky-view LUT update + sky composite ──
+    if (_atmosphere.IsReady())
     {
-        // Upload SSR constants for this frame
-        {
-            struct SSRConstants {
-                float view[16]; float proj[16]; float invViewProj[16];
-                float eyePos[3]; float maxDistance;
-                uint32_t screenW; uint32_t screenH; uint32_t maxSteps; float stepSize;
-                float thickness; float maxRoughness; float _pad0[2]; float _pad1[4];
-            };
-            static_assert(sizeof(SSRConstants) == 256, "SSRConstants must be 256B");
+        // Pass 4.5: Sky-view LUT compute (reads transmittance+multiscatter, writes skyView)
+        rg.AddPass("Atmo SkyView LUT")
+            .SideEffect()
+            .Execute([this](VkCommandBuffer c) {
+                _atmosphere.Update(c, _frameIndex, _deferredView, _deferredProj);
+            });
 
-            XMMATRIX V   = XMLoadFloat4x4(&_deferredView);
-            XMMATRIX P   = XMLoadFloat4x4(&_deferredProj);
-            XMMATRIX VP  = XMMatrixMultiply(V, P);
-            XMVECTOR det = XMMatrixDeterminant(VP);
-            XMMATRIX iVP = XMMatrixInverse(&det, VP);
-            XMFLOAT4X4 iVPF; XMStoreFloat4x4(&iVPF, iVP);
+        // Pass 4.6: Sky composite (reads skyView+depth, composites sky onto HDR via LOAD_OP_LOAD)
+        // HDR is NOT read as sceneTex — scene content is preserved by the atmosphere render pass
+        // LOAD op. The render pass transitions HDR: SHADER_READ_ONLY → COLOR_ATTACHMENT → SHADER_READ_ONLY.
+        rg.AddPass("Sky Composite")
+            .Read(hDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
+            .Write(hHDR,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+            .SideEffect()
+            .Execute([this](VkCommandBuffer c) {
+                _atmosphere.DrawComposite(c, _frameIndex);
+            });
+    }
 
-            float negTx = -_deferredView._41, negTy = -_deferredView._42, negTz = -_deferredView._43;
-            float eyeX  = _deferredView._11*negTx + _deferredView._12*negTy + _deferredView._13*negTz;
-            float eyeY  = _deferredView._21*negTx + _deferredView._22*negTy + _deferredView._23*negTz;
-            float eyeZ  = _deferredView._31*negTx + _deferredView._32*negTy + _deferredView._33*negTz;
-
-            SSRConstants cb{};
-            memcpy(cb.view,        &_deferredView, 64);
-            memcpy(cb.proj,        &_deferredProj, 64);
-            memcpy(cb.invViewProj, &iVPF,          64);
-            cb.eyePos[0] = eyeX; cb.eyePos[1] = eyeY; cb.eyePos[2] = eyeZ;
-            cb.maxDistance = 50.0f;
-            cb.screenW = _swapchainExtent.width; cb.screenH = _swapchainExtent.height;
-            cb.maxSteps  = 32; cb.stepSize  = 0.05f;
-            cb.thickness = 0.1f; cb.maxRoughness = 0.6f;
-            memcpy(_vkSSRCBMapped[_frameIndex], &cb, 256);
-        }
-
+    // ── Pass 5: SSR Compute ──
+    if (_postProcess.IsSSRReady())
+    {
         rg.AddPass("SSR Compute")
             .Read(hHDR,      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
@@ -878,16 +1055,11 @@ void VulkanBackend::CompositeFrame()
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT)
             .SideEffect()
             .Execute([this](VkCommandBuffer c) {
-                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, _vkSSRPipeline);
-                vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                         _vkSSRPipeLayout, 0, 1, &_vkSSRDescSet[_frameIndex], 0, nullptr);
-                uint32_t gx = (_swapchainExtent.width  + 7) / 8;
-                uint32_t gy = (_swapchainExtent.height + 7) / 8;
-                vkCmdDispatch(c, gx, gy, 1);
+                _postProcess.DrawSSR(c, _frameIndex, _deferredView, _deferredProj);
             });
     }
 
-    // ── Pass 6: Motion Blur ──
+    // ?�?� Pass 6: Motion Blur ?�?�
     if (mbActive)
     {
         rg.AddPass("Motion Blur")
@@ -898,7 +1070,11 @@ void VulkanBackend::CompositeFrame()
             .Write(hMB,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
             .SideEffect()
-            .Execute([this](VkCommandBuffer) { DrawVKMotionBlurPass(); });
+            .Execute([this](VkCommandBuffer c) {
+                XMFLOAT4X4 prevVP;
+                memcpy(&prevVP, _postProcess.GetPrevUnjitteredVP(), 64);
+                _postProcess.DrawMotionBlur(c, _frameIndex, _deferredView, _deferredProj, prevVP);
+            });
     }
 
     if (taaActive)
@@ -906,7 +1082,7 @@ void VulkanBackend::CompositeFrame()
         // Determine TAA source: motion blur output if available, else HDR
         VKRGHandle hTAASrc = mbActive ? hMB : hHDR;
 
-        // ── Pass 7: TAA ──
+        // ?�?� Pass 7: TAA ?�?�
         rg.AddPass("TAA")
             .Read(hTAASrc,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
@@ -917,10 +1093,26 @@ void VulkanBackend::CompositeFrame()
             .Write(hTAAWrite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
             .SideEffect()
-            .Execute([this](VkCommandBuffer) { DrawVKTAAPass(); });
+            .Execute([this](VkCommandBuffer c) {
+                // Build TAA constants
+                XMMATRIX V   = XMLoadFloat4x4(&_deferredView);
+                XMMATRIX P   = XMLoadFloat4x4(&_deferredProj);
+                XMMATRIX VP  = XMMatrixMultiply(V, P);
+                XMMATRIX iVP = XMMatrixInverse(nullptr, VP);
+                XMFLOAT4X4 iVPF; XMStoreFloat4x4(&iVPF, iVP);
 
-        // ── Pass 8: Bloom Bright ──
-        if (_vkBloomBrightPipeline)
+                VulkanPostProcess::TAAConstants taaConst{};
+                memcpy(taaConst.invViewProj, &iVPF, 64);
+                memcpy(taaConst.prevViewProj, _postProcess.GetPrevUnjitteredVP(), 64);
+                taaConst.jitter[0]     = _vkCurJitter[0];  taaConst.jitter[1]     = _vkCurJitter[1];
+                taaConst.prevJitter[0] = _vkPrevJitter[0]; taaConst.prevJitter[1] = _vkPrevJitter[1];
+                taaConst.alpha = (_postProcess.GetFrameCount() < 8) ? 1.0f : 0.1f;
+
+                _postProcess.DrawTAA(c, _frameIndex, taaConst);
+            });
+
+        // ?�?� Pass 8: Bloom Bright ?�?�
+        if (_postProcess.GetBloomBrightImage())
         {
             rg.AddPass("Bloom Bright")
                 .Read(hTAAWrite,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -928,50 +1120,50 @@ void VulkanBackend::CompositeFrame()
                 .Write(hBloomBright, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
                 .SideEffect()
-                .Execute([this](VkCommandBuffer) { DrawVKBloomBrightPass(); });
+                .Execute([this](VkCommandBuffer c) { _postProcess.DrawBloomBright(c); });
 
-            // ── Pass 9: Bloom Blur H ──
+            // ?�?� Pass 9: Bloom Blur H ?�?�
             rg.AddPass("Bloom Blur H")
                 .Read(hBloomBright, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
                 .Write(hBloomBlur,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
                 .SideEffect()
-                .Execute([this](VkCommandBuffer) { DrawVKBloomBlurPass(true); });
+                .Execute([this](VkCommandBuffer c) { _postProcess.DrawBloomBlur(c, true); });
 
-            // ── Pass 10: Bloom Blur V ──
+            // ?�?� Pass 10: Bloom Blur V ?�?�
             rg.AddPass("Bloom Blur V")
                 .Read(hBloomBlur,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
                 .Write(hBloomBright, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
                 .SideEffect()
-                .Execute([this](VkCommandBuffer) { DrawVKBloomBlurPass(false); });
+                .Execute([this](VkCommandBuffer c) { _postProcess.DrawBloomBlur(c, false); });
         }
 
-        // ── Pass 11: Tonemap → swapchain ──
+        // ?�?� Pass 11: Tonemap ??swapchain ?�?�
         {
             auto& tonemapPass = rg.AddPass("Tonemap")
                 .Read(hTAAWrite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
                 .SideEffect();
-            if (_vkBloomBrightPipeline)
+            if (_postProcess.GetBloomBrightImage())
                 tonemapPass.Read(hBloomBright, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            if (_vkSSRPipeline)
+            if (_postProcess.IsSSRReady())
                 tonemapPass.Read(hSSR, VK_IMAGE_LAYOUT_GENERAL,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            tonemapPass.Execute([this](VkCommandBuffer) { DrawVKTonemapPass(); });
+            tonemapPass.Execute([this](VkCommandBuffer c) { _postProcess.DrawTonemap(c, _imageIndex); });
         }
     }
     else
     {
-        // Phase 16C fallback: simple HDR + SSR → swapchain (no TAA)
+        // Phase 16C fallback: simple HDR + SSR ??swapchain (no TAA)
         auto& fallbackPass = rg.AddPass("SSR Tonemap Fallback")
             .Read(hHDR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
             .SideEffect();
-        if (_vkSSRPipeline)
+        if (_postProcess.IsSSRReady())
             fallbackPass.Read(hSSR, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         fallbackPass.Execute([this](VkCommandBuffer c) {
@@ -982,14 +1174,14 @@ void VulkanBackend::CompositeFrame()
             trpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             trpi.renderPass        = _tonemapRenderPass;
             trpi.framebuffer       = _tonemapFramebuffers[_imageIndex];
-            trpi.renderArea.extent = _swapchainExtent;
+            trpi.renderArea.extent = _vkSwapchain.GetExtent();
             trpi.clearValueCount   = 1;
             trpi.pClearValues      = &ltClear;
             vkCmdBeginRenderPass(c, &trpi, VK_SUBPASS_CONTENTS_INLINE);
 
-            VkViewport vp{ 0, 0, (float)_swapchainExtent.width, (float)_swapchainExtent.height, 0, 1 };
+            VkViewport vp{ 0, 0, (float)_vkSwapchain.GetExtent().width, (float)_vkSwapchain.GetExtent().height, 0, 1 };
             vkCmdSetViewport(c, 0, 1, &vp);
-            VkRect2D sc{ {0,0}, _swapchainExtent };
+            VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
             vkCmdSetScissor(c, 0, 1, &sc);
 
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, _vkSSRTonemapPipeline);
@@ -1004,15 +1196,18 @@ void VulkanBackend::CompositeFrame()
     rg.Compile();
     rg.Execute(cmd, &_gpuProfiler);
 
-    // ━━ Open ImGui overlay render pass (_renderPass, LOAD from swapchain) ━━
+    // ─── Open ImGui overlay render pass (_vkSwapchain.GetRenderPass(), LOAD from swapchain) ───
+    VkClearValue imguiClears[2]{};
+    imguiClears[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    imguiClears[1].depthStencil = {1.0f, 0};
     VkRenderPassBeginInfo irpi{};
     irpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    irpi.renderPass        = _renderPass;
-    irpi.framebuffer       = _framebuffers[_imageIndex];
-    irpi.renderArea.extent = _swapchainExtent;
-    irpi.clearValueCount   = 0;
+    irpi.renderPass        = _vkSwapchain.GetRenderPass();
+    irpi.framebuffer       = _vkSwapchain.GetFramebuffer(_imageIndex);
+    irpi.renderArea.extent = _vkSwapchain.GetExtent();
+    irpi.clearValueCount   = 2;
+    irpi.pClearValues      = imguiClears;
     vkCmdBeginRenderPass(cmd, &irpi, VK_SUBPASS_CONTENTS_INLINE);
-    // ImGui_ImplVulkan_RenderDrawData will record into this open pass via RenderImGui().
 }
 
 void VulkanBackend::EndFrame()
@@ -1053,14 +1248,7 @@ void VulkanBackend::EndFrame()
         return;
     }
 
-    VkPresentInfoKHR pi{};
-    pi.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores    = &frame.renderDone;
-    pi.swapchainCount     = 1;
-    pi.pSwapchains        = &_swapchain;
-    pi.pImageIndices      = &_imageIndex;
-    VkResult r = vkQueuePresentKHR(_device->GetPresentQueue(), &pi);
+    VkResult r = _vkSwapchain.Present(_device->GetPresentQueue(), frame.renderDone, _imageIndex);
     if (r == VK_ERROR_DEVICE_LOST)
     {
         LUNA_LOG_ERROR("VK: Device lost during present");
@@ -1084,7 +1272,7 @@ void VulkanBackend::EndFrame()
         }
         vkDeviceWaitIdle(_device->GetDevice());
         RecreateSwapchain();
-        for (auto& f : _imagesInFlight) f = VK_NULL_HANDLE;
+        for (uint32_t ii = 0; ii < _vkSwapchain.GetImageCount(); ++ii) _vkSwapchain.SetImageFence(ii, VK_NULL_HANDLE);
         _framesSinceResize = 0;  // Reset resize cooldown
     }
     _frameIndex = (_frameIndex + 1) % FRAMES_IN_FLIGHT;
@@ -1108,26 +1296,29 @@ void VulkanBackend::UpdateMVP(const XMFLOAT4X4&, const XMFLOAT4X4& view, const X
         XMMATRIX P  = XMLoadFloat4x4(&proj);
         XMMATRIX VP = XMMatrixMultiply(V, P);
         XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(_vkUnjitteredVP), VP);
+        _postProcess.SetUnjitteredVP(_vkUnjitteredVP);
     }
 
     // Phase 10: Halton(2,3) jitter ??sub-pixel TAA offset on projection matrix.
     _vkPrevJitter[0] = _vkCurJitter[0];
     _vkPrevJitter[1] = _vkCurJitter[1];
-    if (_vkTAAPipeline) {
+    if (_postProcess.IsTAAReady()) {
         auto Halton = [](int i, int b) -> float {
             float r = 0.0f, f = 1.0f / float(b);
             for (; i > 0; i /= b, f /= float(b)) r += f * float(i % b);
             return r;
         };
-        int idx = int(_vkFrameCount % 16);
-        _vkCurJitter[0] = (Halton(idx + 1, 2) - 0.5f) * 1.0f / float(_swapchainExtent.width);
-        _vkCurJitter[1] = (Halton(idx + 1, 3) - 0.5f) * 1.0f / float(_swapchainExtent.height);
+        int idx = int(_postProcess.GetFrameCount() % 16);
+        _vkCurJitter[0] = (Halton(idx + 1, 2) - 0.5f) * 1.0f / float(_vkSwapchain.GetExtent().width);
+        _vkCurJitter[1] = (Halton(idx + 1, 3) - 0.5f) * 1.0f / float(_vkSwapchain.GetExtent().height);
 
         // Apply jitter to both projections (G-buffer + deferred lighting must match)
         _lastProj._31     += _vkCurJitter[0];
         _lastProj._32     += _vkCurJitter[1];
         _deferredProj._31 += _vkCurJitter[0];
         _deferredProj._32 += _vkCurJitter[1];
+
+        _postProcess.SetJitter(_vkCurJitter[0], _vkCurJitter[1], _vkPrevJitter[0], _vkPrevJitter[1]);
     } else {
         _vkCurJitter[0] = 0.0f;
         _vkCurJitter[1] = 0.0f;
@@ -1412,7 +1603,7 @@ std::vector<std::shared_ptr<Mesh>> VulkanBackend::LoadMeshes(const std::string& 
     // Phase 21: clear stored transforms
     _lastLoadTransforms.clear();
 
-    // Phase 21: helper — process a single primitive with a world transform
+    // Phase 21: helper ??process a single primitive with a world transform
     auto ProcessPrimitive = [&](cgltf_mesh* gltfMesh, cgltf_size pi,
                                  const XMFLOAT4X4& worldTransform)
     {
@@ -1573,10 +1764,29 @@ std::vector<std::shared_ptr<Mesh>> VulkanBackend::LoadMeshes(const std::string& 
     if (CreateIndirectResources())
     {
         LUNA_LOG_INFO("VK: Phase 15B GPU-driven ready (%zu meshes)", _vkSceneMeshes.size());
-        if (!CreateHiZResources())
-            LUNA_LOG_WARN("VK Phase 23: Hi-Z occlusion culling init failed — frustum-only culling");
+        { VulkanHiZ::CreateInfo hiZInfo{}; hiZInfo.core = &_core; hiZInfo.extent = _vkSwapchain.GetExtent(); hiZInfo.depthView = _vkSwapchain.GetDepthView();
+          if (_hiZ.Create(hiZInfo)) {
+              // Update cull descriptor sets with Hi-Z bindings (4=UBO, 5=texture)
+              for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                  if (_vkCullDescSet[i] == VK_NULL_HANDLE) continue;
+                  VkDescriptorBufferInfo hizBI { _hiZ.GetParamsBuffer(), 0, 128 };
+                  VkDescriptorImageInfo  hizII { _hiZ.GetSampler(), _hiZ.GetFullView(), VK_IMAGE_LAYOUT_GENERAL };
+                  VkWriteDescriptorSet ws[2]{};
+                  ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 4, 0, 1,
+                            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hizBI, nullptr };
+                  ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 5, 0, 1,
+                            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hizII, nullptr, nullptr };
+                  vkUpdateDescriptorSets(_device->GetDevice(), 2, ws, 0, nullptr);
+              }
+          } else {
+              LUNA_LOG_WARN("VK Phase 23: Hi-Z occlusion culling init failed ??frustum-only culling");
+          }
+        }
         if (!CreateAsyncComputeResources())
             LUNA_LOG_WARN("Phase 20: Async compute init failed — cull on graphics queue");
+        // Phase 27: mesh shader pipeline (requires objectData + meshlet buffers)
+        if (!CreateMeshShaderResources())
+            LUNA_LOG_INFO("VK Mesh Shader: init skipped — using indirect draw path");
     }
     else
         LUNA_LOG_WARN("VK: CreateIndirectResources FAILED");
@@ -1586,7 +1796,7 @@ std::vector<std::shared_ptr<Mesh>> VulkanBackend::LoadMeshes(const std::string& 
         if (BuildAccelerationStructures() && CreateRTPipeline())
             LUNA_LOG_INFO("VK RT: ray tracing initialized (%zu BLAS(es))", _vkBLASes.size());
         else
-            LUNA_LOG_WARN("VK RT: initialization failed ??falling back to CSM-only shadows");
+            LUNA_LOG_WARN("VK RT: initialization failed — falling back to CSM-only shadows");
     }
 
     LUNA_LOG_INFO("VK: Loaded %zu mesh(es)", _vkSceneMeshes.size());
@@ -1686,7 +1896,10 @@ std::vector<std::shared_ptr<Mesh>> VulkanBackend::LoadDebugQuad()
     std::vector<std::vector<uint32_t>>  allIdxs  = {quadI};
     BuildMergedGeometry(allVerts, allIdxs);
     if (CreateIndirectResources())
+    {
         LUNA_LOG_INFO("VK: Debug quad GPU-driven ready");
+        CreateMeshShaderResources();  // Phase 27: try mesh shader for debug quad too
+    }
 
     if (_rtSupported) {
         if (BuildAccelerationStructures() && CreateRTPipeline())
@@ -1735,9 +1948,9 @@ void VulkanBackend::InitImGui(void* windowHandler)
     ii.QueueFamily     = _device->GetGraphicsQueueFamily();
     ii.DescriptorPool  = _imguiDescriptorPool;
     ii.MinImageCount   = 2;
-    ii.ImageCount      = (uint32_t)_swapchainImages.size();
+    ii.ImageCount      = (uint32_t)_vkSwapchain.GetImageCount();
     ii.CheckVkResultFn = [](VkResult e){ if(e!=VK_SUCCESS) LUNA_LOG_ERROR("ImGui Vk: %d",(int)e); };
-    ii.PipelineInfoMain.RenderPass   = _renderPass;
+    ii.PipelineInfoMain.RenderPass   = _vkSwapchain.GetRenderPass();
     ii.PipelineInfoMain.Subpass      = 0;
     ii.PipelineInfoMain.MSAASamples  = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&ii);
@@ -1753,6 +1966,26 @@ void VulkanBackend::RenderImGui() {
 }
 void VulkanBackend::ShutdownImGui() {
     if (ImGui::GetCurrentContext() == nullptr) return;
+
+    // Reset all command pools BEFORE ImGui destroys its resources.
+    // Application::Shutdown() calls ShutdownImGui() before Backend::Shutdown(),
+    // so frame command buffers still hold references to ImGui's internal
+    // vertex/index buffers and pipeline from ImGui_ImplVulkan_RenderDrawData().
+    // Resetting the pools clears those references, preventing validation errors.
+    if (_device && _device->GetDevice() != VK_NULL_HANDLE)
+    {
+        VkDevice dev = _device->GetDevice();
+        vkDeviceWaitIdle(dev);
+        for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            if (_frames[i].cmdPool)
+                vkResetCommandPool(dev, _frames[i].cmdPool, 0);
+            if (_computeFrames[i].cmdPool)
+                vkResetCommandPool(dev, _computeFrames[i].cmdPool, 0);
+        }
+        if (_transferCmdPool)
+            vkResetCommandPool(dev, _transferCmdPool, 0);
+    }
+
     ImGuiIO& io = ImGui::GetIO();
     if (io.BackendRendererUserData != nullptr)
         ImGui_ImplVulkan_Shutdown();
@@ -1763,7 +1996,7 @@ void VulkanBackend::ShutdownImGui() {
 
 void VulkanBackend::Resize(uint32_t w, uint32_t h) {
     if (!w || !h) return;
-    // Defer resize to next BeginFrame — avoids destroying framebuffers
+    // Defer resize to next BeginFrame ??avoids destroying framebuffers
     // while a command buffer is in recording state.
     _pendingResizeW = w;
     _pendingResizeH = h;
@@ -1941,27 +2174,6 @@ void VulkanBackend::EndSingleTimeCommands(VkCommandBuffer cmd) {
 }
 
 // ===========================================================================
-// Depth resources
-// ===========================================================================
-bool VulkanBackend::CreateDepthResources() {
-    CreateImage(_swapchainExtent.width, _swapchainExtent.height,
-        VK_FORMAT_D32_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,  // Phase 23: blit source for Hi-Z pyramid
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        _depthImage, _depthMemory);
-    _depthView = CreateImageView(_depthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
-    return _depthView != VK_NULL_HANDLE;
-}
-
-void VulkanBackend::DestroyDepthResources() {
-    VkDevice dev = _device->GetDevice();
-    if (_depthView)   { vkDestroyImageView(dev,_depthView,nullptr);  _depthView   = VK_NULL_HANDLE; }
-    if (_depthImage)  { vkDestroyImage(dev,_depthImage,nullptr);     _depthImage  = VK_NULL_HANDLE; }
-    if (_depthMemory) { vkFreeMemory(dev,_depthMemory,nullptr);      _depthMemory = VK_NULL_HANDLE; }
-}
-
-// ===========================================================================
 // Instance / Debug / Surface / ImGui pool
 // ===========================================================================
 bool VulkanBackend::CreateInstance() {
@@ -2037,102 +2249,6 @@ bool VulkanBackend::CreateImGuiDescriptorPool() {
     return vkCreateDescriptorPool(_device->GetDevice(), &pi, nullptr, &_imguiDescriptorPool) == VK_SUCCESS;
 }
 
-// ===========================================================================
-// Swapchain
-// ===========================================================================
-bool VulkanBackend::CreateSwapchain(uint32_t width, uint32_t height) {
-    VkPhysicalDevice gpu = _device->GetPhysicalDevice();
-    VkDevice         dev = _device->GetDevice();
-    VkSurfaceCapabilitiesKHR caps{};
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, _surface, &caps);
-
-    uint32_t fc = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, _surface, &fc, nullptr);
-    std::vector<VkSurfaceFormatKHR> fmts(fc);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, _surface, &fc, fmts.data());
-    VkSurfaceFormatKHR chosen = fmts[0];
-    for (auto& f : fmts)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-            { chosen = f; break; }
-
-    VkExtent2D ext;
-    if (caps.currentExtent.width != UINT32_MAX) ext = caps.currentExtent;
-    else {
-        ext.width  = std::clamp(width,  caps.minImageExtent.width,  caps.maxImageExtent.width);
-        ext.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
-    }
-
-    uint32_t ic = caps.minImageCount + 1;
-    if (caps.maxImageCount > 0 && ic > caps.maxImageCount) ic = caps.maxImageCount;
-
-    VkSwapchainCreateInfoKHR sci{};
-    sci.sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    sci.surface          = _surface;
-    sci.minImageCount    = ic;
-    sci.imageFormat      = chosen.format;
-    sci.imageColorSpace  = chosen.colorSpace;
-    sci.imageExtent      = ext;
-    sci.imageArrayLayers = 1;
-    sci.imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-    uint32_t qf[] = { _device->GetGraphicsQueueFamily(), _device->GetPresentQueueFamily() };
-    if (qf[0] != qf[1]) {
-        sci.imageSharingMode      = VK_SHARING_MODE_CONCURRENT;
-        sci.queueFamilyIndexCount = 2;
-        sci.pQueueFamilyIndices   = qf;
-    } else sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    sci.preTransform   = caps.currentTransform;
-    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-
-    // VSync: FIFO (vsync on) or MAILBOX (triple-buffer, vsync off) with IMMEDIATE fallback
-    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always supported
-    if (!_vsync)
-    {
-        uint32_t pmCount = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, _surface, &pmCount, nullptr);
-        std::vector<VkPresentModeKHR> pms(pmCount);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, _surface, &pmCount, pms.data());
-        for (auto pm : pms)
-            if (pm == VK_PRESENT_MODE_MAILBOX_KHR) { presentMode = pm; break; }
-        if (presentMode == VK_PRESENT_MODE_FIFO_KHR)
-            for (auto pm : pms)
-                if (pm == VK_PRESENT_MODE_IMMEDIATE_KHR) { presentMode = pm; break; }
-    }
-    sci.presentMode = presentMode;
-    sci.clipped     = VK_TRUE;
-
-    if (vkCreateSwapchainKHR(dev, &sci, nullptr, &_swapchain) != VK_SUCCESS)
-    { LUNA_LOG_ERROR("Failed swapchain"); return false; }
-
-    _swapchainFormat = chosen.format;
-    _swapchainExtent = ext;
-
-    uint32_t n = 0;
-    vkGetSwapchainImagesKHR(dev, _swapchain, &n, nullptr);
-    _swapchainImages.resize(n);
-    vkGetSwapchainImagesKHR(dev, _swapchain, &n, _swapchainImages.data());
-    _swapchainImageViews.resize(n);
-    _imagesInFlight.resize(n, VK_NULL_HANDLE);  // Per-image fence tracking
-    for (uint32_t i = 0; i < n; i++)
-        _swapchainImageViews[i] = CreateImageView(_swapchainImages[i], _swapchainFormat, VK_IMAGE_ASPECT_COLOR_BIT);
-
-    LUNA_LOG_INFO("Swapchain: %ux%u, %u images", ext.width, ext.height, n);
-    return true;
-}
-
-void VulkanBackend::DestroySwapchain() {
-    VkDevice dev = _device->GetDevice();
-    for (auto fb : _tonemapFramebuffers) if (fb) vkDestroyFramebuffer(dev, fb, nullptr);
-    _tonemapFramebuffers.clear();
-    for (auto fb : _framebuffers) vkDestroyFramebuffer(dev, fb, nullptr);
-    _framebuffers.clear();
-    for (auto iv : _swapchainImageViews) vkDestroyImageView(dev, iv, nullptr);
-    _swapchainImageViews.clear(); _swapchainImages.clear();
-    _imagesInFlight.clear();
-    if (_swapchain) { vkDestroySwapchainKHR(dev, _swapchain, nullptr); _swapchain = VK_NULL_HANDLE; }
-}
-
 void VulkanBackend::RecreateSwapchain() {
     LUNA_LOG_INFO("VK: RecreateSwapchain %ux%u", _width, _height);
 
@@ -2144,19 +2260,24 @@ void VulkanBackend::RecreateSwapchain() {
         return;
     }
 
-    LUNA_LOG_INFO("VK: RecreateSwapchain — destroying old resources...");
-    DestroyPPResources();   // Phase 16C: destroy HDR RT first (sets _hdrView=null so CreateFramebuffers skips _hdrFramebuffer)
-    DestroyGBufferResources();
-    DestroyDepthResources(); DestroySwapchain();
-    CreateSwapchain(_width, _height); CreateDepthResources();
-    CreateGBufferResources();
-    CreateFramebuffers();
+    LUNA_LOG_INFO("VK: RecreateSwapchain ??destroying old resources...");
+    _postProcess.Destroy();  // Destroy PP resources first (owns HDR/SSR/TAA/bloom images)
+    _gBuffer.Destroy();
+    // Destroy tonemap framebuffers (reference swapchain image views)
+    { VkDevice tdev = _device->GetDevice(); for (auto fb : _tonemapFramebuffers) if (fb) vkDestroyFramebuffer(tdev, fb, nullptr); _tonemapFramebuffers.clear(); }
+    _vkSwapchain.RequestResize(_width, _height); if (!_vkSwapchain.RecreateIfNeeded()) { _deviceLost = true; return; }
+    _gBuffer.Resize(_vkSwapchain.GetExtent(), _vkSwapchain.GetDepthView()); CreateFramebuffers();
 
-    // Recreate size-dependent SSAO resources if SSAO is active
+    // Resize SSAO subsystem 
+    if (_ssao.IsReady()) {
+        _ssao.Resize(_vkSwapchain.GetExtent(), _vkSwapchain.GetDepthView(), _gBuffer.GetNormalView());
+    }
+
+    // Recreate size-dependent SSAO resources if SSAO is active (legacy path)
     if (_ssaoPipeline && _ssaoDescPool) {
         VkDevice dev = _device->GetDevice();
-        uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-        uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+        uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+        uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
         // Destroy old RT images and framebuffers
         if (_ssaoFramebuffer)     { vkDestroyFramebuffer(dev, _ssaoFramebuffer, nullptr);     _ssaoFramebuffer     = VK_NULL_HANDLE; }
@@ -2193,8 +2314,8 @@ void VulkanBackend::RecreateSwapchain() {
         _ssaoBlurFramebuffer = mkFB(_ssaoBlurView);
 
         // Update _ssaoTexDescSet: depth + normal views changed after G-buffer recreation
-        VkDescriptorImageInfo di { _pointClampSampler, _depthView,    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo ni { _pointClampSampler, _gbNormalView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo di { _pointClampSampler, _vkSwapchain.GetDepthView(),    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ni { _pointClampSampler, _gBuffer.GetNormalView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkWriteDescriptorSet tw[2]{};
         tw[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _ssaoTexDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &di, nullptr, nullptr };
         tw[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _ssaoTexDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ni, nullptr, nullptr };
@@ -2216,10 +2337,10 @@ void VulkanBackend::RecreateSwapchain() {
         VkDevice dev = _device->GetDevice();
 
         // Validate views are non-null before proceeding
-        if (!_depthView || !_gbNormalView)
+        if (!_vkSwapchain.GetDepthView() || !_gBuffer.GetNormalView())
         {
-            LUNA_LOG_ERROR("VK RT resize: _depthView=%p _gbNormalView=%p - RT will be disabled",
-                           (void*)_depthView, (void*)_gbNormalView);
+            LUNA_LOG_ERROR("VK RT resize: _vkSwapchain.GetDepthView()=%p _gBuffer.GetNormalView()=%p - RT will be disabled",
+                           (void*)_vkSwapchain.GetDepthView(), (void*)_gBuffer.GetNormalView());
         }
         else
         {
@@ -2227,7 +2348,7 @@ void VulkanBackend::RecreateSwapchain() {
             if (_vkShadowMaskView) { vkDestroyImageView(dev, _vkShadowMaskView, nullptr); _vkShadowMaskView = VK_NULL_HANDLE; }
             if (_vkShadowMaskImage){ vkDestroyImage(dev, _vkShadowMaskImage, nullptr);    _vkShadowMaskImage = VK_NULL_HANDLE; }
             if (_vkShadowMaskMem)  { vkFreeMemory(dev, _vkShadowMaskMem, nullptr);        _vkShadowMaskMem = VK_NULL_HANDLE; }
-            uint32_t W = _swapchainExtent.width, H = _swapchainExtent.height;
+            uint32_t W = _vkSwapchain.GetExtent().width, H = _vkSwapchain.GetExtent().height;
             CreateImage(W, H, VK_FORMAT_R8_UNORM, VK_IMAGE_TILING_OPTIMAL,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vkShadowMaskImage, _vkShadowMaskMem);
@@ -2238,8 +2359,8 @@ void VulkanBackend::RecreateSwapchain() {
             {
                 if (_vkRTDescSet[i] == VK_NULL_HANDLE) continue;
                 VkDescriptorImageInfo shadowII{ VK_NULL_HANDLE,      _vkShadowMaskView, VK_IMAGE_LAYOUT_GENERAL };
-                VkDescriptorImageInfo depthII { _pointClampSampler,  _depthView,        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-                VkDescriptorImageInfo normalII{ _pointClampSampler,  _gbNormalView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                VkDescriptorImageInfo depthII { _pointClampSampler,  _vkSwapchain.GetDepthView(),        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+                VkDescriptorImageInfo normalII{ _pointClampSampler,  _gBuffer.GetNormalView(),     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 VkWriteDescriptorSet ws[3]{};
                 ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkRTDescSet[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          &shadowII, nullptr, nullptr };
                 ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkRTDescSet[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthII,  nullptr, nullptr };
@@ -2250,15 +2371,45 @@ void VulkanBackend::RecreateSwapchain() {
         }
     }
 
-    // Phase 16C: recreate size-dependent SSR + HDR RT (PP resources were destroyed at the top)
-    if (!CreatePPResources()) { LUNA_LOG_WARN("VK: PP resources recreation failed — SSR disabled"); }
+    // Recreate PostProcess subsystem at new resolution
+    {
+        VulkanPostProcess::CreateInfo ppInfo;
+        ppInfo.core = &_core;
+        ppInfo.extent = _vkSwapchain.GetExtent();
+        ppInfo.swapchainFormat = _vkSwapchain.GetFormat();
+        ppInfo.depthView = _vkSwapchain.GetDepthView();
+        ppInfo.normalView = _gBuffer.GetNormalView();
+        ppInfo.metalRoughView = _gBuffer.GetMetalRoughView();
+        ppInfo.linearSampler = _linearSampler;
+        ppInfo.pointClampSampler = _pointClampSampler;
+
+        if (!_postProcess.Create(ppInfo)) {
+            LUNA_LOG_WARN("VK: PostProcess recreation failed on resize");
+        }
+        _postProcess.SetTonemapFramebuffers(_tonemapFramebuffers);
+    }
 
     // Phase 23: recreate Hi-Z pyramid at new resolution
-    DestroyHiZResources();
-    if (_gpuDrivenReady && !CreateHiZResources())
-        LUNA_LOG_WARN("VK Phase 23: Hi-Z recreation failed on resize — frustum-only culling");
+    if (_gpuDrivenReady) {
+        if (_hiZ.Resize(_vkSwapchain.GetExtent(), _vkSwapchain.GetDepthView())) {
+            // Update cull descriptor sets with Hi-Z bindings (4=UBO, 5=texture)
+            for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                if (_vkCullDescSet[i] == VK_NULL_HANDLE) continue;
+                VkDescriptorBufferInfo hizBI { _hiZ.GetParamsBuffer(), 0, 128 };
+                VkDescriptorImageInfo  hizII { _hiZ.GetSampler(), _hiZ.GetFullView(), VK_IMAGE_LAYOUT_GENERAL };
+                VkWriteDescriptorSet ws[2]{};
+                ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 4, 0, 1,
+                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hizBI, nullptr };
+                ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 5, 0, 1,
+                          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hizII, nullptr, nullptr };
+                vkUpdateDescriptorSets(_device->GetDevice(), 2, ws, 0, nullptr);
+            }
+        } else {
+            LUNA_LOG_WARN("VK Phase 23: Hi-Z recreation failed on resize ??frustum-only culling");
+        }
+    }
 
-    LUNA_LOG_INFO("VK: RecreateSwapchain complete (%ux%u)", _swapchainExtent.width, _swapchainExtent.height);
+    LUNA_LOG_INFO("VK: RecreateSwapchain complete (%ux%u)", _vkSwapchain.GetExtent().width, _vkSwapchain.GetExtent().height);
 }
 
 // ===========================================================================
@@ -2267,7 +2418,7 @@ void VulkanBackend::RecreateSwapchain() {
 bool VulkanBackend::CreateRenderPass() {
     VkDevice dev = _device->GetDevice();
 
-    // ?�?� Helper: create a single-subpass render pass ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Helper: create a single-subpass render pass ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     auto mkRP = [&](VkFormat colorFmt, VkImageLayout colorFinal,
                     bool hasDepth, VkAttachmentLoadOp colorLoad) -> VkRenderPass
     {
@@ -2324,48 +2475,6 @@ bool VulkanBackend::CreateRenderPass() {
         return rp;
     };
 
-    // Swapchain render pass ??ImGui overlay (LOAD from deferred-lighting result, PRESENT final)
-    // initialLayout = PRESENT_SRC_KHR because the deferred lighting pass wrote PRESENT_SRC_KHR
-    // before this pass starts (CompositeFrame ends the lighting pass, then opens this one).
-    _renderPass = [&]() -> VkRenderPass {
-        VkAttachmentDescription att{};
-        att.format         = _swapchainFormat;
-        att.samples        = VK_SAMPLE_COUNT_1_BIT;
-        att.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        att.initialLayout  = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        att.finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-        VkAttachmentReference cr{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-        VkSubpassDescription  sp{};
-        sp.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        sp.colorAttachmentCount = 1;
-        sp.pColorAttachments    = &cr;
-
-        VkSubpassDependency dep{};
-        dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
-        dep.dstSubpass    = 0;
-        dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-        VkRenderPassCreateInfo rpi{};
-        rpi.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpi.attachmentCount = 1;
-        rpi.pAttachments    = &att;
-        rpi.subpassCount    = 1;
-        rpi.pSubpasses      = &sp;
-        rpi.dependencyCount = 1;
-        rpi.pDependencies   = &dep;
-        VkRenderPass rp = VK_NULL_HANDLE;
-        vkCreateRenderPass(dev, &rpi, nullptr, &rp);
-        return rp;
-    }();
-    if (!_renderPass) return false;
-
     // HDR forward render pass ??PBR geometry ??R16G16B16A16_SFLOAT (SHADER_READ_ONLY final)
     _hdrRenderPass = mkRP(VK_FORMAT_R16G16B16A16_SFLOAT,
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2379,141 +2488,12 @@ bool VulkanBackend::CreateRenderPass() {
     if (!_ppRenderPass) return false;
 
     // Tone map render pass ??writes to swapchain (PRESENT final, no depth, DONT_CARE load)
-    _tonemapRenderPass = mkRP(_swapchainFormat, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    _tonemapRenderPass = mkRP(_vkSwapchain.GetFormat(), VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                               false, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
     if (!_tonemapRenderPass) return false;
 
-    // G-buffer render pass ??3 colour (albedo/normal/metalRough) + depth.
-    // Colour final layout: SHADER_READ_ONLY_OPTIMAL (ready for deferred lighting read).
-    // Depth  final layout: DEPTH_STENCIL_READ_ONLY_OPTIMAL (sampled in deferred pass).
-    _gbRenderPass = [&]() -> VkRenderPass {
-        VkAttachmentDescription atts[4]{};
-
-        // att[0]: albedo ??RGBA8_UNORM
-        atts[0].format         = VK_FORMAT_R8G8B8A8_UNORM;
-        atts[0].samples        = VK_SAMPLE_COUNT_1_BIT;
-        atts[0].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        atts[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        atts[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        atts[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-        atts[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        // att[1]: normal ??RGBA16F
-        atts[1]        = atts[0];
-        atts[1].format = VK_FORMAT_R16G16B16A16_SFLOAT;
-
-        // att[2]: metalRough ??RGBA8_UNORM
-        atts[2]        = atts[0];
-        atts[2].format = VK_FORMAT_R8G8B8A8_UNORM;
-
-        // att[3]: depth ??D32_SFLOAT
-        atts[3].format         = VK_FORMAT_D32_SFLOAT;
-        atts[3].samples        = VK_SAMPLE_COUNT_1_BIT;
-        atts[3].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        atts[3].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        atts[3].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        atts[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        atts[3].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-        atts[3].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-        VkAttachmentReference cr[3]{
-            { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-            { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-            { 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-        };
-        VkAttachmentReference dr{ 3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-
-        VkSubpassDescription sp{};
-        sp.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        sp.colorAttachmentCount    = 3;
-        sp.pColorAttachments       = cr;
-        sp.pDepthStencilAttachment = &dr;
-
-        // No external dependency needed ??frame fence ensures previous frame has completed
-        // before recording commands for the next frame.
-        VkRenderPassCreateInfo rpi{};
-        rpi.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpi.attachmentCount = 4;
-        rpi.pAttachments    = atts;
-        rpi.subpassCount    = 1;
-        rpi.pSubpasses      = &sp;
-        rpi.dependencyCount = 0;
-        rpi.pDependencies   = nullptr;
-        VkRenderPass rp = VK_NULL_HANDLE;
-        vkCreateRenderPass(dev, &rpi, nullptr, &rp);
-        return rp;
-    }();
-    if (!_gbRenderPass) return false;
-
-    // G-buffer LOAD render pass ??same structure but LOAD_OP_LOAD for re-open after GPU cull.
-    // FlushDraws explicitly transitions images from SHADER_READ_ONLY/DEPTH_STENCIL_READ_ONLY
-    // to ATTACHMENT_OPTIMAL before beginning this pass, so initialLayout matches that state.
-    // finalLayout transitions back to READ_ONLY for SSAO + deferred lighting reads.
-    _gbRenderPassLoad = [&]() -> VkRenderPass {
-        VkAttachmentDescription atts[4]{};
-        // att[0]: albedo ??RGBA8_UNORM, LOAD
-        atts[0].format         = VK_FORMAT_R8G8B8A8_UNORM;
-        atts[0].samples        = VK_SAMPLE_COUNT_1_BIT;
-        atts[0].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
-        atts[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        atts[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        atts[0].initialLayout  = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        atts[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        // att[1]: normal ??RGBA16F
-        atts[1]        = atts[0];
-        atts[1].format = VK_FORMAT_R16G16B16A16_SFLOAT;
-        // att[2]: metalRough ??RGBA8_UNORM
-        atts[2]        = atts[0];
-        // att[3]: depth ??D32_SFLOAT, LOAD
-        atts[3].format         = VK_FORMAT_D32_SFLOAT;
-        atts[3].samples        = VK_SAMPLE_COUNT_1_BIT;
-        atts[3].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
-        atts[3].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        atts[3].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        atts[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        atts[3].initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        atts[3].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-        VkAttachmentReference cr[3]{
-            { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-            { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-            { 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL },
-        };
-        VkAttachmentReference dr{ 3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-
-        VkSubpassDescription sp{};
-        sp.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        sp.colorAttachmentCount    = 3;
-        sp.pColorAttachments       = cr;
-        sp.pDepthStencilAttachment = &dr;
-
-        // Exit dependency: G-buffer writes ??SSAO/deferred fragment shader reads.
-        VkSubpassDependency dep{};
-        dep.srcSubpass    = 0;
-        dep.dstSubpass    = VK_SUBPASS_EXTERNAL;
-        dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dep.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-        VkRenderPassCreateInfo rpi{};
-        rpi.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpi.attachmentCount = 4;
-        rpi.pAttachments    = atts;
-        rpi.subpassCount    = 1;
-        rpi.pSubpasses      = &sp;
-        rpi.dependencyCount = 1;
-        rpi.pDependencies   = &dep;
-        VkRenderPass rp = VK_NULL_HANDLE;
-        vkCreateRenderPass(dev, &rpi, nullptr, &rp);
-        return rp;
-    }();
-    if (!_gbRenderPassLoad) return false;
-
+    // G-buffer render passes are now created by VulkanGBuffer subsystem.
+    // _gBuffer.GetRenderPass() = CLEAR variant, _gBuffer.GetRenderPassLoad() = LOAD variant.
     return true;
 }
 
@@ -2522,7 +2502,7 @@ bool VulkanBackend::CreateRenderPass() {
 // ===========================================================================
 bool VulkanBackend::CreateFramebuffers() {
     VkDevice dev = _device->GetDevice();
-    UINT W = _swapchainExtent.width, H = _swapchainExtent.height;
+    UINT W = _vkSwapchain.GetExtent().width, H = _vkSwapchain.GetExtent().height;
 
     // Helper
     auto mkFB = [&](VkRenderPass rp, VkImageView color, VkImageView depth,
@@ -2542,34 +2522,20 @@ bool VulkanBackend::CreateFramebuffers() {
 
     // HDR framebuffer ??forward PBR writes here (depth needed)
     if (_hdrView && _hdrRenderPass)
-        _hdrFramebuffer = mkFB(_hdrRenderPass, _hdrView, _depthView, W, H);
+        _hdrFramebuffer = mkFB(_hdrRenderPass, _hdrView, _vkSwapchain.GetDepthView(), W, H);
 
-    // G-buffer framebuffer ??3 colour targets + depth
-    if (_gbRenderPass && _gbAlbedoView && _gbNormalView && _gbMetalRoughView && _depthView) {
-        VkImageView gbAtts[4] = { _gbAlbedoView, _gbNormalView, _gbMetalRoughView, _depthView };
-        VkFramebufferCreateInfo fi{};
-        fi.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fi.renderPass      = _gbRenderPass;
-        fi.attachmentCount = 4;
-        fi.pAttachments    = gbAtts;
-        fi.width = W; fi.height = H; fi.layers = 1;
-        vkCreateFramebuffer(dev, &fi, nullptr, &_gbFramebuffer);
-        if (_gbRenderPassLoad) {
-            fi.renderPass = _gbRenderPassLoad;
-            vkCreateFramebuffer(dev, &fi, nullptr, &_gbFramebufferLoad);
-        }
-    }
+    // G-buffer framebuffers now owned by VulkanGBuffer subsystem
 
     // Tone-map framebuffers ??one per swapchain image (no depth, PRESENT final)
-    _tonemapFramebuffers.resize(_swapchainImageViews.size());
-    for (size_t i = 0; i < _swapchainImageViews.size(); i++)
+    _tonemapFramebuffers.resize(_vkSwapchain.GetImageCount());
+    for (size_t i = 0; i < _vkSwapchain.GetImageCount(); i++)
         _tonemapFramebuffers[i] = mkFB(_tonemapRenderPass,
-                                       _swapchainImageViews[i], VK_NULL_HANDLE, W, H);
+                                       _vkSwapchain.GetImageView(i), VK_NULL_HANDLE, W, H);
 
-    // ImGui/swapchain framebuffers ??used for the ImGui render pass (_renderPass, no depth)
-    _framebuffers.resize(_swapchainImageViews.size());
-    for (size_t i = 0; i < _swapchainImageViews.size(); i++)
-        _framebuffers[i] = mkFB(_renderPass, _swapchainImageViews[i], VK_NULL_HANDLE, W, H);
+    // ImGui/swapchain framebuffers ??used for the ImGui render pass (_vkSwapchain.GetRenderPass(), no depth)
+    // ImGui/swapchain framebuffers now owned by VulkanSwapchain
+
+
 
     return true;
 }
@@ -2821,7 +2787,7 @@ bool VulkanBackend::CreatePipeline() {
     gpi.pColorBlendState    = &cbs;
     gpi.pDynamicState       = &dsi;
     gpi.layout              = _pipelineLayout;
-    gpi.renderPass          = _renderPass;
+    gpi.renderPass          = _vkSwapchain.GetRenderPass();
     gpi.subpass             = 0;
 
     VkResult res = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &_graphicsPipeline);
@@ -2833,9 +2799,9 @@ bool VulkanBackend::CreatePipeline() {
 
     LUNA_LOG_INFO("VK: Forward PBR pipeline created");
 
-    // ?�?� G-buffer fill pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?G-buffer fill pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     // Compiles gbuffer_vk.frag.hlsl; reuses same vertex shader, same _pipelineLayout.
-    // Targets _gbRenderPass which has 3 colour attachments.
+    // Targets _gBuffer.GetRenderPass() which has 3 colour attachments.
     {
         std::vector<uint32_t> gbFsS;
         if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"gbuffer_vk.frag.glsl").wstring(), gbFsS))
@@ -2875,7 +2841,7 @@ bool VulkanBackend::CreatePipeline() {
         gbGpi.pStages         = gbStages;
         gbGpi.pColorBlendState= &gbCbs;
         gbGpi.layout          = _pipelineLayout;
-        gbGpi.renderPass      = _gbRenderPass;
+        gbGpi.renderPass      = _gBuffer.GetRenderPass();
 
         res = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gbGpi, nullptr, &_gbPipeline);
         vkDestroyShaderModule(dev, gbVsM, nullptr);
@@ -2890,76 +2856,24 @@ bool VulkanBackend::CreatePipeline() {
 }
 
 // ===========================================================================
-// G-buffer resources
+// G-buffer resources — now delegated to VulkanGBuffer subsystem
 // ===========================================================================
-bool VulkanBackend::CreateGBufferResources()
-{
-    VkDevice dev = _device->GetDevice();
-    uint32_t W = _swapchainExtent.width, H = _swapchainExtent.height;
-
-    auto mkGB = [&](VkFormat fmt, VkImage& img, VkDeviceMemory& mem, VkImageView& view) -> bool {
-        if (!CreateImage(W, H, fmt, VK_IMAGE_TILING_OPTIMAL,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, img, mem))
-            return false;
-        view = CreateImageView(img, fmt, VK_IMAGE_ASPECT_COLOR_BIT);
-        return view != VK_NULL_HANDLE;
-    };
-
-    if (!mkGB(VK_FORMAT_R8G8B8A8_UNORM,       _gbAlbedoImage,     _gbAlbedoMemory,     _gbAlbedoView))     return false;
-    if (!mkGB(VK_FORMAT_R16G16B16A16_SFLOAT,  _gbNormalImage,     _gbNormalMemory,     _gbNormalView))     return false;
-    if (!mkGB(VK_FORMAT_R8G8B8A8_UNORM,       _gbMetalRoughImage, _gbMetalRoughMemory, _gbMetalRoughView)) return false;
-
-    // Build the G-buffer framebuffers (3 colour + existing depth view).
-    // _depthView must already exist (CreateDepthResources called before this).
-    if (_gbRenderPass && _depthView) {
-        VkImageView atts[4] = { _gbAlbedoView, _gbNormalView, _gbMetalRoughView, _depthView };
-        VkFramebufferCreateInfo fi{};
-        fi.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fi.renderPass      = _gbRenderPass;
-        fi.attachmentCount = 4;
-        fi.pAttachments    = atts;
-        fi.width = W; fi.height = H; fi.layers = 1;
-        if (vkCreateFramebuffer(dev, &fi, nullptr, &_gbFramebuffer) != VK_SUCCESS) return false;
-        if (_gbRenderPassLoad) {
-            fi.renderPass = _gbRenderPassLoad;
-            if (vkCreateFramebuffer(dev, &fi, nullptr, &_gbFramebufferLoad) != VK_SUCCESS) return false;
-        }
-    }
-
-    LUNA_LOG_INFO("VK: G-buffer resources created (%ux%u)", W, H);
-    return true;
-}
-
-void VulkanBackend::DestroyGBufferResources()
-{
-    VkDevice dev = _device->GetDevice();
-    if (_gbFramebufferLoad) { vkDestroyFramebuffer(dev, _gbFramebufferLoad, nullptr); _gbFramebufferLoad = VK_NULL_HANDLE; }
-    if (_gbFramebuffer)     { vkDestroyFramebuffer(dev, _gbFramebuffer,     nullptr); _gbFramebuffer     = VK_NULL_HANDLE; }
-    auto dt = [&](VkImageView& v, VkImage& i, VkDeviceMemory& m) {
-        if (v) { vkDestroyImageView(dev, v, nullptr); v = VK_NULL_HANDLE; }
-        if (i) { vkDestroyImage(dev, i, nullptr);     i = VK_NULL_HANDLE; }
-        if (m) { vkFreeMemory(dev, m, nullptr);       m = VK_NULL_HANDLE; }
-    };
-    dt(_gbAlbedoView,     _gbAlbedoImage,     _gbAlbedoMemory);
-    dt(_gbNormalView,     _gbNormalImage,     _gbNormalMemory);
-    dt(_gbMetalRoughView, _gbMetalRoughImage, _gbMetalRoughMemory);
-}
 
 void VulkanBackend::UpdateDeferredGbufDescriptors()
 {
     if (_deferredGbufDescSet == VK_NULL_HANDLE) return;
     VkDevice dev = _device->GetDevice();
 
-    VkDescriptorImageInfo aII  { _pointClampSampler, _gbAlbedoView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo nII  { _pointClampSampler, _gbNormalView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo mrII { _pointClampSampler, _gbMetalRoughView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo dII  { _pointClampSampler, _depthView,        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo aII  { _pointClampSampler, _gBuffer.GetAlbedoView(),     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo nII  { _pointClampSampler, _gBuffer.GetNormalView(),     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo mrII { _pointClampSampler, _gBuffer.GetMetalRoughView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo dII  { _pointClampSampler, _vkSwapchain.GetDepthView(),        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo sII  { _pointClampSampler, VK_NULL_HANDLE,    VK_IMAGE_LAYOUT_UNDEFINED };
-    VkDescriptorImageInfo csmII{ VK_NULL_HANDLE,     _csmArrayView ? _csmArrayView : _gbAlbedoView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo csmSII{ _csmSampler ? _csmSampler : _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-    VkDescriptorImageInfo ssaoII{ VK_NULL_HANDLE, _ssaoBlurView ? _ssaoBlurView : _gbAlbedoView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo bilinII{ _ssaoBilinearClamp ? _ssaoBilinearClamp : _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    VkDescriptorImageInfo csmII{ VK_NULL_HANDLE,     _shadows.GetArrayView() ? _shadows.GetArrayView() : _gBuffer.GetAlbedoView(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo csmSII{ _shadows.GetSampler() ? _shadows.GetSampler() : _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    VkImageView ssaoView = _ssao.GetBlurredView();
+    VkDescriptorImageInfo ssaoII{ VK_NULL_HANDLE, ssaoView ? ssaoView : _gBuffer.GetAlbedoView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo bilinII{ _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };  // VulkanSSAO owns its bilinear sampler
 
     VkWriteDescriptorSet ws[14]{};
     ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _deferredGbufDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &aII,    nullptr, nullptr };
@@ -2975,11 +2889,11 @@ void VulkanBackend::UpdateDeferredGbufDescriptors()
 
     // Phase 15C: write IBL bindings when available
     VkDescriptorImageInfo envII{}, irrII{}, lutII{}, envSmpII{};
-    if (_iblReady) {
-        envII    = { VK_NULL_HANDLE,  _vkPrefilterCubemapView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        irrII    = { VK_NULL_HANDLE,  _vkIrrCubemapView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        lutII    = { VK_NULL_HANDLE,  _vkBrdfLUTView,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        envSmpII = { _vkIBLSampler,   VK_NULL_HANDLE,          VK_IMAGE_LAYOUT_UNDEFINED };
+    if (_ibl.IsReady()) {
+        envII    = { VK_NULL_HANDLE,  _ibl.GetPrefilterView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        irrII    = { VK_NULL_HANDLE,  _ibl.GetIrradianceView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        lutII    = { VK_NULL_HANDLE,  _ibl.GetBRDFLUTView(),   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        envSmpII = { _ibl.GetIBLSampler(), VK_NULL_HANDLE,     VK_IMAGE_LAYOUT_UNDEFINED };
         ws[9]  = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _deferredGbufDescSet,  9, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &envII,    nullptr, nullptr };
         ws[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _deferredGbufDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &irrII,    nullptr, nullptr };
         ws[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _deferredGbufDescSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &lutII,    nullptr, nullptr };
@@ -3071,10 +2985,11 @@ bool VulkanBackend::CreateDeferredPipeline()
         vkCreateDescriptorSetLayout(dev, &li, nullptr, &_deferredGbufLayout);
     }
 
-    VkDescriptorSetLayout dLayouts[] = { _deferredSceneLayout, _deferredGbufLayout };
+    VkDescriptorSetLayout dLayouts[] = { _deferredSceneLayout, _deferredGbufLayout,
+                                         _clusterLightLayout ? _clusterLightLayout : _deferredSceneLayout };
     VkPipelineLayoutCreateInfo pli{};
     pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pli.setLayoutCount = 2;
+    pli.setLayoutCount = _clusterLightLayout ? 3u : 2u;
     pli.pSetLayouts    = dLayouts;
     vkCreatePipelineLayout(dev, &pli, nullptr, &_deferredPipeLayout);
 
@@ -3217,386 +3132,6 @@ bool VulkanBackend::CreateDeferredPipeline()
     return true;
 }
 
-// ===========================================================================
-// CSM Resources
-// ===========================================================================
-bool VulkanBackend::CreateCSMResources()
-{
-    VkDevice dev = _device->GetDevice();
-
-    // Create 2D array image (D32_SFLOAT, 2048×2048, 4 layers)
-    {
-        VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.imageType   = VK_IMAGE_TYPE_2D;
-        ii.format      = VK_FORMAT_D32_SFLOAT;
-        ii.extent      = { CSM_SHADOW_SIZE, CSM_SHADOW_SIZE, 1 };
-        ii.mipLevels   = 1;
-        ii.arrayLayers = CSM_CASCADE_COUNT;
-        ii.samples     = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling      = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateImage(dev, &ii, nullptr, &_csmImage) != VK_SUCCESS) return false;
-
-        VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(dev, _csmImage, &req);
-        VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        ai.allocationSize  = req.size;
-        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(dev, &ai, nullptr, &_csmMemory) != VK_SUCCESS) return false;
-        vkBindImageMemory(dev, _csmImage, _csmMemory, 0);
-    }
-
-    // Per-layer image views (for framebuffer depth attachment)
-    for (uint32_t i = 0; i < CSM_CASCADE_COUNT; i++) {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = _csmImage;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format   = VK_FORMAT_D32_SFLOAT;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, i, 1 };
-        vkCreateImageView(dev, &vi, nullptr, &_csmLayerView[i]);
-    }
-
-    // Array image view (for sampling in deferred lighting)
-    {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = _csmImage;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-        vi.format   = VK_FORMAT_D32_SFLOAT;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, CSM_CASCADE_COUNT };
-        vkCreateImageView(dev, &vi, nullptr, &_csmArrayView);
-    }
-
-    // CSM depth-only render pass
-    // initialLayout = UNDEFINED: first use or we don't care about previous content (cleared anyway)
-    // finalLayout = DEPTH_STENCIL_READ_ONLY_OPTIMAL: ready for sampling in deferred lighting
-    {
-        VkAttachmentDescription att{};
-        att.format         = VK_FORMAT_D32_SFLOAT;
-        att.samples        = VK_SAMPLE_COUNT_1_BIT;
-        att.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-        att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        att.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-        att.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-        VkAttachmentReference dr{ 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-        VkSubpassDescription sp{};
-        sp.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        sp.pDepthStencilAttachment = &dr;
-
-        VkSubpassDependency dep{};
-        dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
-        dep.dstSubpass    = 0;
-        dep.srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dep.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-        dep.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        dep.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-        VkRenderPassCreateInfo rpi{};
-        rpi.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpi.attachmentCount = 1;
-        rpi.pAttachments    = &att;
-        rpi.subpassCount    = 1;
-        rpi.pSubpasses      = &sp;
-        rpi.dependencyCount = 1;
-        rpi.pDependencies   = &dep;
-        vkCreateRenderPass(dev, &rpi, nullptr, &_csmRenderPass);
-    }
-
-    // Per-layer framebuffers
-    for (uint32_t i = 0; i < CSM_CASCADE_COUNT; i++) {
-        VkFramebufferCreateInfo fi{};
-        fi.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fi.renderPass      = _csmRenderPass;
-        fi.attachmentCount = 1;
-        fi.pAttachments    = &_csmLayerView[i];
-        fi.width  = CSM_SHADOW_SIZE;
-        fi.height = CSM_SHADOW_SIZE;
-        fi.layers = 1;
-        vkCreateFramebuffer(dev, &fi, nullptr, &_csmFramebuffers[i]);
-    }
-
-    // Point-clamp sampler for shadow reads
-    {
-        VkSamplerCreateInfo si{};
-        si.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        si.magFilter    = VK_FILTER_NEAREST;
-        si.minFilter    = VK_FILTER_NEAREST;
-        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.maxAnisotropy = 1.0f;
-        vkCreateSampler(dev, &si, nullptr, &_csmSampler);
-    }
-
-    // CSM pipeline layout: push constant (64B lightMVP, vertex stage)
-    {
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        pcr.offset     = 0;
-        pcr.size       = 64;  // float4x4
-        VkPipelineLayoutCreateInfo pli{};
-        pli.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.pushConstantRangeCount = 1;
-        pli.pPushConstantRanges    = &pcr;
-        vkCreatePipelineLayout(dev, &pli, nullptr, &_csmPipelineLayout);
-    }
-
-    // CSM pipeline: depth-only, no FS, front-face culling, depth bias
-    {
-        std::vector<uint32_t> vsS;
-        if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"csm_depth_vk.vert.glsl").wstring(), vsS))
-        { LUNA_LOG_ERROR("VK: csm_depth_vk shader compile failed"); return false; }
-
-        VkShaderModuleCreateInfo smi{};
-        smi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smi.codeSize = vsS.size() * 4;
-        smi.pCode    = vsS.data();
-        VkShaderModule vsM = VK_NULL_HANDLE;
-        vkCreateShaderModule(dev, &smi, nullptr, &vsM);
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage  = VK_SHADER_STAGE_VERTEX_BIT;
-        stage.module = vsM;
-        stage.pName  = "main";
-
-        // Same vertex layout as PBR: stride 48, but only position is consumed
-        // Declare all 4 attrs to match the buffer stride; unused ones are silently ignored
-        VkVertexInputBindingDescription vbd{ 0, 48, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription vad[1]{};
-        vad[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-
-        VkPipelineVertexInputStateCreateInfo vis{};
-        vis.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vis.vertexBindingDescriptionCount   = 1;
-        vis.pVertexBindingDescriptions      = &vbd;
-        vis.vertexAttributeDescriptionCount = 1;
-        vis.pVertexAttributeDescriptions    = vad;
-
-        VkPipelineInputAssemblyStateCreateInfo ias{};
-        ias.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkViewport vp{ 0, 0, (float)CSM_SHADOW_SIZE, (float)CSM_SHADOW_SIZE, 0, 1 };
-        VkRect2D   sc{ {0,0}, {CSM_SHADOW_SIZE, CSM_SHADOW_SIZE} };
-        VkPipelineViewportStateCreateInfo vps{};
-        vps.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vps.viewportCount = 1;
-        vps.pViewports    = &vp;
-        vps.scissorCount  = 1;
-        vps.pScissors     = &sc;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode             = VK_POLYGON_MODE_FILL;
-        rs.cullMode                = VK_CULL_MODE_FRONT_BIT;   // front-face culling reduces acne
-        rs.frontFace               = VK_FRONT_FACE_CLOCKWISE;  // matches -fvk-invert-y winding
-        rs.lineWidth               = 1.0f;
-        rs.depthBiasEnable         = VK_TRUE;
-        rs.depthBiasConstantFactor = 1.25f;
-        rs.depthBiasSlopeFactor    = 1.75f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS;
-
-        VkPipelineColorBlendStateCreateInfo cbs{};
-        cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-
-        VkGraphicsPipelineCreateInfo gpi{};
-        gpi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        gpi.stageCount          = 1;
-        gpi.pStages             = &stage;
-        gpi.pVertexInputState   = &vis;
-        gpi.pInputAssemblyState = &ias;
-        gpi.pViewportState      = &vps;
-        gpi.pRasterizationState = &rs;
-        gpi.pMultisampleState   = &ms;
-        gpi.pDepthStencilState  = &ds;
-        gpi.pColorBlendState    = &cbs;
-        gpi.layout              = _csmPipelineLayout;
-        gpi.renderPass          = _csmRenderPass;
-        gpi.subpass             = 0;
-
-        VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &_csmPipeline);
-        vkDestroyShaderModule(dev, vsM, nullptr);
-        if (r != VK_SUCCESS) { LUNA_LOG_ERROR("VK: CSM pipeline failed: %d", (int)r); return false; }
-    }
-
-    // Transition CSM image to DEPTH_STENCIL_READ_ONLY initially (so first frame deferred read is valid)
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout           = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image               = _csmImage;
-        b.subresourceRange    = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, CSM_CASCADE_COUNT };
-        b.srcAccessMask       = 0;
-        b.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &b);
-        EndSingleTimeCommands(cmd);
-    }
-
-    LUNA_LOG_INFO("VK: CSM resources created (%u×%u × %u cascades)", CSM_SHADOW_SIZE, CSM_SHADOW_SIZE, CSM_CASCADE_COUNT);
-    return true;
-}
-
-void VulkanBackend::DestroyCSMResources()
-{
-    VkDevice dev = _device->GetDevice();
-    if (_csmPipeline)       { vkDestroyPipeline(dev, _csmPipeline, nullptr);       _csmPipeline       = VK_NULL_HANDLE; }
-    if (_csmPipelineLayout) { vkDestroyPipelineLayout(dev, _csmPipelineLayout, nullptr); _csmPipelineLayout = VK_NULL_HANDLE; }
-    for (uint32_t i = 0; i < CSM_CASCADE_COUNT; i++) {
-        if (_csmFramebuffers[i]) { vkDestroyFramebuffer(dev, _csmFramebuffers[i], nullptr); _csmFramebuffers[i] = VK_NULL_HANDLE; }
-        if (_csmLayerView[i])    { vkDestroyImageView(dev, _csmLayerView[i], nullptr);     _csmLayerView[i]    = VK_NULL_HANDLE; }
-    }
-    if (_csmArrayView)  { vkDestroyImageView(dev, _csmArrayView, nullptr);  _csmArrayView  = VK_NULL_HANDLE; }
-    if (_csmRenderPass) { vkDestroyRenderPass(dev, _csmRenderPass, nullptr); _csmRenderPass = VK_NULL_HANDLE; }
-    if (_csmImage)      { vkDestroyImage(dev, _csmImage, nullptr);          _csmImage      = VK_NULL_HANDLE; }
-    if (_csmMemory)     { vkFreeMemory(dev, _csmMemory, nullptr);           _csmMemory     = VK_NULL_HANDLE; }
-    if (_csmSampler)    { vkDestroySampler(dev, _csmSampler, nullptr);      _csmSampler    = VK_NULL_HANDLE; }
-}
-
-// ---------------------------------------------------------------------------
-// UpdateCSMMatrices ??practical split scheme + orthographic light VP
-// ---------------------------------------------------------------------------
-void VulkanBackend::UpdateCSMMatrices(const XMFLOAT4X4& view, const XMFLOAT4X4& proj)
-{
-    const float nearZ  = 0.1f;
-    const float farZ   = 100.0f;
-    const float lambda = 0.5f;
-    const float ratio  = farZ / nearZ;
-
-    float splits[CSM_CASCADE_COUNT];
-    for (uint32_t i = 0; i < CSM_CASCADE_COUNT; ++i)
-    {
-        float p       = (i + 1) / (float)CSM_CASCADE_COUNT;
-        float logSpl  = nearZ * std::pow(ratio, p);
-        float unifSpl = nearZ + (farZ - nearZ) * p;
-        splits[i]     = lambda * (logSpl - unifSpl) + unifSpl;
-    }
-    for (uint32_t i = 0; i < CSM_CASCADE_COUNT; i++) _csmSplits[i] = splits[i];
-
-    XMVECTOR lightDirV = XMVector3Normalize(XMVectorSet(1.0f, 2.0f, 1.0f, 0.0f));
-    XMMATRIX viewMat = XMLoadFloat4x4(&view);
-    XMMATRIX projMat = XMLoadFloat4x4(&proj);
-    XMMATRIX invView = XMMatrixInverse(nullptr, viewMat);
-
-    float tanHalfFovX = 1.0f / XMVectorGetX(projMat.r[0]);
-    float tanHalfFovY = 1.0f / XMVectorGetY(projMat.r[1]);
-
-    float lastSplit = nearZ;
-    for (uint32_t cascade = 0; cascade < CSM_CASCADE_COUNT; ++cascade)
-    {
-        float zN = lastSplit;
-        float zF = splits[cascade];
-
-        XMFLOAT3 vsCorners[8] = {
-            {-tanHalfFovX * zN,  tanHalfFovY * zN, zN},
-            { tanHalfFovX * zN,  tanHalfFovY * zN, zN},
-            { tanHalfFovX * zN, -tanHalfFovY * zN, zN},
-            {-tanHalfFovX * zN, -tanHalfFovY * zN, zN},
-            {-tanHalfFovX * zF,  tanHalfFovY * zF, zF},
-            { tanHalfFovX * zF,  tanHalfFovY * zF, zF},
-            { tanHalfFovX * zF, -tanHalfFovY * zF, zF},
-            {-tanHalfFovX * zF, -tanHalfFovY * zF, zF},
-        };
-
-        XMVECTOR cornersWS[8];
-        XMVECTOR center = XMVectorZero();
-        for (uint32_t j = 0; j < 8; ++j) {
-            XMVECTOR vs = XMVectorSet(vsCorners[j].x, vsCorners[j].y, vsCorners[j].z, 1.0f);
-            cornersWS[j] = XMVector4Transform(vs, invView);
-            center = XMVectorAdd(center, cornersWS[j]);
-        }
-        center = XMVectorScale(center, 1.0f / 8.0f);
-
-        XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-        if (std::abs(XMVectorGetY(lightDirV)) > 0.99f)
-            up = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
-        XMVECTOR eye    = XMVectorSubtract(center, lightDirV);
-        XMMATRIX lightV = XMMatrixLookAtLH(eye, center, up);
-
-        XMVECTOR minLS = XMVectorReplicate(FLT_MAX);
-        XMVECTOR maxLS = XMVectorReplicate(-FLT_MAX);
-        for (uint32_t j = 0; j < 8; ++j) {
-            XMVECTOR ls = XMVector4Transform(cornersWS[j], lightV);
-            minLS = XMVectorMin(minLS, ls);
-            maxLS = XMVectorMax(maxLS, ls);
-        }
-
-        float minX = XMVectorGetX(minLS), maxX = XMVectorGetX(maxLS);
-        float minY = XMVectorGetY(minLS), maxY = XMVectorGetY(maxLS);
-        float minZ = XMVectorGetZ(minLS), maxZ = XMVectorGetZ(maxLS);
-        float zExtent = maxZ - minZ;
-        minZ -= zExtent * 0.5f;
-
-        XMMATRIX lightP  = XMMatrixOrthographicOffCenterLH(minX, maxX, minY, maxY, minZ, maxZ);
-        XMMATRIX lightVP = XMMatrixMultiply(lightV, lightP);
-        XMStoreFloat4x4(&_csmLightVP[cascade], lightVP);
-
-        lastSplit = zF;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DrawCSMPass ??render all meshes into the 4-cascade shadow map
-// ---------------------------------------------------------------------------
-void VulkanBackend::DrawCSMPass(VkCommandBuffer cmd)
-{
-    if (!_csmPipeline || _lastMeshModels.empty()) return;
-
-    for (uint32_t cascade = 0; cascade < CSM_CASCADE_COUNT; ++cascade)
-    {
-        VkClearValue clear{};
-        clear.depthStencil = { 1.0f, 0 };
-
-        VkRenderPassBeginInfo rpi{};
-        rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpi.renderPass        = _csmRenderPass;
-        rpi.framebuffer       = _csmFramebuffers[cascade];
-        rpi.renderArea.extent = { CSM_SHADOW_SIZE, CSM_SHADOW_SIZE };
-        rpi.clearValueCount   = 1;
-        rpi.pClearValues      = &clear;
-        vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _csmPipeline);
-
-        XMMATRIX lvp = XMLoadFloat4x4(&_csmLightVP[cascade]);
-
-        for (size_t mi = 0; mi < _vkSceneMeshes.size() && mi < _lastMeshModels.size(); ++mi)
-        {
-            auto& m = _vkSceneMeshes[mi];
-            if (!m) continue;
-
-            XMMATRIX model = XMLoadFloat4x4(&_lastMeshModels[mi]);
-            XMMATRIX lmvp  = XMMatrixMultiply(model, lvp);
-            XMFLOAT4X4 lmvpf;
-            XMStoreFloat4x4(&lmvpf, lmvp);
-
-            vkCmdPushConstants(cmd, _csmPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, &lmvpf);
-
-            VkDeviceSize off = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &m->vertexBuffer, &off);
-            vkCmdBindIndexBuffer(cmd, m->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, m->indexCount, 1, 0, 0, 0);
-        }
-
-        vkCmdEndRenderPass(cmd);
-    }
-}
 
 // ===========================================================================
 // SSAO Resources
@@ -3619,8 +3154,8 @@ static void GenerateSSAOKernel(XMFLOAT4* samples, int sampleCount)
 bool VulkanBackend::CreateSSAOResources()
 {
     VkDevice dev = _device->GetDevice();
-    uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-    uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+    uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+    uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
     // -- Half-res R8_UNORM render targets (raw + blur) --
     auto mkRT = [&](VkImage& img, VkDeviceMemory& mem, VkImageView& view) -> bool {
@@ -3800,8 +3335,8 @@ bool VulkanBackend::CreateSSAOResources()
         ai.descriptorPool = _ssaoDescPool; ai.descriptorSetCount = 1; ai.pSetLayouts = &_ssaoTexLayout;
         vkAllocateDescriptorSets(dev, &ai, &_ssaoTexDescSet);
 
-        VkDescriptorImageInfo di { _pointClampSampler, _depthView,      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo ni { _pointClampSampler, _gbNormalView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo di { _pointClampSampler, _vkSwapchain.GetDepthView(),      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ni { _pointClampSampler, _gBuffer.GetNormalView(),   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo noi{ _ssaoPointWrap,     _ssaoNoiseView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo s0 { _pointClampSampler, VK_NULL_HANDLE,  VK_IMAGE_LAYOUT_UNDEFINED };
         VkDescriptorImageInfo s1 { _ssaoPointWrap,     VK_NULL_HANDLE,  VK_IMAGE_LAYOUT_UNDEFINED };
@@ -3915,9 +3450,9 @@ void VulkanBackend::DestroySSAOResources()
 bool VulkanBackend::CreatePPResources()
 {
     VkDevice dev = _device->GetDevice();
-    uint32_t W = _swapchainExtent.width, H = _swapchainExtent.height;
+    uint32_t W = _vkSwapchain.GetExtent().width, H = _vkSwapchain.GetExtent().height;
 
-    // ?�?� 1. HDR image (COLOR_ATTACHMENT | SAMPLED, R16G16B16A16_SFLOAT) ?�?�
+    // ?�?�?1. HDR image (COLOR_ATTACHMENT | SAMPLED, R16G16B16A16_SFLOAT) ?�?�?
     if (!CreateImage(W, H, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _hdrImage, _hdrMemory))
@@ -3934,7 +3469,7 @@ bool VulkanBackend::CreatePPResources()
             return false;
     }
 
-    // ?�?� 2. SSR image (STORAGE | SAMPLED, R16G16B16A16_SFLOAT, kept GENERAL) ?�?�
+    // ?�?�?2. SSR image (STORAGE | SAMPLED, R16G16B16A16_SFLOAT, kept GENERAL) ?�?�?
     if (!CreateImage(W, H, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _ssrImage, _ssrMemory))
@@ -3943,7 +3478,7 @@ bool VulkanBackend::CreatePPResources()
     if (!_ssrView) return false;
     TransitionImageLayout(_ssrImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
-    // ?�?� 3. Tonemap DSL: binding0=SAMPLED_IMAGE(hdr), binding1=SAMPLED_IMAGE(ssr), binding2=SAMPLER ?�?�
+    // ?�?�?3. Tonemap DSL: binding0=SAMPLED_IMAGE(hdr), binding1=SAMPLED_IMAGE(ssr), binding2=SAMPLER ?�?�?
     {
         VkDescriptorSetLayoutBinding bs[3]{};
         bs[0] = { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
@@ -4037,7 +3572,7 @@ bool VulkanBackend::CreatePPResources()
         if (r != VK_SUCCESS) { LUNA_LOG_ERROR("VK PP: tonemap pipeline failed: %d", (int)r); return false; }
     }
 
-    // ?�?� 4. SSR compute pipeline ?�?�
+    // ?�?�?4. SSR compute pipeline ?�?�?
     // DSL: binding0=UBO, binding1-4=SAMPLED_IMAGE, binding5=STORAGE_IMAGE, binding6-7=SAMPLER
     {
         VkDescriptorSetLayoutBinding bs[8]{};
@@ -4097,9 +3632,9 @@ bool VulkanBackend::CreatePPResources()
         vkAllocateDescriptorSets(dev, &ai, &_vkSSRDescSet[i]);
 
         VkDescriptorBufferInfo ubi{ _vkSSRCB[i], 0, 256 };
-        VkDescriptorImageInfo  di { VK_NULL_HANDLE, _depthView,          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  ni { VK_NULL_HANDLE, _gbNormalView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  mri{ VK_NULL_HANDLE, _gbMetalRoughView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo  di { VK_NULL_HANDLE, _vkSwapchain.GetDepthView(),          VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo  ni { VK_NULL_HANDLE, _gBuffer.GetNormalView(),       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo  mri{ VK_NULL_HANDLE, _gBuffer.GetMetalRoughView(),   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  hi { VK_NULL_HANDLE, _hdrView,            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  oi { VK_NULL_HANDLE, _ssrView,       VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo  s0 { _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -4142,7 +3677,7 @@ bool VulkanBackend::CreatePPResources()
         }
     }
 
-    // ?�?� Phase 18B: Motion Blur target (full-res RGBA16F, COLOR_ATTACHMENT | SAMPLED) ?�?�
+    // ?�?�?Phase 18B: Motion Blur target (full-res RGBA16F, COLOR_ATTACHMENT | SAMPLED) ?�?�?
     {
         if (CreateImage(W, H, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -4188,7 +3723,7 @@ bool VulkanBackend::CreatePPResources()
             // Write descriptors
             VkDescriptorBufferInfo ubi{ _vkMBCB[i], 0, sizeof(VKMotionBlurConstants) };
             VkDescriptorImageInfo hdrI { VK_NULL_HANDLE, _hdrView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkDescriptorImageInfo depI { VK_NULL_HANDLE, _depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+            VkDescriptorImageInfo depI { VK_NULL_HANDLE, _vkSwapchain.GetDepthView(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
             VkDescriptorImageInfo samI { _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
             VkWriteDescriptorSet ws[4]{};
             ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkMBDescSet[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  nullptr, &ubi,  nullptr };
@@ -4203,7 +3738,7 @@ bool VulkanBackend::CreatePPResources()
         vkCreatePipelineLayout(dev, &pli, nullptr, &_vkMBPipeLayout);
     }
 
-    // ?�?� Phase 17: TAA + Bloom + Full Tonemap ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Phase 17: TAA + Bloom + Full Tonemap ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     uint32_t halfW = std::max(1u, W / 2), halfH = std::max(1u, H / 2);
 
     // TAA history images (full-res × 2, COLOR_ATTACHMENT | SAMPLED)
@@ -4340,7 +3875,7 @@ bool VulkanBackend::CreatePPResources()
         VkImageView curFrameView = (_mbView != VK_NULL_HANDLE) ? _mbView : _hdrView;
         VkDescriptorImageInfo curImg  { VK_NULL_HANDLE, curFrameView,      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo histImg { VK_NULL_HANDLE, _taaHistoryView[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo depthImg{ VK_NULL_HANDLE, _depthView,        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo depthImg{ VK_NULL_HANDLE, _vkSwapchain.GetDepthView(),        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo bilinear{ _linearSampler,     VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
         VkDescriptorImageInfo point   { _pointClampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
         VkWriteDescriptorSet ws[6]{};
@@ -4474,7 +4009,11 @@ bool VulkanBackend::CreatePPResources()
             {
                 std::vector<uint32_t> mbFS;
                 if (CompileHLSLtoSPIRV(GetShaderFullPath(L"motion_blur.frag.hlsl").wstring(), L"ps_6_0", mbFS))
-                    _vkMBPipeline = mkGfxPipeline(vsM, mkMod(mbFS), _vkMBPipeLayout, _ppRenderPass);
+                {
+                    VkShaderModule mbFsM = mkMod(mbFS);
+                    _vkMBPipeline = mkGfxPipeline(vsM, mbFsM, _vkMBPipeLayout, _ppRenderPass);
+                    vkDestroyShaderModule(dev, mbFsM, nullptr);
+                }
                 else
                     LUNA_LOG_WARN("VK PP18B: motion_blur.frag.hlsl compile failed ??motion blur disabled");
             }
@@ -4614,7 +4153,7 @@ void VulkanBackend::DrawVKTAAPass()
     if (!_vkTAAPipeline) return;
     auto& frame = _frames[_frameIndex];
     VkCommandBuffer cmd = frame.cmdBuffer;
-    uint32_t W = _swapchainExtent.width, H = _swapchainExtent.height;
+    uint32_t W = _vkSwapchain.GetExtent().width, H = _vkSwapchain.GetExtent().height;
 
     // Upload TAA constants
     {
@@ -4646,14 +4185,14 @@ void VulkanBackend::DrawVKTAAPass()
     rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpi.renderPass        = _ppRenderPass;
     rpi.framebuffer       = _taaFramebuffer[_vkTaaHistoryIndex];
-    rpi.renderArea.extent = _swapchainExtent;
+    rpi.renderArea.extent = _vkSwapchain.GetExtent();
     rpi.clearValueCount   = 1;
     rpi.pClearValues      = &clear;
     vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
 
     VkViewport vp{ 0, 0, (float)W, (float)H, 0, 1 };
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {0,0}, _swapchainExtent };
+    VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _vkTAAPipeline);
@@ -4661,7 +4200,7 @@ void VulkanBackend::DrawVKTAAPass()
                              _vkTAAPipelineLayout, 0, 1, &_vkTAADescSet[_frameIndex], 0, nullptr);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
-    // Trailing barrier removed — VulkanRenderGraph handles inter-pass transitions (Phase 18C)
+    // Trailing barrier removed ??VulkanRenderGraph handles inter-pass transitions (Phase 18C)
 }
 
 void VulkanBackend::DrawVKBloomBrightPass()
@@ -4669,8 +4208,8 @@ void VulkanBackend::DrawVKBloomBrightPass()
     if (!_vkBloomBrightPipeline) return;
     auto& frame = _frames[_frameIndex];
     VkCommandBuffer cmd = frame.cmdBuffer;
-    uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-    uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+    uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+    uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
     VkClearValue clear{};
     VkRenderPassBeginInfo rpi{};
@@ -4694,7 +4233,7 @@ void VulkanBackend::DrawVKBloomBrightPass()
     vkCmdPushConstants(cmd, _vkBloomPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
-    // Trailing barrier removed — VulkanRenderGraph handles inter-pass transitions (Phase 18C)
+    // Trailing barrier removed ??VulkanRenderGraph handles inter-pass transitions (Phase 18C)
 }
 
 void VulkanBackend::DrawVKBloomBlurPass(bool horizontal)
@@ -4702,8 +4241,8 @@ void VulkanBackend::DrawVKBloomBlurPass(bool horizontal)
     if (!_vkBloomBlurPipeline) return;
     auto& frame = _frames[_frameIndex];
     VkCommandBuffer cmd = frame.cmdBuffer;
-    uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-    uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+    uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+    uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
     // H-blur: bloomBright ??bloomBlur;  V-blur: bloomBlur ??bloomBright
     VkDescriptorSet srcSet = horizontal ? _vkBloomBlurHDescSet : _vkBloomBlurVDescSet;
@@ -4734,7 +4273,7 @@ void VulkanBackend::DrawVKBloomBlurPass(bool horizontal)
     vkCmdPushConstants(cmd, _vkBloomPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
-    // Trailing barrier removed — VulkanRenderGraph handles inter-pass transitions (Phase 18C)
+    // Trailing barrier removed ??VulkanRenderGraph handles inter-pass transitions (Phase 18C)
 }
 
 void VulkanBackend::DrawVKTonemapPass()
@@ -4748,14 +4287,14 @@ void VulkanBackend::DrawVKTonemapPass()
     rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpi.renderPass        = _tonemapRenderPass;
     rpi.framebuffer       = _tonemapFramebuffers[_imageIndex];
-    rpi.renderArea.extent = _swapchainExtent;
+    rpi.renderArea.extent = _vkSwapchain.GetExtent();
     rpi.clearValueCount   = 1;
     rpi.pClearValues      = &clear;
     vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport vp{ 0, 0, (float)_swapchainExtent.width, (float)_swapchainExtent.height, 0, 1 };
+    VkViewport vp{ 0, 0, (float)_vkSwapchain.GetExtent().width, (float)_vkSwapchain.GetExtent().height, 0, 1 };
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {0,0}, _swapchainExtent };
+    VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _vkTonemapPipeline);
@@ -4770,8 +4309,8 @@ void VulkanBackend::DrawVKTonemapPass()
 void VulkanBackend::DrawSSAOPass(VkCommandBuffer cmd)
 {
     if (!_ssaoPipeline) return;
-    uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-    uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+    uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+    uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
     // Update UBO
     XMMATRIX proj = XMLoadFloat4x4(&_lastProj);
@@ -4801,8 +4340,8 @@ void VulkanBackend::DrawSSAOPass(VkCommandBuffer cmd)
 void VulkanBackend::DrawSSAOBlurPass(VkCommandBuffer cmd)
 {
     if (!_ssaoBlurPipeline) return;
-    uint32_t halfW = std::max(1u, _swapchainExtent.width  / 2);
-    uint32_t halfH = std::max(1u, _swapchainExtent.height / 2);
+    uint32_t halfW = std::max(1u, _vkSwapchain.GetExtent().width  / 2);
+    uint32_t halfH = std::max(1u, _vkSwapchain.GetExtent().height / 2);
 
     VkClearValue clear{}; clear.color.float32[0] = 1.0f;
     VkRenderPassBeginInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -4837,16 +4376,14 @@ void VulkanBackend::DestroyDeferredPipeline()
 
 void VulkanBackend::DestroyPipeline() {
     VkDevice dev = _device->GetDevice();
-    DestroyIBLResources();        // Phase 15C: destroy IBL textures + compute pipelines
-    DestroyHiZResources();        // Phase 23: destroy Hi-Z pyramid resources
+    _atmosphere.Destroy();        // Phase 28: destroy atmosphere LUTs + pipelines
+    _ibl.Destroy();               // Phase 15C: destroy IBL textures + compute pipelines
+    DestroyMeshShaderResources(); // Phase 27: destroy mesh shader pipeline + meshlet buffers
     DestroyIndirectResources();   // Phase 15B: destroy GPU-driven buffers + pipelines
     DestroyDeferredPipeline();
     DestroySSAOResources();
-    DestroyCSMResources();
-    DestroyGBufferResources();
+    _gBuffer.Destroy();
     if (_gbPipeline)        { vkDestroyPipeline(dev, _gbPipeline, nullptr);                   _gbPipeline         = VK_NULL_HANDLE; }
-    if (_gbRenderPassLoad)  { vkDestroyRenderPass(dev, _gbRenderPassLoad, nullptr);           _gbRenderPassLoad   = VK_NULL_HANDLE; }
-    if (_gbRenderPass)      { vkDestroyRenderPass(dev, _gbRenderPass, nullptr);               _gbRenderPass       = VK_NULL_HANDLE; }
     if (_graphicsPipeline)  { vkDestroyPipeline(dev, _graphicsPipeline, nullptr);             _graphicsPipeline   = VK_NULL_HANDLE; }
     if (_pipelineLayout)    { vkDestroyPipelineLayout(dev, _pipelineLayout, nullptr);         _pipelineLayout     = VK_NULL_HANDLE; }
     if (_mvpDescLayout)     { vkDestroyDescriptorSetLayout(dev, _mvpDescLayout, nullptr);     _mvpDescLayout      = VK_NULL_HANDLE; }
@@ -4920,7 +4457,8 @@ void VulkanBackend::BuildMergedGeometry(const std::vector<std::vector<PBRVertex>
         memcpy(p, mergedV.data(), (size_t)sz);
         vkUnmapMemory(dev, stgMem);
 
-        VkBufferUsageFlags vbUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        VkBufferUsageFlags vbUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                   | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // Phase 27: mesh shader SSBO access
         if (_rtSupported)  // Phase 18D: AS build requires device-addressable vertex data
             vbUsage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
                      | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -4969,6 +4507,290 @@ void VulkanBackend::BuildMergedGeometry(const std::vector<std::vector<PBRVertex>
 
     LUNA_LOG_INFO("VK: Merged geometry: %zu verts, %zu indices, %zu meshes",
         mergedV.size(), mergedI.size(), meshInfos.size());
+
+    // -----------------------------------------------------------------------
+    // Phase 27: Build meshlets and upload to GPU buffers (if mesh shaders supported)
+    // -----------------------------------------------------------------------
+    if (_device->IsMeshShaderSupported())
+    {
+        _vkMeshMeshletOffsets.clear();
+        _vkMeshMeshletCounts.clear();
+
+        std::vector<Meshlet>       allMeshlets;
+        std::vector<MeshletBounds> allBounds;
+        std::vector<uint32_t>      allMeshletVerts;
+        std::vector<uint32_t>      allMeshletTris;
+
+        for (size_t m = 0; m < allVerts.size(); ++m)
+        {
+            // Extract positions from PBRVertex array
+            std::vector<DirectX::XMFLOAT3> positions(allVerts[m].size());
+            for (size_t v = 0; v < allVerts[m].size(); ++v)
+            {
+                positions[v].x = allVerts[m][v].position.x;
+                positions[v].y = allVerts[m][v].position.y;
+                positions[v].z = allVerts[m][v].position.z;
+            }
+
+            MeshletBuildResult mbr = BuildMeshlets(
+                positions.data(), (uint32_t)positions.size(),
+                allIdxs[m].data(), (uint32_t)allIdxs[m].size());
+
+            _vkMeshMeshletOffsets.push_back((uint32_t)allMeshlets.size());
+            _vkMeshMeshletCounts.push_back((uint32_t)mbr.meshlets.size());
+
+            // Offset meshlet vertex/triangle references to global merged arrays
+            uint32_t vertBase = (uint32_t)allMeshletVerts.size();
+            uint32_t triBase  = (uint32_t)allMeshletTris.size();
+            int32_t meshVertOffset = meshInfos[m].vertexOffset;
+
+            for (auto& ml : mbr.meshlets)
+            {
+                Meshlet gml = ml;
+                gml.vertexOffset   += vertBase;
+                gml.triangleOffset += triBase;
+                allMeshlets.push_back(gml);
+            }
+            allBounds.insert(allBounds.end(), mbr.bounds.begin(), mbr.bounds.end());
+
+            // Offset meshlet vertex indices to global merged vertex buffer
+            for (uint32_t vi : mbr.meshletVertices)
+                allMeshletVerts.push_back(vi + meshVertOffset);
+
+            allMeshletTris.insert(allMeshletTris.end(),
+                mbr.meshletTriangles.begin(), mbr.meshletTriangles.end());
+        }
+
+        LUNA_LOG_INFO("VK Mesh Shader: %zu meshlets, %zu meshletVerts, %zu meshletTris",
+            allMeshlets.size(), allMeshletVerts.size(), allMeshletTris.size());
+
+        // Upload meshlet buffers (staging → device-local SSBO)
+        auto uploadSSBO = [&](const void* data, VkDeviceSize sz, VkBuffer& outBuf, VkDeviceMemory& outMem)
+        {
+            VkBuffer stg; VkDeviceMemory stgMem;
+            CreateBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stg, stgMem);
+            void* p; vkMapMemory(dev, stgMem, 0, sz, 0, &p);
+            memcpy(p, data, (size_t)sz);
+            vkUnmapMemory(dev, stgMem);
+            CreateBuffer(sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, outBuf, outMem);
+            CopyBuffer(stg, outBuf, sz);
+            vkDestroyBuffer(dev, stg, nullptr); vkFreeMemory(dev, stgMem, nullptr);
+        };
+
+        if (!allMeshlets.empty())
+        {
+            uploadSSBO(allMeshlets.data(),     allMeshlets.size()     * sizeof(Meshlet),       _vkMeshletBuffer,       _vkMeshletMem);
+            uploadSSBO(allBounds.data(),       allBounds.size()       * sizeof(MeshletBounds),  _vkMeshletBoundsBuffer, _vkMeshletBoundsMem);
+            uploadSSBO(allMeshletVerts.data(),  allMeshletVerts.size() * sizeof(uint32_t),       _vkMeshletVertBuffer,   _vkMeshletVertMem);
+            uploadSSBO(allMeshletTris.data(),   allMeshletTris.size()  * sizeof(uint32_t),       _vkMeshletTriBuffer,    _vkMeshletTriMem);
+        }
+    }
+}
+
+// ===========================================================================
+// Phase 27: Mesh shader pipeline creation
+// ===========================================================================
+bool VulkanBackend::CreateMeshShaderResources()
+{
+    if (!_device->IsMeshShaderSupported()) return false;
+    if (!_vkMeshletBuffer || !_objectDataBuffer) return false;
+
+    VkDevice dev = _device->GetDevice();
+
+    // Load vkCmdDrawMeshTasksEXT function pointer
+    pfn_vkCmdDrawMeshTasksEXT = (PFN_vkCmdDrawMeshTasksEXT)
+        vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT");
+    if (!pfn_vkCmdDrawMeshTasksEXT)
+    {
+        LUNA_LOG_WARN("VK Mesh Shader: vkCmdDrawMeshTasksEXT not found");
+        return false;
+    }
+
+    // --- Descriptor set layout (set=0): 6 SSBO bindings ---
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    }
+    // binding 3 (vertices) also readable from mesh shader only, but stageFlags already includes both
+
+    VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dslci.bindingCount = 6;
+    dslci.pBindings    = bindings;
+    if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &_meshShaderDescLayout) != VK_SUCCESS)
+        return false;
+
+    // --- Descriptor pool ---
+    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 };
+    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpci.maxSets       = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes    = &poolSize;
+    if (vkCreateDescriptorPool(dev, &dpci, nullptr, &_meshShaderDescPool) != VK_SUCCESS)
+        return false;
+
+    // --- Allocate descriptor set ---
+    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dsai.descriptorPool     = _meshShaderDescPool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &_meshShaderDescLayout;
+    if (vkAllocateDescriptorSets(dev, &dsai, &_meshShaderDescSet) != VK_SUCCESS)
+        return false;
+
+    // --- Write descriptor set ---
+    VkDescriptorBufferInfo bufInfos[6]{};
+    bufInfos[0] = { _objectDataBuffer,       0, VK_WHOLE_SIZE };  // binding 0: objectData
+    bufInfos[1] = { _vkMeshletBuffer,        0, VK_WHOLE_SIZE };  // binding 1: meshlets
+    bufInfos[2] = { _vkMeshletBoundsBuffer,  0, VK_WHOLE_SIZE };  // binding 2: bounds
+    bufInfos[3] = { _mergedVB,               0, VK_WHOLE_SIZE };  // binding 3: vertices (PBRVertex SSBO)
+    bufInfos[4] = { _vkMeshletVertBuffer,    0, VK_WHOLE_SIZE };  // binding 4: meshletVertices
+    bufInfos[5] = { _vkMeshletTriBuffer,     0, VK_WHOLE_SIZE };  // binding 5: meshletTriangles
+
+    VkWriteDescriptorSet writes[6]{};
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = _meshShaderDescSet;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(dev, 6, writes, 0, nullptr);
+
+    // --- Pipeline layout: set=0 (mesh SSBOs) + set=1 (bindless materials) + push constants ---
+    VkDescriptorSetLayout setLayouts[2] = { _meshShaderDescLayout, _indirectMaterialLayout };
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    pcRange.offset     = 0;
+    pcRange.size       = 240;  // viewMatrix(64) + projMatrix(64) + frustumPlanes(96) + 3*uint+pad(16)
+
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount         = 2;
+    plci.pSetLayouts            = setLayouts;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcRange;
+    if (vkCreatePipelineLayout(dev, &plci, nullptr, &_meshShaderPipeLayout) != VK_SUCCESS)
+        return false;
+
+    // --- Compile shaders ---
+    std::vector<uint32_t> taskSpv, meshSpv, fragSpv;
+    if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"meshlet_cull_vk.task.glsl").wstring(), taskSpv) ||
+        !CompileGLSLtoSPIRV(GetShaderFullPath(L"gbuffer_mesh_vk.mesh.glsl").wstring(), meshSpv) ||
+        !CompileGLSLtoSPIRV(GetShaderFullPath(L"gbuffer_indirect_vk.frag.glsl").wstring(), fragSpv))
+    {
+        LUNA_LOG_ERROR("VK Mesh Shader: shader compilation failed");
+        return false;
+    }
+
+    auto mkMod = [&](const std::vector<uint32_t>& spv) -> VkShaderModule {
+        VkShaderModuleCreateInfo ci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        ci.codeSize = spv.size() * 4;
+        ci.pCode    = spv.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        vkCreateShaderModule(dev, &ci, nullptr, &m);
+        return m;
+    };
+    VkShaderModule taskMod = mkMod(taskSpv);
+    VkShaderModule meshMod = mkMod(meshSpv);
+    VkShaderModule fragMod = mkMod(fragSpv);
+
+    // --- Graphics pipeline (task + mesh + fragment, no vertex input) ---
+    VkPipelineShaderStageCreateInfo stages[3]{};
+    stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                  VK_SHADER_STAGE_TASK_BIT_EXT, taskMod, "main" };
+    stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                  VK_SHADER_STAGE_MESH_BIT_EXT, meshMod, "main" };
+    stages[2] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                  VK_SHADER_STAGE_FRAGMENT_BIT, fragMod, "main" };
+
+    // No vertex input — mesh shader fetches from SSBO
+    VkPipelineViewportStateCreateInfo vpState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpState.viewportCount = 1;
+    vpState.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_BACK_BIT;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable  = VK_TRUE;
+    dss.depthWriteEnable = VK_TRUE;
+    dss.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cbas[3]{};
+    for (int i = 0; i < 3; ++i)
+        cbas[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cbs{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cbs.attachmentCount = 3;
+    cbs.pAttachments    = cbas;
+
+    VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dynState.dynamicStateCount = 2;
+    dynState.pDynamicStates    = dynStates;
+
+    VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpci.stageCount          = 3;
+    gpci.pStages             = stages;
+    gpci.pVertexInputState   = nullptr;   // no vertex input for mesh shaders
+    gpci.pInputAssemblyState = nullptr;   // no input assembly for mesh shaders
+    gpci.pViewportState      = &vpState;
+    gpci.pRasterizationState = &rs;
+    gpci.pMultisampleState   = &ms;
+    gpci.pDepthStencilState  = &dss;
+    gpci.pColorBlendState    = &cbs;
+    gpci.pDynamicState       = &dynState;
+    gpci.layout              = _meshShaderPipeLayout;
+    gpci.renderPass          = _gBuffer.GetRenderPassLoad();
+    gpci.subpass             = 0;
+
+    VkResult vr = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &_meshShaderPipeline);
+
+    vkDestroyShaderModule(dev, taskMod, nullptr);
+    vkDestroyShaderModule(dev, meshMod, nullptr);
+    vkDestroyShaderModule(dev, fragMod, nullptr);
+
+    if (vr != VK_SUCCESS)
+    {
+        LUNA_LOG_ERROR("VK Mesh Shader: pipeline creation failed: %d", vr);
+        return false;
+    }
+
+    _meshShaderReady = true;
+    LUNA_LOG_INFO("VK Mesh Shader: pipeline ready (task + mesh + fragment)");
+    return true;
+}
+
+void VulkanBackend::DestroyMeshShaderResources()
+{
+    VkDevice dev = _device->GetDevice();
+    if (_meshShaderPipeline)   { vkDestroyPipeline(dev, _meshShaderPipeline, nullptr);             _meshShaderPipeline = VK_NULL_HANDLE; }
+    if (_meshShaderPipeLayout) { vkDestroyPipelineLayout(dev, _meshShaderPipeLayout, nullptr);     _meshShaderPipeLayout = VK_NULL_HANDLE; }
+    if (_meshShaderDescPool)   { vkDestroyDescriptorPool(dev, _meshShaderDescPool, nullptr);       _meshShaderDescPool = VK_NULL_HANDLE; }
+    if (_meshShaderDescLayout) { vkDestroyDescriptorSetLayout(dev, _meshShaderDescLayout, nullptr);_meshShaderDescLayout = VK_NULL_HANDLE; }
+
+    auto destroyBuf = [&](VkBuffer& b, VkDeviceMemory& m) {
+        if (b) { vkDestroyBuffer(dev, b, nullptr); b = VK_NULL_HANDLE; }
+        if (m) { vkFreeMemory(dev, m, nullptr); m = VK_NULL_HANDLE; }
+    };
+    destroyBuf(_vkMeshletBuffer,       _vkMeshletMem);
+    destroyBuf(_vkMeshletBoundsBuffer, _vkMeshletBoundsMem);
+    destroyBuf(_vkMeshletVertBuffer,   _vkMeshletVertMem);
+    destroyBuf(_vkMeshletTriBuffer,    _vkMeshletTriMem);
+
+    _meshShaderReady = false;
 }
 
 bool VulkanBackend::CreateIndirectResources()
@@ -4979,7 +4801,7 @@ bool VulkanBackend::CreateIndirectResources()
     VkDevice dev = _device->GetDevice();
     uint32_t meshCount = (uint32_t)_vkSceneMeshes.size();
 
-    // ?�?� objectData SSBO (HOST_VISIBLE|COHERENT, persistently mapped) ?�?�?�?�?�?�?�?�?�
+    // ?�?�?objectData SSBO (HOST_VISIBLE|COHERENT, persistently mapped) ?�?�?�?�?�?�?�?�?�?
     {
         VkDeviceSize sz = MAX_GPU_OBJECTS * sizeof(GPUObjectDataVK);
         if (!CreateBuffer(sz,
@@ -4990,7 +4812,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkMapMemory(dev, _objectDataMem, 0, sz, 0, &_objectDataMapped);
     }
 
-    // ?�?� Per-frame indirect arg + draw count buffers (DEVICE_LOCAL)
+    // ?�?�?Per-frame indirect arg + draw count buffers (DEVICE_LOCAL)
     for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
         VkDeviceSize argSz   = MAX_GPU_OBJECTS * sizeof(VkDrawIndexedIndirectCmd);
         VkDeviceSize countSz = sizeof(uint32_t);
@@ -5162,7 +4984,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkCreateDescriptorPool(dev, &pi, nullptr, &_vkCullDescPool);
     }
 
-    // ?�?� Allocate descriptor sets ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Allocate descriptor sets ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     // Bindless material set (fixed-size arrays of matCount each, partially bound)
     {
         VkDescriptorSetAllocateInfo ai{};
@@ -5193,7 +5015,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkAllocateDescriptorSets(dev, &ai, &_vkCullDescSet[i]);
     }
 
-    // ?�?� ViewProj UBO for VS set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?ViewProj UBO for VS set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     {
         if (!CreateBuffer(128,
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -5203,7 +5025,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkMapMemory(dev, _indirectViewProjMem, 0, 128, 0, &_indirectViewProjMapped);
     }
 
-    // ?�?� Write VS descriptor set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Write VS descriptor set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     {
         VkDescriptorBufferInfo vpBI{ _indirectViewProjBuf, 0, 128 };
         VkDescriptorBufferInfo objBI{ _objectDataBuffer, 0, VK_WHOLE_SIZE };
@@ -5215,7 +5037,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkUpdateDescriptorSets(dev, 2, ws, 0, nullptr);
     }
 
-    // ?�?� Write bindless material descriptor set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Write bindless material descriptor set ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     if (matCount > 0) {
         VkDescriptorBufferInfo matBI{ _matFactorBuffer, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet matW{};
@@ -5256,7 +5078,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkUpdateDescriptorSets(dev, 5, ws, 0, nullptr);
     }
 
-    // ?�?� Write cull descriptor sets (per-frame, bind indirectArg + drawCount per frame) ?�
+    // ?�?�?Write cull descriptor sets (per-frame, bind indirectArg + drawCount per frame) ?�?
     for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
         VkDescriptorBufferInfo objBI { _objectDataBuffer,     0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo miBI  { _meshInfoBuf,          0, VK_WHOLE_SIZE };
@@ -5275,7 +5097,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkUpdateDescriptorSets(dev, 4, ws, 0, nullptr);
     }
 
-    // ?�?� Pipeline layouts ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Pipeline layouts ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     // Indirect G-buffer pipeline layout (set=0: VS layout, set=1: bindless material)
     {
         VkDescriptorSetLayout dsl[] = { _indirectVSLayout, _indirectMaterialLayout };
@@ -5301,7 +5123,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkCreatePipelineLayout(dev, &pli, nullptr, &_vkCullPipeLayout);
     }
 
-    // ?�?� GPU cull compute pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?GPU cull compute pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     {
         std::vector<uint32_t> csS;
         if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"gpu_cull_vk.comp.glsl").wstring(), csS))
@@ -5322,7 +5144,7 @@ bool VulkanBackend::CreateIndirectResources()
         vkDestroyShaderModule(dev, csM, nullptr);
     }
 
-    // ?�?� Indirect G-buffer graphics pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // ?�?�?Indirect G-buffer graphics pipeline ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?
     {
         std::vector<uint32_t> vsS, fsS;
         if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"pbr_indirect_vk.vert.glsl").wstring(),     vsS) ||
@@ -5365,7 +5187,7 @@ bool VulkanBackend::CreateIndirectResources()
 
         VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
         rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_BACK_BIT;
+        rs.cullMode    = VK_CULL_MODE_NONE;
         rs.frontFace   = VK_FRONT_FACE_CLOCKWISE;
         rs.lineWidth   = 1.0f;
 
@@ -5401,7 +5223,7 @@ bool VulkanBackend::CreateIndirectResources()
         gpi.pColorBlendState    = &cbs;
         gpi.pDynamicState       = &dsi;
         gpi.layout              = _indirectPipeLayout;
-        gpi.renderPass          = _gbRenderPassLoad;   // re-opened pass (LOAD_OP_LOAD)
+        gpi.renderPass          = _gBuffer.GetRenderPassLoad();   // re-opened pass (LOAD_OP_LOAD)
         gpi.subpass             = 0;
 
         VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &_indirectGBufPipeline);
@@ -5496,7 +5318,7 @@ bool VulkanBackend::CreateAsyncComputeResources()
             return false;
         }
 
-        // Semaphore (compute done → graphics wait)
+        // Semaphore (compute done ??graphics wait)
         VkSemaphoreCreateInfo semCI{};
         semCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         if (vkCreateSemaphore(dev, &semCI, nullptr, &cf.doneSemaphore) != VK_SUCCESS)
@@ -5516,8 +5338,9 @@ bool VulkanBackend::CreateAsyncComputeResources()
         }
     }
 
-    _asyncComputeReady = true;
-    LUNA_LOG_INFO("Phase 20: Vulkan async compute resources created");
+    // DEBUGGING: Disable async compute to test sync issues
+    _asyncComputeReady = false;  // was: true
+    LUNA_LOG_INFO("Phase 20: Vulkan async compute resources created (DISABLED FOR DEBUG)");
     return true;
 }
 
@@ -5559,13 +5382,13 @@ void VulkanBackend::DispatchCullAsync()
 
     VkCommandBuffer cmd = cf.cmdBuffer;
 
-    // Upload object data (HOST_COHERENT — no barrier needed)
+    // Upload object data (HOST_COHERENT ??no barrier needed)
     memcpy(_objectDataMapped, _cpuInstances.data(), count * sizeof(GPUObjectDataVK));
 
     // Clear draw count
     vkCmdFillBuffer(cmd, _drawCountBuffer[_frameIndex], 0, sizeof(uint32_t), 0);
 
-    // Barrier: TRANSFER_WRITE → COMPUTE_SHADER_READ (drawCount)
+    // Barrier: TRANSFER_WRITE ??COMPUTE_SHADER_READ (drawCount)
     {
         VkBufferMemoryBarrier bmb{};
         bmb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -5620,8 +5443,8 @@ void VulkanBackend::DispatchCullAsync()
         cc.frustumPlanes[5][2] = tm.m[3][2] - tm.m[2][2]; cc.frustumPlanes[5][3] = tm.m[3][3] - tm.m[2][3];
         cc.objectCount = count;
 
-        cc.enableHiZ   = _hizReady ? 1u : 0u;
-        cc.hizMipCount = _hizMipCount;
+        cc.enableHiZ   = _hiZ.IsReady() ? 1u : 0u;
+        cc.hizMipCount = _hiZ.GetMipCount();
         {
             XMFLOAT4X4 projF;
             XMStoreFloat4x4(&projF, P);
@@ -5635,7 +5458,7 @@ void VulkanBackend::DispatchCullAsync()
         vkCmdDispatch(cmd, (count + 63) / 64, 1, 1);
     }
 
-    // Queue ownership release barriers (compute → graphics)
+    // Queue ownership release barriers (compute ??graphics)
     // If same family, use IGNORED (no ownership transfer needed, just execution barrier)
     {
         uint32_t srcFamily = (computeFamily != graphicsFamily) ? computeFamily  : VK_QUEUE_FAMILY_IGNORED;
@@ -5673,347 +5496,6 @@ void VulkanBackend::DispatchCullAsync()
 }
 
 // ===========================================================================
-// Phase 23: Hi-Z Occlusion Culling (Vulkan)
-// ===========================================================================
-
-bool VulkanBackend::CreateHiZResources()
-{
-    if (_swapchainExtent.width == 0 || _swapchainExtent.height == 0) return false;
-    VkDevice dev = _device->GetDevice();
-
-    uint32_t w = _swapchainExtent.width;
-    uint32_t h = _swapchainExtent.height;
-
-    // Compute mip count
-    _hizMipCount = 1;
-    { uint32_t t = std::max(w, h); while (t > 1) { t >>= 1; _hizMipCount++; } }
-    _hizMipCount = std::min(_hizMipCount, HIZ_MAX_MIPS);
-
-    // Create Hi-Z image (R32_SFLOAT, full mip chain, SAMPLED | STORAGE | TRANSFER_DST)
-    {
-        VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.imageType     = VK_IMAGE_TYPE_2D;
-        ii.format        = VK_FORMAT_R32_SFLOAT;
-        ii.extent        = { w, h, 1 };
-        ii.mipLevels     = _hizMipCount;
-        ii.arrayLayers   = 1;
-        ii.samples       = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
-                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        vkCreateImage(dev, &ii, nullptr, &_hizImage);
-
-        VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(dev, _hizImage, &req);
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize  = req.size;
-        mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(dev, &mai, nullptr, &_hizMemory);
-        vkBindImageMemory(dev, _hizImage, _hizMemory, 0);
-    }
-
-    // Transition to GENERAL (needed for storage image writes)
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        VkImageMemoryBarrier bar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        bar.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
-        bar.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
-        bar.image         = _hizImage;
-        bar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, _hizMipCount, 0, 1 };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &bar);
-        EndSingleTimeCommands(cmd);
-    }
-
-    // Create per-mip image views
-    for (uint32_t m = 0; m < _hizMipCount; ++m)
-    {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = _hizImage;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format   = VK_FORMAT_R32_SFLOAT;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 1 };
-        vkCreateImageView(dev, &vi, nullptr, &_hizMipView[m]);
-    }
-
-    // Full-pyramid view (all mips, for cull shader sampling)
-    {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = _hizImage;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format   = VK_FORMAT_R32_SFLOAT;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, _hizMipCount, 0, 1 };
-        vkCreateImageView(dev, &vi, nullptr, &_hizFullView);
-    }
-
-    // Point-clamp sampler for Hi-Z
-    {
-        VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        si.magFilter    = VK_FILTER_NEAREST;
-        si.minFilter    = VK_FILTER_NEAREST;
-        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.maxLod       = (float)_hizMipCount;
-        vkCreateSampler(dev, &si, nullptr, &_hizSampler);
-    }
-
-    // Hi-Z generation descriptor set layout: binding 0 = combined image sampler, binding 1 = storage image
-    {
-        VkDescriptorSetLayoutBinding bs[2]{};
-        bs[0] = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        bs[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        VkDescriptorSetLayoutCreateInfo li{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        li.bindingCount = 2;
-        li.pBindings    = bs;
-        vkCreateDescriptorSetLayout(dev, &li, nullptr, &_hizGenDescLayout);
-    }
-
-    // Descriptor pool: enough sets for all mip transitions
-    {
-        VkDescriptorPoolSize psz[] = {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, _hizMipCount },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          _hizMipCount },
-        };
-        VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pi.maxSets       = _hizMipCount;
-        pi.poolSizeCount = 2;
-        pi.pPoolSizes    = psz;
-        vkCreateDescriptorPool(dev, &pi, nullptr, &_hizGenDescPool);
-    }
-
-    // Allocate + write per-mip descriptor sets
-    // Mip 0: reads from _depthImage (D32_SFLOAT), writes to Hi-Z mip 0 (R32_SFLOAT)
-    {
-        VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        ai.descriptorPool     = _hizGenDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &_hizGenDescLayout;
-        vkAllocateDescriptorSets(dev, &ai, &_hizGenDescSet[0]);
-
-        VkDescriptorImageInfo srcII{ _hizSampler, _depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo dstII{ VK_NULL_HANDLE, _hizMipView[0], VK_IMAGE_LAYOUT_GENERAL };
-
-        VkWriteDescriptorSet ws[2]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _hizGenDescSet[0], 0, 0, 1,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &srcII, nullptr, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _hizGenDescSet[0], 1, 0, 1,
-                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 2, ws, 0, nullptr);
-    }
-    // Mips 1+: reads from Hi-Z mip N-1, writes to Hi-Z mip N
-    for (uint32_t m = 1; m < _hizMipCount; ++m)
-    {
-        VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        ai.descriptorPool     = _hizGenDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &_hizGenDescLayout;
-        vkAllocateDescriptorSets(dev, &ai, &_hizGenDescSet[m]);
-
-        VkDescriptorImageInfo srcII{ _hizSampler, _hizMipView[m - 1], VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo dstII{ VK_NULL_HANDLE, _hizMipView[m], VK_IMAGE_LAYOUT_GENERAL };
-
-        VkWriteDescriptorSet ws[2]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _hizGenDescSet[m], 0, 0, 1,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &srcII, nullptr, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _hizGenDescSet[m], 1, 0, 1,
-                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 2, ws, 0, nullptr);
-    }
-
-    // Hi-Z generation pipeline layout + compute pipeline
-    {
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.offset     = 0;
-        pcr.size       = 20;  // 5 x uint (srcW, srcH, dstW, dstH, copyMode)
-
-        VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount         = 1;
-        pli.pSetLayouts            = &_hizGenDescLayout;
-        pli.pushConstantRangeCount = 1;
-        pli.pPushConstantRanges    = &pcr;
-        vkCreatePipelineLayout(dev, &pli, nullptr, &_hizGenPipeLayout);
-    }
-    {
-        std::vector<uint32_t> csS;
-        if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"hiz_generate_vk.comp.glsl").wstring(), csS))
-        { LUNA_LOG_ERROR("VK Phase 23: hiz_generate compile failed"); return false; }
-
-        VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-        smi.codeSize = csS.size() * 4; smi.pCode = csS.data();
-        VkShaderModule csM = VK_NULL_HANDLE;
-        vkCreateShaderModule(dev, &smi, nullptr, &csM);
-
-        VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpi.stage.module = csM;
-        cpi.stage.pName  = "main";
-        cpi.layout       = _hizGenPipeLayout;
-        vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &_hizGenPipeline);
-        vkDestroyShaderModule(dev, csM, nullptr);
-    }
-
-    // Hi-Z UBO for cull shader (viewProj + screenSize = 80 bytes)
-    {
-        if (!CreateBuffer(128, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            _hizParamsBuffer, _hizParamsMem))
-            return false;
-        vkMapMemory(dev, _hizParamsMem, 0, 128, 0, &_hizParamsMapped);
-    }
-
-    LUNA_LOG_INFO("VK Phase 23: Hi-Z pyramid created — %ux%u, %u mips", w, h, _hizMipCount);
-
-    // Update cull descriptor sets with Hi-Z bindings (4=UBO, 5=texture)
-    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++)
-    {
-        if (_vkCullDescSet[i] == VK_NULL_HANDLE) continue;
-        VkDescriptorBufferInfo hizBI { _hizParamsBuffer, 0, 128 };
-        VkDescriptorImageInfo  hizII { _hizSampler, _hizFullView, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet ws[2]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 4, 0, 1,
-                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hizBI, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, _vkCullDescSet[i], 5, 0, 1,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hizII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 2, ws, 0, nullptr);
-    }
-
-    return true;
-}
-
-void VulkanBackend::DestroyHiZResources()
-{
-    if (!_device) return;
-    VkDevice dev = _device->GetDevice();
-    _hizReady = false;
-
-    if (_hizParamsMapped) { vkUnmapMemory(dev, _hizParamsMem); _hizParamsMapped = nullptr; }
-    if (_hizParamsBuffer) { vkDestroyBuffer(dev, _hizParamsBuffer, nullptr); _hizParamsBuffer = VK_NULL_HANDLE; }
-    if (_hizParamsMem)    { vkFreeMemory(dev, _hizParamsMem, nullptr);        _hizParamsMem    = VK_NULL_HANDLE; }
-
-    if (_hizGenPipeline)   { vkDestroyPipeline(dev, _hizGenPipeline, nullptr);         _hizGenPipeline   = VK_NULL_HANDLE; }
-    if (_hizGenPipeLayout) { vkDestroyPipelineLayout(dev, _hizGenPipeLayout, nullptr); _hizGenPipeLayout = VK_NULL_HANDLE; }
-    if (_hizGenDescPool)   { vkDestroyDescriptorPool(dev, _hizGenDescPool, nullptr);   _hizGenDescPool   = VK_NULL_HANDLE; }
-    if (_hizGenDescLayout) { vkDestroyDescriptorSetLayout(dev, _hizGenDescLayout, nullptr); _hizGenDescLayout = VK_NULL_HANDLE; }
-
-    if (_hizSampler)  { vkDestroySampler(dev, _hizSampler, nullptr);    _hizSampler  = VK_NULL_HANDLE; }
-    if (_hizFullView) { vkDestroyImageView(dev, _hizFullView, nullptr); _hizFullView = VK_NULL_HANDLE; }
-    for (uint32_t m = 0; m < HIZ_MAX_MIPS; ++m) {
-        if (_hizMipView[m]) { vkDestroyImageView(dev, _hizMipView[m], nullptr); _hizMipView[m] = VK_NULL_HANDLE; }
-    }
-    if (_hizImage)  { vkDestroyImage(dev, _hizImage, nullptr);    _hizImage  = VK_NULL_HANDLE; }
-    if (_hizMemory) { vkFreeMemory(dev, _hizMemory, nullptr);      _hizMemory = VK_NULL_HANDLE; }
-    _hizMipCount = 0;
-}
-
-void VulkanBackend::BuildHiZPyramid(VkCommandBuffer cmd)
-{
-    if (!_hizImage || _hizMipCount < 2) return;
-
-    _gpuProfiler.WriteBeginTimestamp(cmd, "Hi-Z Build");
-
-    // Transition depth → SHADER_READ for compute sampling (descriptor set 0 reads _depthView)
-    {
-        VkImageMemoryBarrier bar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        bar.srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        bar.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
-        bar.oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        bar.newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        bar.image            = _depthImage;
-        bar.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &bar);
-    }
-
-    // Generate all mips via compute (mip 0 = 1:1 copy from depth, mips 1+ = 2×2 min downsample)
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _hizGenPipeline);
-
-    uint32_t srcW = _swapchainExtent.width;
-    uint32_t srcH = _swapchainExtent.height;
-
-    // Mip 0: 1:1 copy from depth buffer
-    {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _hizGenPipeLayout,
-            0, 1, &_hizGenDescSet[0], 0, nullptr);
-        uint32_t constants[5] = { srcW, srcH, srcW, srcH, 1 };  // copyMode = 1
-        vkCmdPushConstants(cmd, _hizGenPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, constants);
-        vkCmdDispatch(cmd, (srcW + 7) / 8, (srcH + 7) / 8, 1);
-
-        // Barrier: Hi-Z mip 0 write → mip 0 read (for next dispatch)
-        VkImageMemoryBarrier bar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        bar.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
-        bar.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
-        bar.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
-        bar.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
-        bar.image            = _hizImage;
-        bar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &bar);
-    }
-
-    // Transition depth back to ATTACHMENT_OPTIMAL
-    {
-        VkImageMemoryBarrier bar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        bar.srcAccessMask    = VK_ACCESS_SHADER_READ_BIT;
-        bar.dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-        bar.oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        bar.newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        bar.image            = _depthImage;
-        bar.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &bar);
-    }
-
-    // Mips 1+: 2×2 min downsample
-    for (uint32_t m = 1; m < _hizMipCount; ++m)
-    {
-        uint32_t dstW = std::max(srcW >> 1, 1u);
-        uint32_t dstH = std::max(srcH >> 1, 1u);
-
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _hizGenPipeLayout,
-            0, 1, &_hizGenDescSet[m], 0, nullptr);
-
-        uint32_t constants[5] = { srcW, srcH, dstW, dstH, 0 };  // copyMode = 0
-        vkCmdPushConstants(cmd, _hizGenPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, constants);
-        vkCmdDispatch(cmd, (dstW + 7) / 8, (dstH + 7) / 8, 1);
-
-        // Barrier between mip dispatches
-        VkImageMemoryBarrier bar{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        bar.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
-        bar.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
-        bar.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
-        bar.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
-        bar.image            = _hizImage;
-        bar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 1 };
-        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &bar);
-
-        srcW = dstW;
-        srcH = dstH;
-    }
-
-    _gpuProfiler.WriteEndTimestamp(cmd);
-    _hizReady = true;
-}
-
 void VulkanBackend::FlushDraws()
 {
     if (!_gpuDrivenReady || _cpuInstances.empty()) return;
@@ -6037,10 +5519,134 @@ void VulkanBackend::FlushDraws()
     vkCmdEndRenderPass(cmd);
     _gpuProfiler.WriteEndTimestamp(cmd); // end "GBuffer Fill"
 
+    // Phase 27: Mesh shader path — per-object DispatchMeshTasks with task+mesh culling
+    if (_meshShaderReady && _meshShaderPipeline && pfn_vkCmdDrawMeshTasksEXT)
+    {
+        _gpuProfiler.WriteBeginTimestamp(cmd, "GPU Cull");
+
+        // 1b. Transition G-buffer images for re-use
+        {
+            VkImageMemoryBarrier bars[4]{};
+            for (int i = 0; i < 3; i++) {
+                bars[i].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                bars[i].srcAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                bars[i].dstAccessMask    = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                bars[i].oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                bars[i].newLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                bars[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                bars[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                bars[i].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            }
+            bars[0].image = _gBuffer.GetAlbedoImage();
+            bars[1].image = _gBuffer.GetNormalImage();
+            bars[2].image = _gBuffer.GetMetalRoughImage();
+            bars[3].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bars[3].srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            bars[3].dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            bars[3].oldLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            bars[3].newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            bars[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bars[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bars[3].subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+            bars[3].image            = _vkSwapchain.GetDepthImage();
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                0, 0, nullptr, 0, nullptr, 4, bars);
+        }
+        _gpuProfiler.WriteEndTimestamp(cmd); // end "GPU Cull" (minimal — cull is inline in task shader)
+
+        // Re-open G-buffer render pass with LOAD_OP_LOAD
+        {
+            VkRenderPassBeginInfo rpi{};
+            rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpi.renderPass        = _gBuffer.GetRenderPassLoad();
+            rpi.framebuffer       = _gBuffer.GetFramebufferLoad();
+            rpi.renderArea.extent = _vkSwapchain.GetExtent();
+            vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
+            VkViewport viewport{ 0, 0, (float)_vkSwapchain.GetExtent().width,
+                                 (float)_vkSwapchain.GetExtent().height, 0, 1 };
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            VkRect2D scissor{ {0,0}, _vkSwapchain.GetExtent() };
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+        }
+
+        // Upload object data
+        memcpy(_objectDataMapped, _cpuInstances.data(), count * sizeof(GPUObjectDataVK));
+
+        // Build frustum planes
+        XMMATRIX V = XMLoadFloat4x4(&_deferredView);
+        XMMATRIX P = XMLoadFloat4x4(&_lastProj);
+        XMMATRIX VP = XMMatrixMultiply(V, P);
+        XMFLOAT4X4 vpMat; XMStoreFloat4x4(&vpMat, VP);
+
+        // Extract frustum planes from VP matrix (row-major)
+        struct { float x, y, z, w; } frustumPlanes[6];
+        frustumPlanes[0] = { vpMat._14 + vpMat._11, vpMat._24 + vpMat._21, vpMat._34 + vpMat._31, vpMat._44 + vpMat._41 };
+        frustumPlanes[1] = { vpMat._14 - vpMat._11, vpMat._24 - vpMat._21, vpMat._34 - vpMat._31, vpMat._44 - vpMat._41 };
+        frustumPlanes[2] = { vpMat._14 + vpMat._12, vpMat._24 + vpMat._22, vpMat._34 + vpMat._32, vpMat._44 + vpMat._42 };
+        frustumPlanes[3] = { vpMat._14 - vpMat._12, vpMat._24 - vpMat._22, vpMat._34 - vpMat._32, vpMat._44 - vpMat._42 };
+        frustumPlanes[4] = { vpMat._13, vpMat._23, vpMat._33, vpMat._43 };
+        frustumPlanes[5] = { vpMat._14 - vpMat._13, vpMat._24 - vpMat._23, vpMat._34 - vpMat._33, vpMat._44 - vpMat._43 };
+        for (int i = 0; i < 6; ++i) {
+            float len = std::sqrt(frustumPlanes[i].x*frustumPlanes[i].x + frustumPlanes[i].y*frustumPlanes[i].y + frustumPlanes[i].z*frustumPlanes[i].z);
+            if (len > 0.0001f) { float inv = 1.0f/len; frustumPlanes[i].x *= inv; frustumPlanes[i].y *= inv; frustumPlanes[i].z *= inv; frustumPlanes[i].w *= inv; }
+        }
+
+        // Bind mesh shader pipeline + descriptor sets
+        _gpuProfiler.WriteBeginTimestamp(cmd, "Mesh Shader Draw");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _meshShaderPipeline);
+        VkDescriptorSet dSets[] = { _meshShaderDescSet, _indirectMaterialSet };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _meshShaderPipeLayout,
+            0, 2, dSets, 0, nullptr);
+
+        // Per-object mesh task dispatch
+        // Push constant layout: mat4 view(64) + mat4 proj(64) + vec4 planes[6](96) + 4*uint(16) = 240B
+        struct MeshShaderPC {
+            float viewMatrix[16];       // 64
+            float projMatrix[16];       // 64
+            float frustumPlanes[6][4];  // 96
+            uint32_t objectIndex;       //  4
+            uint32_t meshletOffset;     //  4
+            uint32_t meshletCount;      //  4
+            uint32_t _pad;              //  4 = 240
+        } pc{};
+        memcpy(pc.viewMatrix, &_deferredView, 64);
+        memcpy(pc.projMatrix, &_lastProj, 64);
+        memcpy(pc.frustumPlanes, frustumPlanes, 96);
+
+        for (uint32_t obj = 0; obj < count; ++obj)
+        {
+            const GPUObjectDataVK& inst = _cpuInstances[obj];
+            uint32_t meshIdx = inst.meshIndex;
+            if (meshIdx >= _vkMeshMeshletOffsets.size()) continue;
+
+            uint32_t meshletOff   = _vkMeshMeshletOffsets[meshIdx];
+            uint32_t meshletCount = _vkMeshMeshletCounts[meshIdx];
+            if (meshletCount == 0) continue;
+
+            pc.objectIndex   = obj;
+            pc.meshletOffset = meshletOff;
+            pc.meshletCount  = meshletCount;
+
+            vkCmdPushConstants(cmd, _meshShaderPipeLayout,
+                VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+                0, 240, &pc);
+
+            uint32_t groupCount = (meshletCount + 31) / 32;
+            pfn_vkCmdDrawMeshTasksEXT(cmd, groupCount, 1, 1);
+        }
+
+        _gpuProfiler.WriteEndTimestamp(cmd); // end "Mesh Shader Draw"
+        _cpuInstances.clear();
+        return;
+    }
+
+    // Fallback: compute cull + indirect draw path (Phase 15B/20)
     _gpuProfiler.WriteBeginTimestamp(cmd, "GPU Cull");
 
-    // 1b. Transition G-buffer images: SHADER_READ_ONLY → COLOR_ATTACHMENT (color),
-    //     DEPTH_STENCIL_READ_ONLY → DEPTH_STENCIL_ATTACHMENT (depth).
+    // 1b. Transition G-buffer images: SHADER_READ_ONLY ??COLOR_ATTACHMENT (color),
+    //     DEPTH_STENCIL_READ_ONLY ??DEPTH_STENCIL_ATTACHMENT (depth).
     {
         VkImageMemoryBarrier bars[4]{};
         for (int i = 0; i < 3; i++) {
@@ -6054,9 +5660,9 @@ void VulkanBackend::FlushDraws()
             bars[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bars[i].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         }
-        bars[0].image = _gbAlbedoImage;
-        bars[1].image = _gbNormalImage;
-        bars[2].image = _gbMetalRoughImage;
+        bars[0].image = _gBuffer.GetAlbedoImage();
+        bars[1].image = _gBuffer.GetNormalImage();
+        bars[2].image = _gBuffer.GetMetalRoughImage();
         bars[3].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         bars[3].srcAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         bars[3].dstAccessMask    = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
@@ -6066,7 +5672,7 @@ void VulkanBackend::FlushDraws()
         bars[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bars[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bars[3].subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        bars[3].image            = _depthImage;
+        bars[3].image            = _vkSwapchain.GetDepthImage();
 
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -6075,9 +5681,11 @@ void VulkanBackend::FlushDraws()
     }
 
     // Phase 23: Build Hi-Z pyramid from previous frame's depth (stays on graphics queue)
-    if (_hizImage && _hizMipCount >= 2)
+    if (_hiZ.GetMipCount() >= 2)
     {
-        BuildHiZPyramid(cmd);
+        _gpuProfiler.WriteBeginTimestamp(cmd, "Hi-Z Build");
+        _hiZ.BuildPyramid(cmd, _vkSwapchain.GetDepthImage(), _vkSwapchain.GetExtent());
+        _gpuProfiler.WriteEndTimestamp(cmd);
 
         struct HiZParams { float viewProj[16]; float screenW; float screenH; float hizMipCount; float pad; };
         HiZParams hp{};
@@ -6086,18 +5694,18 @@ void VulkanBackend::FlushDraws()
         XMMATRIX VP = XMMatrixMultiply(V, P);
         XMFLOAT4X4 vpF; XMStoreFloat4x4(&vpF, VP);
         memcpy(hp.viewProj, &vpF, 64);
-        hp.screenW     = (float)_swapchainExtent.width;
-        hp.screenH     = (float)_swapchainExtent.height;
-        hp.hizMipCount = (float)_hizMipCount;
-        memcpy(_hizParamsMapped, &hp, sizeof(hp));
+        hp.screenW     = (float)_vkSwapchain.GetExtent().width;
+        hp.screenH     = (float)_vkSwapchain.GetExtent().height;
+        hp.hizMipCount = (float)_hiZ.GetMipCount();
+        memcpy(_hiZ.GetParamsMapped(), &hp, sizeof(hp));
     }
 
-    // Phase 20: Async compute path — dispatch cull on dedicated compute queue
+    // Phase 20: Async compute path ??dispatch cull on dedicated compute queue
     if (_asyncComputeReady)
     {
         DispatchCullAsync();
 
-        // Queue ownership acquire barriers on graphics queue (compute → graphics)
+        // Queue ownership acquire barriers on graphics queue (compute ??graphics)
         uint32_t computeFamily  = _device->GetComputeQueueFamily();
         uint32_t graphicsFamily = _device->GetGraphicsQueueFamily();
         uint32_t srcFamily = (computeFamily != graphicsFamily) ? computeFamily  : VK_QUEUE_FAMILY_IGNORED;
@@ -6123,13 +5731,13 @@ void VulkanBackend::FlushDraws()
     {
         // Fallback: dispatch cull on graphics queue (single-queue path)
 
-        // Upload object data (HOST_COHERENT — no barrier needed)
+        // Upload object data (HOST_COHERENT ??no barrier needed)
         memcpy(_objectDataMapped, _cpuInstances.data(), count * sizeof(GPUObjectDataVK));
 
         // Clear draw count
         vkCmdFillBuffer(cmd, _drawCountBuffer[_frameIndex], 0, sizeof(uint32_t), 0);
 
-        // Barrier: TRANSFER_WRITE → COMPUTE_SHADER_READ (drawCount)
+        // Barrier: TRANSFER_WRITE ??COMPUTE_SHADER_READ (drawCount)
         {
             VkBufferMemoryBarrier bmb{};
             bmb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -6182,8 +5790,8 @@ void VulkanBackend::FlushDraws()
             cc.frustumPlanes[5][2] = tm.m[3][2] - tm.m[2][2]; cc.frustumPlanes[5][3] = tm.m[3][3] - tm.m[2][3];
             cc.objectCount = count;
 
-            cc.enableHiZ   = _hizReady ? 1u : 0u;
-            cc.hizMipCount = _hizMipCount;
+            cc.enableHiZ   = _hiZ.IsReady() ? 1u : 0u;
+            cc.hizMipCount = _hiZ.GetMipCount();
             {
                 XMFLOAT4X4 projF;
                 XMStoreFloat4x4(&projF, P);
@@ -6197,7 +5805,7 @@ void VulkanBackend::FlushDraws()
             vkCmdDispatch(cmd, (count + 63) / 64, 1, 1);
         }
 
-        // Barrier: COMPUTE SHADER_WRITE → DRAW_INDIRECT + VERTEX_INPUT read
+        // Barrier: COMPUTE SHADER_WRITE ??DRAW_INDIRECT + VERTEX_INPUT read
         {
             VkBufferMemoryBarrier bmbs[2]{};
             bmbs[0].sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -6222,16 +5830,16 @@ void VulkanBackend::FlushDraws()
     {
         VkRenderPassBeginInfo rpi{};
         rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpi.renderPass        = _gbRenderPassLoad;
-        rpi.framebuffer       = _gbFramebufferLoad;
-        rpi.renderArea.extent = _swapchainExtent;
+        rpi.renderPass        = _gBuffer.GetRenderPassLoad();
+        rpi.framebuffer       = _gBuffer.GetFramebufferLoad();
+        rpi.renderArea.extent = _vkSwapchain.GetExtent();
         rpi.clearValueCount   = 0;  // LOAD_OP_LOAD ??no clears needed
         vkCmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
 
         VkViewport vp{ 0, 0,
-            (float)_swapchainExtent.width, (float)_swapchainExtent.height, 0, 1 };
+            (float)_vkSwapchain.GetExtent().width, (float)_vkSwapchain.GetExtent().height, 0, 1 };
         vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{ {0,0}, _swapchainExtent };
+        VkRect2D sc{ {0,0}, _vkSwapchain.GetExtent() };
         vkCmdSetScissor(cmd, 0, 1, &sc);
     }
 
@@ -6255,7 +5863,7 @@ void VulkanBackend::FlushDraws()
             sizeof(VkDrawIndexedIndirectCmd));
     }
 
-    // Render pass left open — CompositeFrame will close it via vkCmdEndRenderPass
+    // Render pass left open ??CompositeFrame will close it via vkCmdEndRenderPass
     _gpuProfiler.WriteEndTimestamp(cmd); // end "Indirect Draw"
     _cpuInstances.clear();
 }
@@ -6268,78 +5876,9 @@ bool VulkanBackend::LoadHDREnvironment(const std::string& hdrPath)
 {
     VkDevice dev = _device->GetDevice();
 
-    // Load equirectangular HDR image via stb_image
-    int w, h, c;
-    float* pixels = stbi_loadf(hdrPath.c_str(), &w, &h, &c, 4);
-    if (!pixels) {
-        LUNA_LOG_ERROR("VK IBL: failed to load HDR '%s': %s", hdrPath.c_str(), stbi_failure_reason());
-        return false;
-    }
-    VkDeviceSize imgSz = (VkDeviceSize)w * h * 4 * sizeof(float);
-
-    // Upload to device-local 2D image (R32G32B32A32_SFLOAT)
-    VkImage        equirectImg = VK_NULL_HANDLE;
-    VkDeviceMemory equirectMem = VK_NULL_HANDLE;
-    VkImageView    equirectView= VK_NULL_HANDLE;
-    {
-        VkBuffer stg; VkDeviceMemory stgMem;
-        CreateBuffer(imgSz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            stg, stgMem);
-        void* p; vkMapMemory(dev, stgMem, 0, imgSz, 0, &p);
-        memcpy(p, pixels, (size_t)imgSz);
-        vkUnmapMemory(dev, stgMem);
-        stbi_image_free(pixels);
-
-        VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.imageType   = VK_IMAGE_TYPE_2D;
-        ii.format      = VK_FORMAT_R32G32B32A32_SFLOAT;
-        ii.extent      = { (uint32_t)w, (uint32_t)h, 1 };
-        ii.mipLevels   = 1; ii.arrayLayers = 1;
-        ii.samples     = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling      = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        vkCreateImage(dev, &ii, nullptr, &equirectImg);
-        VkMemoryRequirements req; vkGetImageMemoryRequirements(dev, equirectImg, &req);
-        VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        ai.allocationSize  = req.size;
-        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(dev, &ai, nullptr, &equirectMem);
-        vkBindImageMemory(dev, equirectImg, equirectMem, 0);
-
-        TransitionImageLayout(equirectImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        CopyBufferToImage(stg, equirectImg, (uint32_t)w, (uint32_t)h);
-        TransitionImageLayout(equirectImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        vkDestroyBuffer(dev, stg, nullptr); vkFreeMemory(dev, stgMem, nullptr);
-
-        // Early exit if device lost during image upload
-        if (_deviceLost) {
-            vkDestroyImageView(dev, equirectView, nullptr);
-            vkDestroyImage(dev, equirectImg, nullptr);
-            vkFreeMemory(dev, equirectMem, nullptr);
-            LUNA_LOG_ERROR("VK IBL: device lost during equirect upload");
-            return false;
-        }
-
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = equirectImg;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format   = VK_FORMAT_R32G32B32A32_SFLOAT;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCreateImageView(dev, &vi, nullptr, &equirectView);
-    }
-
-    // Create IBL resources and dispatch precompute
-    if (!CreateIBLResources() || !DispatchIBLPrecompute(equirectImg, equirectView)) {
-        vkDestroyImageView(dev, equirectView, nullptr);
-        vkDestroyImage(dev, equirectImg, nullptr);
-        vkFreeMemory(dev, equirectMem, nullptr);
-        return false;
-    }
-
-    vkDestroyImageView(dev, equirectView, nullptr);
-    vkDestroyImage(dev, equirectImg, nullptr);
-    vkFreeMemory(dev, equirectMem, nullptr);
+    // Delegate IBL precompute (equirect?�cube, irradiance, prefilter, BRDF LUT) to VulkanIBL
+    if (!_ibl.Init({ &_core })) return false;
+    if (!_ibl.LoadHDREnvironment(hdrPath)) return false;
 
     // Compile IBL deferred lighting pipeline
     {
@@ -6400,595 +5939,30 @@ bool VulkanBackend::LoadHDREnvironment(const std::string& hdrPath)
     }
 
     // Write IBL descriptors into the deferred G-buffer set and activate
-    _iblReady = true;
     UpdateDeferredGbufDescriptors();
-    LUNA_LOG_INFO("VK IBL: environment loaded ??IBL active");
-    return true;
-}
+    LUNA_LOG_INFO("VK IBL: environment loaded — IBL active");
 
-bool VulkanBackend::CreateIBLResources()
-{
-    VkDevice dev = _device->GetDevice();
-
-    auto createCubemap = [&](uint32_t size, uint32_t mips, VkFormat fmt,
-                              VkImage& img, VkDeviceMemory& mem) -> bool {
-        VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.flags       = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-        ii.imageType   = VK_IMAGE_TYPE_2D;
-        ii.format      = fmt;
-        ii.extent      = { size, size, 1 };
-        ii.mipLevels   = mips;
-        ii.arrayLayers = 6;
-        ii.samples     = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling      = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage       = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateImage(dev, &ii, nullptr, &img) != VK_SUCCESS) return false;
-        VkMemoryRequirements req; vkGetImageMemoryRequirements(dev, img, &req);
-        VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        ai.allocationSize  = req.size;
-        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        return vkAllocateMemory(dev, &ai, nullptr, &mem) == VK_SUCCESS
-            && vkBindImageMemory(dev, img, mem, 0) == VK_SUCCESS;
-    };
-
-    auto makeCubeView = [&](VkImage img, VkFormat fmt, uint32_t mips) -> VkImageView {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = img;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
-        vi.format   = fmt;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 6 };
-        VkImageView v = VK_NULL_HANDLE;
-        vkCreateImageView(dev, &vi, nullptr, &v);
-        return v;
-    };
-
-    auto makeArrayView = [&](VkImage img, VkFormat fmt, uint32_t baseMip, uint32_t mipCount) -> VkImageView {
-        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image    = img;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-        vi.format   = fmt;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, 6 };
-        VkImageView v = VK_NULL_HANDLE;
-        vkCreateImageView(dev, &vi, nullptr, &v);
-        return v;
-    };
-
-    // Env cubemap (512², 1 mip, R16G16B16A16_SFLOAT)
-    if (!createCubemap(VK_ENV_CUBE_SIZE, 1, VK_FORMAT_R16G16B16A16_SFLOAT, _vkEnvCubemap, _vkEnvCubemapMem)) return false;
-    _vkEnvCubemapView  = makeCubeView (_vkEnvCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, 1);
-    _vkEnvCubemapArray = makeArrayView(_vkEnvCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1);
-
-    // Irradiance cubemap (32², 1 mip, R16G16B16A16_SFLOAT)
-    if (!createCubemap(VK_IRR_CUBE_SIZE, 1, VK_FORMAT_R16G16B16A16_SFLOAT, _vkIrrCubemap, _vkIrrCubemapMem)) return false;
-    _vkIrrCubemapView  = makeCubeView (_vkIrrCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, 1);
-    _vkIrrCubemapArray = makeArrayView(_vkIrrCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1);
-
-    // Prefilter cubemap (128², 5 mips, R16G16B16A16_SFLOAT)
-    if (!createCubemap(VK_PREFILTER_CUBE_SIZE, VK_PREFILTER_MIP_COUNT, VK_FORMAT_R16G16B16A16_SFLOAT,
-                        _vkPrefilterCubemap, _vkPrefilterCubemapMem)) return false;
-    _vkPrefilterCubemapView = makeCubeView(_vkPrefilterCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, VK_PREFILTER_MIP_COUNT);
-    for (uint32_t m = 0; m < VK_PREFILTER_MIP_COUNT; m++)
-        _vkPrefilterMipView[m] = makeArrayView(_vkPrefilterCubemap, VK_FORMAT_R16G16B16A16_SFLOAT, m, 1);
-
-    // BRDF LUT (512×512, R16G16_SFLOAT, 2D)
+    // Phase 28: Initialize atmosphere rendering (requires HDR + depth views from post-process)
     {
-        VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.imageType   = VK_IMAGE_TYPE_2D;
-        ii.format      = VK_FORMAT_R16G16_SFLOAT;
-        ii.extent      = { VK_BRDF_LUT_SIZE, VK_BRDF_LUT_SIZE, 1 };
-        ii.mipLevels   = 1; ii.arrayLayers = 1;
-        ii.samples     = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling      = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage       = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        if (vkCreateImage(dev, &ii, nullptr, &_vkBrdfLUT) != VK_SUCCESS) return false;
-        VkMemoryRequirements req; vkGetImageMemoryRequirements(dev, _vkBrdfLUT, &req);
-        VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        ai.allocationSize  = req.size;
-        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(dev, &ai, nullptr, &_vkBrdfLUTMem);
-        vkBindImageMemory(dev, _vkBrdfLUT, _vkBrdfLUTMem, 0);
-        _vkBrdfLUTView = CreateImageView(_vkBrdfLUT, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
+        VulkanAtmosphere::CreateInfo atmoCI{};
+        atmoCI.core         = &_core;
+        atmoCI.extent       = _vkSwapchain.GetExtent();
+        atmoCI.depthView    = _vkSwapchain.GetDepthView();
+        atmoCI.hdrView      = _postProcess.GetHDRView();
+        atmoCI.hdrImage     = _postProcess.GetHDRImage();
+        atmoCI.ppRenderPass = _postProcess.GetPPRenderPass();
+        atmoCI.framesInFlight = FRAMES_IN_FLIGHT;
+        if (_atmosphere.Create(atmoCI))
+            LUNA_LOG_INFO("VK Atmosphere: initialized — sky rendering active");
+        else
+            LUNA_LOG_WARN("VK Atmosphere: init failed — no sky rendering");
     }
 
-    // IBL sampler (trilinear, clamp-to-edge, maxLOD = prefilter mip count)
-    {
-        VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        si.magFilter    = VK_FILTER_LINEAR;
-        si.minFilter    = VK_FILTER_LINEAR;
-        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.maxAnisotropy = 1.0f;
-        si.minLod       = 0.0f;
-        si.maxLod       = (float)VK_PREFILTER_MIP_COUNT;
-        vkCreateSampler(dev, &si, nullptr, &_vkIBLSampler);
-    }
-
-    // Compute pipelines: equirect, irradiance, prefilter, brdfLut
-    // All use the same descriptor layout pattern:
-    //   binding 0: optional CB or nothing; we store CB as push constants
-    // Actually each shader has its own layout. Create all 4 here.
-
-    auto makeComputePipeline = [&](const wchar_t* shaderFile,
-                                    VkDescriptorSetLayout dsl,
-                                    uint32_t pushSize,
-                                    VkPipelineLayout& outLayout,
-                                    VkPipeline& outPipeline) -> bool {
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.size       = pushSize;
-        VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount         = 1;
-        pli.pSetLayouts            = &dsl;
-        pli.pushConstantRangeCount = (pushSize > 0) ? 1 : 0;
-        pli.pPushConstantRanges    = (pushSize > 0) ? &pcr : nullptr;
-        vkCreatePipelineLayout(dev, &pli, nullptr, &outLayout);
-
-        std::vector<uint32_t> csS;
-        if (!CompileGLSLtoSPIRV(GetShaderFullPath(shaderFile).wstring(), csS)) return false;
-        VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-        smi.codeSize = csS.size() * 4; smi.pCode = csS.data();
-        VkShaderModule csM = VK_NULL_HANDLE;
-        vkCreateShaderModule(dev, &smi, nullptr, &csM);
-        VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpi.stage.module = csM;
-        cpi.stage.pName  = "main";
-        cpi.layout       = outLayout;
-        VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &outPipeline);
-        vkDestroyShaderModule(dev, csM, nullptr);
-        return r == VK_SUCCESS;
-    };
-
-    // Each IBL shader uses bindings: 0=CB(as UBO in set), 1=input texture, 2=RW output, 3=sampler
-    // We create one shared descriptor set layout for equirect/irradiance/prefilter stages:
-    //   binding 0: UNIFORM_BUFFER  (CB)
-    //   binding 1: SAMPLED_IMAGE   (input: equirect or env cube)
-    //   binding 2: STORAGE_IMAGE   (output: RW cube layer)
-    //   binding 3: SAMPLER
-    // For brdfLut: binding 0: STORAGE_IMAGE (gLutOut only ??no input texture)
-
-    // Layout with UBO+SampledImage+StorageImage+Sampler (equirect/irradiance/prefilter)
-    auto makeIBLLayoutFull = [&]() -> VkDescriptorSetLayout {
-        VkDescriptorSetLayoutBinding bs[4]{};
-        bs[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        bs[1] = { 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        bs[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        bs[3] = { 3, VK_DESCRIPTOR_TYPE_SAMPLER,        1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        VkDescriptorSetLayoutCreateInfo li{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        li.bindingCount = 4; li.pBindings = bs;
-        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-        vkCreateDescriptorSetLayout(dev, &li, nullptr, &dsl);
-        return dsl;
-    };
-
-    // Layout with only StorageImage at binding 0 (brdfLUT shader: no cbuffer, no sampler)
-    auto makeIBLLayoutBrdf = [&]() -> VkDescriptorSetLayout {
-        VkDescriptorSetLayoutBinding bs{ 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        VkDescriptorSetLayoutCreateInfo li{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        li.bindingCount = 1; li.pBindings = &bs;
-        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-        vkCreateDescriptorSetLayout(dev, &li, nullptr, &dsl);
-        return dsl;
-    };
-
-    // Store DSLs as members ??kept alive until DestroyIBLResources (after pipeline layouts destroyed)
-    _vkEquirectDSL  = makeIBLLayoutFull();
-    _vkIrrConvDSL   = makeIBLLayoutFull();
-    _vkPrefilterDSL = makeIBLLayoutFull();
-    _vkBrdfLutDSL   = makeIBLLayoutBrdf();
-
-    if (!makeComputePipeline(L"equirect_to_cube_vk.comp.glsl",  _vkEquirectDSL,  0, _vkEquirectPipeLayout,  _vkEquirectPipeline)  ||
-        !makeComputePipeline(L"irradiance_conv_vk.comp.glsl",   _vkIrrConvDSL,   0, _vkIrrConvPipeLayout,   _vkIrrConvPipeline)   ||
-        !makeComputePipeline(L"prefilter_env_vk.comp.glsl",     _vkPrefilterDSL, 0, _vkPrefilterPipeLayout, _vkPrefilterPipeline) ||
-        !makeComputePipeline(L"brdf_lut_vk.comp.glsl",          _vkBrdfLutDSL,   0, _vkBrdfLutPipeLayout,   _vkBrdfLutPipeline))
-    {
-        LUNA_LOG_ERROR("VK IBL: failed to compile IBL compute shaders");
-        return false;
-    }
-
-    return true;
-}
-
-bool VulkanBackend::DispatchIBLPrecompute(VkImage equirectSrc, VkImageView equirectView)
-{
-    VkDevice dev = _device->GetDevice();
-
-    // =========================================================================
-    // IBL precompute is split into SEPARATE submissions per stage to avoid
-    // GPU TDR (Timeout Detection and Recovery). Heavy convolution kernels
-    // (irradiance, prefilter) can timeout if batched into one command buffer.
-    // Each stage: BeginSingleTimeCommands → record → EndSingleTimeCommands (sync)
-    // =========================================================================
-
-    // Create a linear sampler for IBL equirect sampling
-    VkSampler linearSampler = VK_NULL_HANDLE;
-    {
-        VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        si.magFilter    = VK_FILTER_LINEAR;
-        si.minFilter    = VK_FILTER_LINEAR;
-        si.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.maxAnisotropy = 1.0f;
-        si.maxLod        = 1.0f;
-        vkCreateSampler(dev, &si, nullptr, &linearSampler);
-    }
-
-    // Helper: create a one-time descriptor pool + set with given layout
-    auto allocSet = [&](VkDescriptorPool& pool,
-                         const std::vector<VkDescriptorPoolSize>& sizes,
-                         VkDescriptorSetLayout dsl) -> VkDescriptorSet {
-        VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pi.maxSets       = 1;
-        pi.poolSizeCount = (uint32_t)sizes.size();
-        pi.pPoolSizes    = sizes.data();
-        vkCreateDescriptorPool(dev, &pi, nullptr, &pool);
-        VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        ai.descriptorPool     = pool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &dsl;
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        vkAllocateDescriptorSets(dev, &ai, &ds);
-        return ds;
-    };
-
-    // Helper: create CB UBO with given data
-    auto makeCB = [&](const void* data, VkDeviceSize sz,
-                       VkBuffer& buf, VkDeviceMemory& mem) {
-        CreateBuffer(sz, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buf, mem);
-        void* p; vkMapMemory(dev, mem, 0, sz, 0, &p);
-        memcpy(p, data, (size_t)sz);
-        vkUnmapMemory(dev, mem);
-    };
-
-    // Use the member DSLs kept alive in CreateIBLResources
-    VkDescriptorSetLayout equirectDSL  = _vkEquirectDSL;
-    VkDescriptorSetLayout irrConvDSL   = _vkIrrConvDSL;
-    VkDescriptorSetLayout prefilterDSL = _vkPrefilterDSL;
-    VkDescriptorSetLayout brdfLutDSL   = _vkBrdfLutDSL;
-
-    // Cleanup lists (resources deleted after each stage submission now)
-    std::vector<VkDescriptorPool> tempPools;
-    std::vector<VkBuffer>         tempBufs;
-    std::vector<VkDeviceMemory>   tempMems;
-
-    // Helper: cleanup temp resources after each stage
-    auto cleanupTemp = [&]() {
-        for (auto p : tempPools) vkDestroyDescriptorPool(dev, p, nullptr);
-        for (auto b : tempBufs)  vkDestroyBuffer(dev, b, nullptr);
-        for (auto m : tempMems)  vkFreeMemory(dev, m, nullptr);
-        tempPools.clear();
-        tempBufs.clear();
-        tempMems.clear();
-    };
-
-    // =========================================================================
-    // Stage 1: Equirect → EnvCube (SEPARATE SUBMISSION)
-    // =========================================================================
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        if (!cmd || _deviceLost) {
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: failed to begin Stage 1 command buffer");
-            return false;
-        }
-
-        // Transition env cubemap to GENERAL for compute writes
-        VkImageMemoryBarrier b1{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b1.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        b1.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.image               = _vkEnvCubemap;
-        b1.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
-        b1.srcAccessMask       = 0;
-        b1.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b1);
-
-        uint32_t cbData[4] = { VK_ENV_CUBE_SIZE, 0, 0, 0 };
-        VkBuffer cbBuf = VK_NULL_HANDLE; VkDeviceMemory cbMem = VK_NULL_HANDLE;
-        makeCB(cbData, 16, cbBuf, cbMem);
-        tempBufs.push_back(cbBuf); tempMems.push_back(cbMem);
-
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        std::vector<VkDescriptorPoolSize> psz = {
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLER,        1 },
-        };
-        VkDescriptorSet ds = allocSet(pool, psz, equirectDSL);
-        tempPools.push_back(pool);
-
-        VkDescriptorBufferInfo cbBI{ cbBuf, 0, 16 };
-        VkDescriptorImageInfo  srcII{ VK_NULL_HANDLE, equirectView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  dstII{ VK_NULL_HANDLE, _vkEnvCubemapArray, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo  smpII{ linearSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-        VkWriteDescriptorSet ws[4]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &cbBI, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &srcII, nullptr, nullptr };
-        ws[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        ws[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 3, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &smpII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 4, ws, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkEquirectPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkEquirectPipeLayout, 0, 1, &ds, 0, nullptr);
-        uint32_t g = (VK_ENV_CUBE_SIZE + 7) / 8;
-        vkCmdDispatch(cmd, g, g, 6);
-
-        // Transition env cubemap to SHADER_READ for next stages
-        VkImageMemoryBarrier b2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b2.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b2.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.image               = _vkEnvCubemap;
-        b2.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
-        b2.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        b2.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b2);
-
-        EndSingleTimeCommands(cmd);
-        if (_deviceLost) {
-            cleanupTemp();
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: device lost during Stage 1 (equirect→cube)");
-            return false;
-        }
-        cleanupTemp();
-        LUNA_LOG_INFO("VK IBL: Stage 1 done (equirect → envCube)");
-    }
-
-    // =========================================================================
-    // Stage 2: Irradiance convolution (SEPARATE SUBMISSION)
-    // =========================================================================
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        if (!cmd || _deviceLost) {
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: failed to begin Stage 2 command buffer");
-            return false;
-        }
-
-        // Transition irradiance cubemap to GENERAL
-        VkImageMemoryBarrier b1{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b1.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        b1.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.image               = _vkIrrCubemap;
-        b1.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
-        b1.srcAccessMask       = 0;
-        b1.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b1);
-
-        uint32_t cbData[4] = { VK_IRR_CUBE_SIZE, 0, 0, 0 };
-        VkBuffer cbBuf = VK_NULL_HANDLE; VkDeviceMemory cbMem = VK_NULL_HANDLE;
-        makeCB(cbData, 16, cbBuf, cbMem);
-        tempBufs.push_back(cbBuf); tempMems.push_back(cbMem);
-
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        std::vector<VkDescriptorPoolSize> psz = {
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLER,        1 },
-        };
-        VkDescriptorSet ds = allocSet(pool, psz, irrConvDSL);
-        tempPools.push_back(pool);
-
-        VkDescriptorBufferInfo cbBI{ cbBuf, 0, 16 };
-        VkDescriptorImageInfo  srcII{ VK_NULL_HANDLE, _vkEnvCubemapView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  dstII{ VK_NULL_HANDLE, _vkIrrCubemapArray, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo  smpII{ linearSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-        VkWriteDescriptorSet ws[4]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &cbBI, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &srcII, nullptr, nullptr };
-        ws[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        ws[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 3, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &smpII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 4, ws, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkIrrConvPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkIrrConvPipeLayout, 0, 1, &ds, 0, nullptr);
-        uint32_t g = (VK_IRR_CUBE_SIZE + 7) / 8;
-        vkCmdDispatch(cmd, g, g, 6);
-
-        // Transition irradiance cubemap to SHADER_READ
-        VkImageMemoryBarrier b2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b2.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b2.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.image               = _vkIrrCubemap;
-        b2.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
-        b2.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        b2.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b2);
-
-        EndSingleTimeCommands(cmd);
-        if (_deviceLost) {
-            cleanupTemp();
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: device lost during Stage 2 (irradiance)");
-            return false;
-        }
-        cleanupTemp();
-        LUNA_LOG_INFO("VK IBL: Stage 2 done (irradiance convolution)");
-    }
-
-    // =========================================================================
-    // Stage 3: Prefilter environment - ONE MIP PER SUBMISSION to avoid TDR
-    // =========================================================================
-    for (uint32_t mip = 0; mip < VK_PREFILTER_MIP_COUNT; mip++)
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        if (!cmd || _deviceLost) {
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: failed to begin Stage 3 mip %u command buffer", mip);
-            return false;
-        }
-
-        float roughness = (float)mip / float(VK_PREFILTER_MIP_COUNT - 1u);
-        uint32_t mipSize = std::max(1u, VK_PREFILTER_CUBE_SIZE >> mip);
-
-        // Transition this mip level to GENERAL
-        VkImageMemoryBarrier b1{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b1.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;  // All mips start UNDEFINED (first use)
-        b1.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.image               = _vkPrefilterCubemap;
-        b1.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 6 };
-        b1.srcAccessMask       = 0;
-        b1.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b1);
-
-        struct PrefilterCB { uint32_t faceSize, mipLevel, numMips; float roughness; };
-        PrefilterCB cbData{ mipSize, mip, VK_PREFILTER_MIP_COUNT, roughness };
-        VkBuffer cbBuf = VK_NULL_HANDLE; VkDeviceMemory cbMem = VK_NULL_HANDLE;
-        makeCB(&cbData, 16, cbBuf, cbMem);
-        tempBufs.push_back(cbBuf); tempMems.push_back(cbMem);
-
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        std::vector<VkDescriptorPoolSize> psz = {
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1 },
-            { VK_DESCRIPTOR_TYPE_SAMPLER,        1 },
-        };
-        VkDescriptorSet ds = allocSet(pool, psz, prefilterDSL);
-        tempPools.push_back(pool);
-
-        VkDescriptorBufferInfo cbBI{ cbBuf, 0, 16 };
-        VkDescriptorImageInfo  srcII{ VK_NULL_HANDLE, _vkEnvCubemapView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  dstII{ VK_NULL_HANDLE, _vkPrefilterMipView[mip], VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo  smpII{ linearSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-        VkWriteDescriptorSet ws[4]{};
-        ws[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &cbBI, nullptr };
-        ws[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &srcII, nullptr, nullptr };
-        ws[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        ws[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 3, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &smpII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 4, ws, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkPrefilterPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkPrefilterPipeLayout, 0, 1, &ds, 0, nullptr);
-        uint32_t g = std::max(1u, (mipSize + 7) / 8);
-        vkCmdDispatch(cmd, g, g, 6);
-
-        // Transition this mip to SHADER_READ
-        VkImageMemoryBarrier b2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b2.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b2.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.image               = _vkPrefilterCubemap;
-        b2.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 6 };
-        b2.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        b2.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b2);
-
-        EndSingleTimeCommands(cmd);
-        if (_deviceLost) {
-            cleanupTemp();
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: device lost during Stage 3 mip %u", mip);
-            return false;
-        }
-        cleanupTemp();
-    }
-    LUNA_LOG_INFO("VK IBL: Stage 3 done (prefilter %u mips)", VK_PREFILTER_MIP_COUNT);
-
-    // =========================================================================
-    // Stage 4: BRDF LUT (SEPARATE SUBMISSION)
-    // =========================================================================
-    {
-        VkCommandBuffer cmd = BeginSingleTimeCommands();
-        if (!cmd || _deviceLost) {
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: failed to begin Stage 4 command buffer");
-            return false;
-        }
-
-        // Transition BRDF LUT to GENERAL
-        VkImageMemoryBarrier b1{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b1.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        b1.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b1.image               = _vkBrdfLUT;
-        b1.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b1.srcAccessMask       = 0;
-        b1.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b1);
-
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        std::vector<VkDescriptorPoolSize> psz = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 } };
-        VkDescriptorSet ds = allocSet(pool, psz, brdfLutDSL);
-        tempPools.push_back(pool);
-
-        VkDescriptorImageInfo dstII{ VK_NULL_HANDLE, _vkBrdfLUTView, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet ws{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1,
-                                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstII, nullptr, nullptr };
-        vkUpdateDescriptorSets(dev, 1, &ws, 0, nullptr);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkBrdfLutPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _vkBrdfLutPipeLayout, 0, 1, &ds, 0, nullptr);
-        uint32_t g = (VK_BRDF_LUT_SIZE + 15) / 16;
-        vkCmdDispatch(cmd, g, g, 1);
-
-        // Transition BRDF LUT to SHADER_READ
-        VkImageMemoryBarrier b2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        b2.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
-        b2.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b2.image               = _vkBrdfLUT;
-        b2.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b2.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        b2.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &b2);
-
-        EndSingleTimeCommands(cmd);
-        if (_deviceLost) {
-            cleanupTemp();
-            vkDestroySampler(dev, linearSampler, nullptr);
-            LUNA_LOG_ERROR("VK IBL: device lost during Stage 4 (BRDF LUT)");
-            return false;
-        }
-        cleanupTemp();
-        LUNA_LOG_INFO("VK IBL: Stage 4 done (BRDF LUT)");
-    }
-
-    // Cleanup sampler
-    vkDestroySampler(dev, linearSampler, nullptr);
-
-    // Final GPU sync — ensure all IBL writes are visible before frame loop
-    VkResult idleRes = vkDeviceWaitIdle(dev);
-    if (idleRes == VK_ERROR_DEVICE_LOST) {
-        LUNA_LOG_ERROR("VK IBL: device lost during final sync");
-        _deviceLost = true;
-        return false;
-    }
-
-    LUNA_LOG_INFO("VK IBL: precompute done (envCube + irrCube + prefilterCube + brdfLUT)");
     return true;
 }
 
 // ===========================================================================
 // Phase 18B: Vulkan Motion Blur pass
-// Entry:  _hdrImage = SHADER_READ_ONLY_OPTIMAL (after deferred lighting)
-//         _depthImage = DEPTH_STENCIL_READ_ONLY_OPTIMAL (G-buffer writes depth, left readable)
-// Exit:   _mbImage = SHADER_READ_ONLY_OPTIMAL (ppRenderPass finalLayout)
 // ===========================================================================
 void VulkanBackend::DrawVKMotionBlurPass()
 {
@@ -6996,10 +5970,9 @@ void VulkanBackend::DrawVKMotionBlurPass()
 
     VkDevice        dev  = _device->GetDevice();
     VkCommandBuffer cmd  = _frames[_frameIndex].cmdBuffer;
-    uint32_t        W    = _swapchainExtent.width;
-    uint32_t        H    = _swapchainExtent.height;
+    uint32_t        W    = _vkSwapchain.GetExtent().width;
+    uint32_t        H    = _vkSwapchain.GetExtent().height;
 
-    // Build and upload MB constants
     XMMATRIX V   = XMLoadFloat4x4(&_deferredView);
     XMMATRIX P   = XMLoadFloat4x4(&_deferredProj);
     XMMATRIX VP  = XMMatrixMultiply(V, P);
@@ -7014,11 +5987,9 @@ void VulkanBackend::DrawVKMotionBlurPass()
     cb.numSamples   = 8;
     memcpy(_vkMBCBMapped[_frameIndex], &cb, sizeof(cb));
 
-    // Store current VP for next frame
     XMFLOAT4X4 vpF; XMStoreFloat4x4(&vpF, VP);
     _vkMBLastVP = vpF;
 
-    // Begin render pass targeting _mbFB (ppRenderPass: UNDEFINED?�SHADER_READ_ONLY)
     VkClearValue cv{}; cv.color = { {0,0,0,1} };
     VkRenderPassBeginInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpi.renderPass        = _ppRenderPass;
@@ -7039,25 +6010,22 @@ void VulkanBackend::DrawVKMotionBlurPass()
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
     vkCmdEndRenderPass(cmd);
-    // _mbImage is now SHADER_READ_ONLY_OPTIMAL (ppRenderPass finalLayout)
 }
 
 // ===========================================================================
-// Phase 18D: Vulkan Ray Tracing ??stubs (full implementation guarded by _rtSupported)
+// Phase 18D: Vulkan Ray Tracing
 // ===========================================================================
 bool VulkanBackend::BuildAccelerationStructures()
 {
     if (!_rtSupported || _meshASInfoCache.empty() || !_mergedVB || !_mergedIB) return false;
     VkDevice dev = _device->GetDevice();
 
-    // Helper: buffer device address
     auto getAddr = [&](VkBuffer buf) -> VkDeviceAddress {
         VkBufferDeviceAddressInfo i{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
         i.buffer = buf;
         return vkGetBufferDeviceAddress(dev, &i);
     };
 
-    // Helper: allocate AS-backing or scratch buffer (DEVICE_LOCAL + SHADER_DEVICE_ADDRESS)
     auto makeASBuf = [&](VkDeviceSize sz, VkBufferUsageFlags extra, VkBuffer& b, VkDeviceMemory& m) {
         return CreateBuffer(sz,
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
@@ -7068,7 +6036,6 @@ bool VulkanBackend::BuildAccelerationStructures()
     VkDeviceAddress vbAddr = getAddr(_mergedVB);
     VkDeviceAddress ibAddr = getAddr(_mergedIB);
 
-    // ?�?� Build one BLAS per mesh ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
     _vkBLASes.clear();
     _vkBLASes.reserve(_meshASInfoCache.size());
 
@@ -7078,8 +6045,8 @@ bool VulkanBackend::BuildAccelerationStructures()
 
         VkAccelerationStructureGeometryTrianglesDataKHR tris{};
         tris.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-        tris.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;               // position at byte offset 0
-        tris.vertexData.deviceAddress = vbAddr + (VkDeviceSize)info.vertexOffset * 48u; // sizeof(PBRVertex)=48
+        tris.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tris.vertexData.deviceAddress = vbAddr + (VkDeviceSize)info.vertexOffset * 48u;
         tris.vertexStride = 48u;
         tris.maxVertex    = info.vertexCount - 1;
         tris.indexType    = VK_INDEX_TYPE_UINT32;
@@ -7131,7 +6098,6 @@ bool VulkanBackend::BuildAccelerationStructures()
 
         VkCommandBuffer blasCmd = BeginSingleTimeCommands();
         pfn_vkCmdBuildAccelerationStructuresKHR(blasCmd, 1, &buildInfo, &pRange);
-        // Memory barrier: BLAS write must complete before TLAS build reads it
         VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
         mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
@@ -7141,7 +6107,6 @@ bool VulkanBackend::BuildAccelerationStructures()
             0, 1, &mb, 0, nullptr, 0, nullptr);
         EndSingleTimeCommands(blasCmd);
 
-        // Check for device lost during BLAS build
         if (_deviceLost) {
             vkDestroyBuffer(dev, scratchBuf, nullptr);
             vkFreeMemory(dev, scratchMem, nullptr);
@@ -7151,11 +6116,10 @@ bool VulkanBackend::BuildAccelerationStructures()
 
         vkDestroyBuffer(dev, scratchBuf, nullptr);
         vkFreeMemory(dev, scratchMem, nullptr);
-
         _vkBLASes.push_back(blas);
     }
 
-    // ?�?� Build TLAS (one instance per BLAS, identity transform) ?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    // Build TLAS
     std::vector<VkAccelerationStructureInstanceKHR> instances(_vkBLASes.size());
     for (size_t i = 0; i < _vkBLASes.size(); i++)
     {
@@ -7164,7 +6128,6 @@ bool VulkanBackend::BuildAccelerationStructures()
         addrInfo.accelerationStructure = _vkBLASes[i].as;
 
         VkAccelerationStructureInstanceKHR inst{};
-        // Identity transform (3×4 row-major: diagonal = 1, rest = 0)
         inst.transform.matrix[0][0] = inst.transform.matrix[1][1] = inst.transform.matrix[2][2] = 1.0f;
         inst.instanceCustomIndex    = (uint32_t)i;
         inst.mask                   = 0xFF;
@@ -7174,7 +6137,6 @@ bool VulkanBackend::BuildAccelerationStructures()
         instances[i] = inst;
     }
 
-    // Instance buffer (HOST_VISIBLE for simplicity ??static scene)
     VkDeviceSize instSize = instances.size() * sizeof(VkAccelerationStructureInstanceKHR);
     CreateBuffer(instSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
@@ -7232,7 +6194,6 @@ bool VulkanBackend::BuildAccelerationStructures()
     pfn_vkCmdBuildAccelerationStructuresKHR(tlasCmd, 1, &tlasBuild, &pTlasRange);
     EndSingleTimeCommands(tlasCmd);
 
-    // Check for device lost during TLAS build
     if (_deviceLost) {
         vkDestroyBuffer(dev, tlasScratch, nullptr);
         vkFreeMemory(dev, tlasScratchMem, nullptr);
@@ -7243,8 +6204,7 @@ bool VulkanBackend::BuildAccelerationStructures()
     vkDestroyBuffer(dev, tlasScratch, nullptr);
     vkFreeMemory(dev, tlasScratchMem, nullptr);
 
-    LUNA_LOG_INFO("VK RT: Built %zu BLAS(es) + TLAS (%u instances)",
-                  _vkBLASes.size(), instCount);
+    LUNA_LOG_INFO("VK RT: Built %zu BLAS(es) + TLAS (%u instances)", _vkBLASes.size(), instCount);
     return true;
 }
 
@@ -7269,16 +6229,14 @@ bool VulkanBackend::CreateRTPipeline()
 {
     if (!_rtSupported || _vkTLAS.as == VK_NULL_HANDLE) return false;
     VkDevice dev = _device->GetDevice();
-    uint32_t W = _swapchainExtent.width, H = _swapchainExtent.height;
+    uint32_t W = _vkSwapchain.GetExtent().width, H = _vkSwapchain.GetExtent().height;
 
-    // 1. Shadow mask image (R8_UNORM, STORAGE | SAMPLED, full-res)
     if (!CreateImage(W, H, VK_FORMAT_R8_UNORM, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vkShadowMaskImage, _vkShadowMaskMem))
         return false;
     _vkShadowMaskView = CreateImageView(_vkShadowMaskImage, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
 
-    // 2. Query RT pipeline properties for SBT layout
     auto getPhysProps2 = (PFN_vkGetPhysicalDeviceProperties2)
         vkGetInstanceProcAddr(_instance, "vkGetPhysicalDeviceProperties2");
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
@@ -7288,12 +6246,10 @@ bool VulkanBackend::CreateRTPipeline()
     devProps2.pNext = &rtProps;
     getPhysProps2(_device->GetPhysicalDevice(), &devProps2);
 
-    const uint32_t handleSize  = rtProps.shaderGroupHandleSize;       // typically 32
-    const uint32_t baseAlign   = rtProps.shaderGroupBaseAlignment;    // typically 64
-    // Each SBT entry occupies one baseAlign-aligned slot
+    const uint32_t handleSize  = rtProps.shaderGroupHandleSize;
+    const uint32_t baseAlign   = rtProps.shaderGroupBaseAlignment;
     const uint32_t entryStride = baseAlign;
 
-    // 3. DSL: binding 0=TLAS, 1=STORAGE_IMAGE, 2=COMBINED_IMAGE_SAMPLER(depth), 3=COMBINED_IMAGE_SAMPLER(normal), 4=UBO
     {
         VkDescriptorSetLayoutBinding bs[5]{};
         bs[0] = { 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,  1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
@@ -7306,12 +6262,10 @@ bool VulkanBackend::CreateRTPipeline()
         vkCreateDescriptorSetLayout(dev, &li, nullptr, &_vkRTLayout);
     }
 
-    // 4. Pipeline layout
     VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pli.setLayoutCount = 1; pli.pSetLayouts = &_vkRTLayout;
     vkCreatePipelineLayout(dev, &pli, nullptr, &_vkRTPipeLayout);
 
-    // 5. Descriptor pool + per-frame sets
     VkDescriptorPoolSize psizes[] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, FRAMES_IN_FLIGHT },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              FRAMES_IN_FLIGHT },
@@ -7324,7 +6278,6 @@ bool VulkanBackend::CreateRTPipeline()
     dpi.maxSets       = FRAMES_IN_FLIGHT;
     vkCreateDescriptorPool(dev, &dpi, nullptr, &_vkRTDescPool);
 
-    // 6. Per-frame RT scene UBOs (256B) + descriptor sets
     struct RTSceneUBO { float invViewProj[16]; float lightDir[3]; float maxDist; float _pad[44]; };
     static_assert(sizeof(RTSceneUBO) == 256, "RTSceneUBO must be 256B");
 
@@ -7340,15 +6293,14 @@ bool VulkanBackend::CreateRTPipeline()
         dsai.pSetLayouts        = &_vkRTLayout;
         vkAllocateDescriptorSets(dev, &dsai, &_vkRTDescSet[i]);
 
-        // Write all bindings for this frame's set
         VkWriteDescriptorSetAccelerationStructureKHR asWrite{};
         asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
         asWrite.accelerationStructureCount = 1;
         asWrite.pAccelerationStructures    = &_vkTLAS.as;
 
         VkDescriptorImageInfo shadowII{ VK_NULL_HANDLE,        _vkShadowMaskView, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo depthII { _pointClampSampler,   _depthView,        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo normalII{ _pointClampSampler,   _gbNormalView,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo depthII { _pointClampSampler,   _vkSwapchain.GetDepthView(),        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo normalII{ _pointClampSampler,   _gBuffer.GetNormalView(),     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorBufferInfo uboBI  { _vkRTSceneCB[i], 0, 256 };
 
         VkWriteDescriptorSet ws[5]{};
@@ -7360,7 +6312,6 @@ bool VulkanBackend::CreateRTPipeline()
         vkUpdateDescriptorSets(dev, 5, ws, 0, nullptr);
     }
 
-    // 7. Compile RT shaders (lib_6_5 ??SPIR-V)
     std::vector<uint32_t> rgenSpv, rmissSpv, rchitSpv;
     if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"rt_shadows_vk.rgen.glsl").wstring(),  rgenSpv)  ||
         !CompileGLSLtoSPIRV(GetShaderFullPath(L"rt_shadows_vk.rmiss.glsl").wstring(), rmissSpv) ||
@@ -7381,7 +6332,6 @@ bool VulkanBackend::CreateRTPipeline()
     VkShaderModule rmissMod = mkMod(rmissSpv);
     VkShaderModule rchitMod = mkMod(rchitSpv);
 
-    // 8. RT pipeline: 3 stages + 3 groups (raygen, miss, chit)
     VkPipelineShaderStageCreateInfo stages[3]{};
     stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                   VK_SHADER_STAGE_RAYGEN_BIT_KHR,       rgenMod,  "main", nullptr };
@@ -7391,17 +6341,14 @@ bool VulkanBackend::CreateRTPipeline()
                   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,  rchitMod, "main", nullptr };
 
     VkRayTracingShaderGroupCreateInfoKHR groups[3]{};
-    // Group 0: raygen (GENERAL)
     groups[0].sType              = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
     groups[0].type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
     groups[0].generalShader      = 0;
     groups[0].closestHitShader   = VK_SHADER_UNUSED_KHR;
     groups[0].anyHitShader       = VK_SHADER_UNUSED_KHR;
     groups[0].intersectionShader = VK_SHADER_UNUSED_KHR;
-    // Group 1: miss (GENERAL)
     groups[1] = groups[0];
     groups[1].generalShader = 1;
-    // Group 2: closest hit (TRIANGLES_HIT_GROUP)
     groups[2].sType              = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
     groups[2].type               = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
     groups[2].generalShader      = VK_SHADER_UNUSED_KHR;
@@ -7429,7 +6376,6 @@ bool VulkanBackend::CreateRTPipeline()
     vkDestroyShaderModule(dev, rmissMod, nullptr);
     vkDestroyShaderModule(dev, rchitMod, nullptr);
 
-    // 9. Shader Binding Table (SBT)
     VkDeviceSize sbtSize = 3 * entryStride;
     CreateBuffer(sbtSize,
         VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -7455,7 +6401,6 @@ bool VulkanBackend::CreateRTPipeline()
     _vkHitRegion  = { sbtAddr + 2 * entryStride, entryStride, entryStride };
     _vkCallRegion = {};
 
-    // Update the deferred G-buffer descriptor set (binding 13 = shadow mask)
     UpdateDeferredGbufDescriptors();
 
     LUNA_LOG_INFO("VK RT: pipeline + SBT created (handle=%uB, entry=%uB)", handleSize, entryStride);
@@ -7485,46 +6430,282 @@ void VulkanBackend::DestroyRTPipeline()
     _vkRgenRegion = _vkMissRegion = _vkHitRegion = _vkCallRegion = {};
 }
 
-void VulkanBackend::DestroyIBLResources()
+// ===========================================================================
+// Phase 24: Clustered Lighting
+// ===========================================================================
+bool VulkanBackend::CreateClusteredLightingResources()
 {
     VkDevice dev = _device->GetDevice();
-    _iblReady = false;
 
-    if (_vkBrdfLutPipeline)      { vkDestroyPipeline(dev, _vkBrdfLutPipeline, nullptr);          _vkBrdfLutPipeline     = VK_NULL_HANDLE; }
-    if (_vkBrdfLutPipeLayout)    { vkDestroyPipelineLayout(dev, _vkBrdfLutPipeLayout, nullptr);   _vkBrdfLutPipeLayout   = VK_NULL_HANDLE; }
-    if (_vkBrdfLutDSL)           { vkDestroyDescriptorSetLayout(dev, _vkBrdfLutDSL, nullptr);     _vkBrdfLutDSL          = VK_NULL_HANDLE; }
-    if (_vkPrefilterPipeline)    { vkDestroyPipeline(dev, _vkPrefilterPipeline, nullptr);         _vkPrefilterPipeline   = VK_NULL_HANDLE; }
-    if (_vkPrefilterPipeLayout)  { vkDestroyPipelineLayout(dev, _vkPrefilterPipeLayout, nullptr); _vkPrefilterPipeLayout = VK_NULL_HANDLE; }
-    if (_vkPrefilterDSL)         { vkDestroyDescriptorSetLayout(dev, _vkPrefilterDSL, nullptr);   _vkPrefilterDSL        = VK_NULL_HANDLE; }
-    if (_vkIrrConvPipeline)      { vkDestroyPipeline(dev, _vkIrrConvPipeline, nullptr);           _vkIrrConvPipeline     = VK_NULL_HANDLE; }
-    if (_vkIrrConvPipeLayout)    { vkDestroyPipelineLayout(dev, _vkIrrConvPipeLayout, nullptr);   _vkIrrConvPipeLayout   = VK_NULL_HANDLE; }
-    if (_vkIrrConvDSL)           { vkDestroyDescriptorSetLayout(dev, _vkIrrConvDSL, nullptr);     _vkIrrConvDSL          = VK_NULL_HANDLE; }
-    if (_vkEquirectPipeline)     { vkDestroyPipeline(dev, _vkEquirectPipeline, nullptr);          _vkEquirectPipeline    = VK_NULL_HANDLE; }
-    if (_vkEquirectPipeLayout)   { vkDestroyPipelineLayout(dev, _vkEquirectPipeLayout, nullptr);  _vkEquirectPipeLayout  = VK_NULL_HANDLE; }
-    if (_vkEquirectDSL)          { vkDestroyDescriptorSetLayout(dev, _vkEquirectDSL, nullptr);    _vkEquirectDSL         = VK_NULL_HANDLE; }
+    // ── SSBOs ──
+    VkDeviceSize lightSSBOSize   = MAX_POINT_LIGHTS * sizeof(GPUPointLight);       // 32 KB
+    VkDeviceSize countsSize      = CLUSTER_COUNT * sizeof(uint32_t);                // ~14 KB
+    VkDeviceSize indicesSize     = CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER * sizeof(uint32_t);  // ~1.7 MB
 
-    if (_vkIBLSampler)           { vkDestroySampler(dev, _vkIBLSampler, nullptr);                 _vkIBLSampler  = VK_NULL_HANDLE; }
-    if (_vkBrdfSampler)          { vkDestroySampler(dev, _vkBrdfSampler, nullptr);                _vkBrdfSampler = VK_NULL_HANDLE; }
+    // Light SSBO (host-visible for CPU upload)
+    if (!CreateBuffer(lightSSBOSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            _lightSSBO, _lightSSBOMem))
+        return false;
+    vkMapMemory(dev, _lightSSBOMem, 0, lightSSBOSize, 0, &_lightSSBOMapped);
 
-    if (_vkBrdfLUTView)          { vkDestroyImageView(dev, _vkBrdfLUTView, nullptr);              _vkBrdfLUTView = VK_NULL_HANDLE; }
-    if (_vkBrdfLUT)              { vkDestroyImage(dev, _vkBrdfLUT, nullptr);                      _vkBrdfLUT     = VK_NULL_HANDLE; }
-    if (_vkBrdfLUTMem)           { vkFreeMemory(dev, _vkBrdfLUTMem, nullptr);                     _vkBrdfLUTMem  = VK_NULL_HANDLE; }
+    // Cluster counts SSBO (device-local, written by compute, read by fragment)
+    if (!CreateBuffer(countsSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            _clusterCountsSSBO, _clusterCountsSSBOMem))
+        return false;
 
-    for (uint32_t m = 0; m < VK_PREFILTER_MIP_COUNT; m++)
-        if (_vkPrefilterMipView[m]) { vkDestroyImageView(dev, _vkPrefilterMipView[m], nullptr); _vkPrefilterMipView[m] = VK_NULL_HANDLE; }
-    if (_vkPrefilterCubemapView) { vkDestroyImageView(dev, _vkPrefilterCubemapView, nullptr); _vkPrefilterCubemapView = VK_NULL_HANDLE; }
-    if (_vkPrefilterCubemap)     { vkDestroyImage(dev, _vkPrefilterCubemap, nullptr);         _vkPrefilterCubemap     = VK_NULL_HANDLE; }
-    if (_vkPrefilterCubemapMem)  { vkFreeMemory(dev, _vkPrefilterCubemapMem, nullptr);        _vkPrefilterCubemapMem  = VK_NULL_HANDLE; }
+    // Cluster indices SSBO (device-local, written by compute, read by fragment)
+    if (!CreateBuffer(indicesSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            _clusterIndicesSSBO, _clusterIndicesSSBOMem))
+        return false;
 
-    if (_vkIrrCubemapArray)      { vkDestroyImageView(dev, _vkIrrCubemapArray, nullptr);   _vkIrrCubemapArray = VK_NULL_HANDLE; }
-    if (_vkIrrCubemapView)       { vkDestroyImageView(dev, _vkIrrCubemapView, nullptr);    _vkIrrCubemapView  = VK_NULL_HANDLE; }
-    if (_vkIrrCubemap)           { vkDestroyImage(dev, _vkIrrCubemap, nullptr);            _vkIrrCubemap      = VK_NULL_HANDLE; }
-    if (_vkIrrCubemapMem)        { vkFreeMemory(dev, _vkIrrCubemapMem, nullptr);           _vkIrrCubemapMem   = VK_NULL_HANDLE; }
+    // Cluster params UBO (host-visible)
+    if (!CreateBuffer(256,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            _clusterParamsCB, _clusterParamsCBMem))
+        return false;
+    vkMapMemory(dev, _clusterParamsCBMem, 0, 256, 0, &_clusterParamsCBMapped);
 
-    if (_vkEnvCubemapArray)      { vkDestroyImageView(dev, _vkEnvCubemapArray, nullptr);   _vkEnvCubemapArray = VK_NULL_HANDLE; }
-    if (_vkEnvCubemapView)       { vkDestroyImageView(dev, _vkEnvCubemapView, nullptr);    _vkEnvCubemapView  = VK_NULL_HANDLE; }
-    if (_vkEnvCubemap)           { vkDestroyImage(dev, _vkEnvCubemap, nullptr);            _vkEnvCubemap      = VK_NULL_HANDLE; }
-    if (_vkEnvCubemapMem)        { vkFreeMemory(dev, _vkEnvCubemapMem, nullptr);           _vkEnvCubemapMem   = VK_NULL_HANDLE; }
+    // ── Compute descriptor set layout (set=0: UBO, lights, counts, indices) ──
+    {
+        VkDescriptorSetLayoutBinding bs[4]{};
+        bs[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bs[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bs[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bs[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 4;
+        li.pBindings    = bs;
+        vkCreateDescriptorSetLayout(dev, &li, nullptr, &_clusterCompDescLayout);
+    }
+
+    // ── Fragment shader descriptor set layout (set=2: UBO, lights, counts, indices — read-only) ──
+    {
+        VkDescriptorSetLayoutBinding bs[4]{};
+        bs[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+        bs[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+        bs[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+        bs[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 4;
+        li.pBindings    = bs;
+        vkCreateDescriptorSetLayout(dev, &li, nullptr, &_clusterLightLayout);
+    }
+
+    // ── Compute pipeline layout ──
+    {
+        VkPipelineLayoutCreateInfo pli{};
+        pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts    = &_clusterCompDescLayout;
+        vkCreatePipelineLayout(dev, &pli, nullptr, &_clusterCompPipeLayout);
+    }
+
+    // ── Descriptor pool (1 compute set + 1 fragment set) ──
+    {
+        VkDescriptorPoolSize dsz[] = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  2 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  6 },
+        };
+        VkDescriptorPoolCreateInfo dpi{};
+        dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.poolSizeCount = (uint32_t)std::size(dsz);
+        dpi.pPoolSizes    = dsz;
+        dpi.maxSets       = 2;
+        vkCreateDescriptorPool(dev, &dpi, nullptr, &_clusterCompDescPool);
+    }
+
+    // ── Allocate compute descriptor set ──
+    {
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool     = _clusterCompDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts        = &_clusterCompDescLayout;
+        vkAllocateDescriptorSets(dev, &dsai, &_clusterCompDescSet);
+    }
+
+    // ── Allocate fragment descriptor set (set=2) ──
+    {
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool     = _clusterCompDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts        = &_clusterLightLayout;
+        vkAllocateDescriptorSets(dev, &dsai, &_clusterLightDescSet);
+    }
+
+    // ── Write descriptors (both sets use the same buffers) ──
+    auto writeDescs = [&](VkDescriptorSet dset) {
+        VkDescriptorBufferInfo uboInfo  { _clusterParamsCB,     0, sizeof(ClusterParamsUBO) };
+        VkDescriptorBufferInfo lightInfo{ _lightSSBO,           0, MAX_POINT_LIGHTS * sizeof(GPUPointLight) };
+        VkDescriptorBufferInfo countInfo{ _clusterCountsSSBO,   0, CLUSTER_COUNT * sizeof(uint32_t) };
+        VkDescriptorBufferInfo idxInfo  { _clusterIndicesSSBO,  0, CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER * sizeof(uint32_t) };
+
+        VkWriteDescriptorSet w[4]{};
+        for (int i = 0; i < 4; i++) {
+            w[i].sType      = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet     = dset;
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+        }
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;  w[0].pBufferInfo = &uboInfo;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;  w[1].pBufferInfo = &lightInfo;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;  w[2].pBufferInfo = &countInfo;
+        w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;  w[3].pBufferInfo = &idxInfo;
+
+        vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
+    };
+
+    writeDescs(_clusterCompDescSet);
+    writeDescs(_clusterLightDescSet);
+
+    // ── Compile compute shader + create pipeline ──
+    std::vector<uint32_t> compSpv;
+    if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"cluster_assign_vk.comp.glsl").wstring(), compSpv))
+    {
+        LUNA_LOG_WARN("VK: Cluster assign shader compile failed — clustered lighting disabled");
+        return false;
+    }
+
+    VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smi.codeSize = compSpv.size() * 4;
+    smi.pCode    = compSpv.data();
+    VkShaderModule csm = VK_NULL_HANDLE;
+    vkCreateShaderModule(dev, &smi, nullptr, &csm);
+
+    VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = csm;
+    cpi.stage.pName  = "main";
+    cpi.layout       = _clusterCompPipeLayout;
+    vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &_clusterCompPipeline);
+    vkDestroyShaderModule(dev, csm, nullptr);
+
+    if (!_clusterCompPipeline) {
+        LUNA_LOG_WARN("VK: Cluster compute pipeline creation failed");
+        return false;
+    }
+
+    _clusteredLightingReady = true;
+    LUNA_LOG_INFO("VK: Phase 24 clustered lighting ready (%ux%ux%u clusters, max %u lights)",
+                  CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_POINT_LIGHTS);
+    return true;
+}
+
+void VulkanBackend::DestroyClusteredLightingResources()
+{
+    _clusteredLightingReady = false;
+    VkDevice dev = _device->GetDevice();
+
+    if (_clusterCompPipeline)   { vkDestroyPipeline(dev, _clusterCompPipeline, nullptr);              _clusterCompPipeline   = VK_NULL_HANDLE; }
+    if (_clusterCompPipeLayout) { vkDestroyPipelineLayout(dev, _clusterCompPipeLayout, nullptr);      _clusterCompPipeLayout = VK_NULL_HANDLE; }
+    if (_clusterCompDescLayout) { vkDestroyDescriptorSetLayout(dev, _clusterCompDescLayout, nullptr); _clusterCompDescLayout = VK_NULL_HANDLE; }
+    if (_clusterLightLayout)    { vkDestroyDescriptorSetLayout(dev, _clusterLightLayout, nullptr);    _clusterLightLayout    = VK_NULL_HANDLE; }
+    if (_clusterCompDescPool)   { vkDestroyDescriptorPool(dev, _clusterCompDescPool, nullptr);        _clusterCompDescPool   = VK_NULL_HANDLE; }
+    _clusterCompDescSet   = VK_NULL_HANDLE;
+    _clusterLightDescSet  = VK_NULL_HANDLE;
+
+    if (_lightSSBOMapped) { vkUnmapMemory(dev, _lightSSBOMem); _lightSSBOMapped = nullptr; }
+    if (_lightSSBO)       { vkDestroyBuffer(dev, _lightSSBO, nullptr);       _lightSSBO       = VK_NULL_HANDLE; }
+    if (_lightSSBOMem)    { vkFreeMemory(dev, _lightSSBOMem, nullptr);       _lightSSBOMem    = VK_NULL_HANDLE; }
+
+    if (_clusterCountsSSBO)    { vkDestroyBuffer(dev, _clusterCountsSSBO, nullptr);    _clusterCountsSSBO    = VK_NULL_HANDLE; }
+    if (_clusterCountsSSBOMem) { vkFreeMemory(dev, _clusterCountsSSBOMem, nullptr);    _clusterCountsSSBOMem = VK_NULL_HANDLE; }
+    if (_clusterIndicesSSBO)    { vkDestroyBuffer(dev, _clusterIndicesSSBO, nullptr);   _clusterIndicesSSBO    = VK_NULL_HANDLE; }
+    if (_clusterIndicesSSBOMem) { vkFreeMemory(dev, _clusterIndicesSSBOMem, nullptr);   _clusterIndicesSSBOMem = VK_NULL_HANDLE; }
+    if (_clusterParamsCBMapped) { vkUnmapMemory(dev, _clusterParamsCBMem); _clusterParamsCBMapped = nullptr; }
+    if (_clusterParamsCB)     { vkDestroyBuffer(dev, _clusterParamsCB, nullptr);       _clusterParamsCB     = VK_NULL_HANDLE; }
+    if (_clusterParamsCBMem)  { vkFreeMemory(dev, _clusterParamsCBMem, nullptr);       _clusterParamsCBMem  = VK_NULL_HANDLE; }
+}
+
+void VulkanBackend::DispatchClusterAssign(VkCommandBuffer cmd)
+{
+    if (!_clusteredLightingReady || _pointLights.empty()) return;
+
+    // Upload light data (transform to view space)
+    XMMATRIX V = XMLoadFloat4x4(&_deferredView);
+    uint32_t numLights = (uint32_t)std::min((size_t)MAX_POINT_LIGHTS, _pointLights.size());
+
+    std::vector<GPUPointLight> viewSpaceLights(numLights);
+    for (uint32_t i = 0; i < numLights; i++) {
+        const auto& l = _pointLights[i];
+        XMVECTOR posWS = XMVectorSet(l.position[0], l.position[1], l.position[2], 1.0f);
+        XMVECTOR posVS = XMVector4Transform(posWS, V);
+        XMFLOAT4 vs; XMStoreFloat4(&vs, posVS);
+        viewSpaceLights[i].position[0] = vs.x;
+        viewSpaceLights[i].position[1] = vs.y;
+        viewSpaceLights[i].position[2] = vs.z;
+        viewSpaceLights[i].radius    = l.radius;
+        viewSpaceLights[i].color[0]  = l.color[0];
+        viewSpaceLights[i].color[1]  = l.color[1];
+        viewSpaceLights[i].color[2]  = l.color[2];
+        viewSpaceLights[i].intensity = l.intensity;
+    }
+    memcpy(_lightSSBOMapped, viewSpaceLights.data(), numLights * sizeof(GPUPointLight));
+
+    // Update cluster params UBO
+    {
+        XMMATRIX P = XMLoadFloat4x4(&_deferredProj);
+        XMMATRIX iP = XMMatrixInverse(nullptr, P);
+        XMFLOAT4X4 iPF; XMStoreFloat4x4(&iPF, iP);
+
+        ClusterParamsUBO cp{};
+        memcpy(cp.invProj, &iPF, 64);
+        cp.nearZ    = 0.1f;
+        cp.farZ     = 100.0f;
+        cp.screenW  = (float)_vkSwapchain.GetExtent().width;
+        cp.screenH  = (float)_vkSwapchain.GetExtent().height;
+        cp.numLights = numLights;
+        memcpy(_clusterParamsCBMapped, &cp, sizeof(cp));
+    }
+
+    // Clear cluster counts
+    vkCmdFillBuffer(cmd, _clusterCountsSSBO, 0, CLUSTER_COUNT * sizeof(uint32_t), 0);
+
+    // Barrier: fill → compute read/write
+    VkBufferMemoryBarrier clearBarrier{};
+    clearBarrier.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    clearBarrier.buffer        = _clusterCountsSSBO;
+    clearBarrier.offset        = 0;
+    clearBarrier.size          = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &clearBarrier, 0, nullptr);
+
+    // Bind + dispatch
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _clusterCompPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             _clusterCompPipeLayout, 0, 1, &_clusterCompDescSet, 0, nullptr);
+    vkCmdDispatch(cmd, CLUSTER_X, CLUSTER_Y, CLUSTER_Z);
+
+    // Barrier: compute write → fragment read
+    VkBufferMemoryBarrier readBarriers[2]{};
+    for (int i = 0; i < 2; i++) {
+        readBarriers[i].sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        readBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        readBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        readBarriers[i].offset        = 0;
+        readBarriers[i].size          = VK_WHOLE_SIZE;
+    }
+    readBarriers[0].buffer = _clusterCountsSSBO;
+    readBarriers[1].buffer = _clusterIndicesSSBO;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 2, readBarriers, 0, nullptr);
 }
 
 } // namespace Luna

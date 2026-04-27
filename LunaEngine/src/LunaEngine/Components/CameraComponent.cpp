@@ -12,6 +12,7 @@ CameraComponent::CameraComponent()
     , _nearZ(0.1f)
     , _farZ(500.0f)
 {
+    // Default: 30° elevation, looking down at target from above-behind.
     XMVECTOR q = XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0), XMConvertToRadians(-30.0f));
     XMStoreFloat4(&_orientation, XMQuaternionNormalize(q));
 }
@@ -20,10 +21,12 @@ void CameraComponent::Orbit(float dYaw, float dPitch)
 {
     XMVECTOR q = XMLoadFloat4(&_orientation);
 
+    // Yaw around world Y (vertical axis in Y-up)
     XMVECTOR qYaw = XMQuaternionRotationAxis(
         XMVectorSet(0, 1, 0, 0), XMConvertToRadians(dYaw));
     q = XMQuaternionMultiply(qYaw, q);
 
+    // Pitch around camera's local right (X)
     XMVECTOR right = XMVector3Rotate(XMVectorSet(1, 0, 0, 0), q);
     XMVECTOR qPitch = XMQuaternionRotationAxis(right, XMConvertToRadians(-dPitch));
     q = XMQuaternionNormalize(XMQuaternionMultiply(qPitch, q));

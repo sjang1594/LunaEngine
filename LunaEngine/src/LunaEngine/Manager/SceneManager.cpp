@@ -16,6 +16,7 @@
 namespace Luna
 {
 
+// Out-of-line definition required for the static singleton pointer
 SceneManager* SceneManager::_instance = nullptr;
 
 void SceneManager::Update()
@@ -37,6 +38,7 @@ shared_ptr<Scene> SceneManager::LoadTestScene()
 {
     auto scene = make_shared<Scene>();
 
+    // Load glTF meshes via the active backend (polymorphic call via IRenderBackend)
     auto* backend = IRenderContext::GetBackend();
     if (!backend)
     {
@@ -53,6 +55,7 @@ shared_ptr<Scene> SceneManager::LoadTestScene()
     auto meshes = backend->LoadMeshes(assetPath);
 #endif
 
+    // Phase 14: load HDR environment for IBL
     std::string hdrPath = GetAssetPath("Assets/environment.hdr").string();
     if (backend->LoadHDREnvironment(hdrPath))
         LUNA_LOG_INFO("IBL environment loaded");
@@ -68,6 +71,7 @@ shared_ptr<Scene> SceneManager::LoadTestScene()
 #endif
     }
 
+    // Phase 21: retrieve per-mesh transforms from the backend (if available)
     auto transforms = backend->GetLastLoadTransforms();
 
     for (size_t i = 0; i < meshes.size(); ++i)
@@ -75,6 +79,7 @@ shared_ptr<Scene> SceneManager::LoadTestScene()
         auto go = make_shared<GameObject>();
         go->Init();
 
+        // Apply per-mesh transform from glTF node hierarchy
         if (i < transforms.size())
         {
             auto transform = go->GetTransform();
@@ -91,18 +96,23 @@ shared_ptr<Scene> SceneManager::LoadTestScene()
 
     LUNA_LOG_INFO("LoadTestScene: created %zu game objects", meshes.size());
 
+    // --- Main Camera (Isaac Sim-style: camera as scene object) ---
     {
         auto camGO = make_shared<GameObject>();
         camGO->Init();
-        camGO->AddComponent(make_shared<CameraComponent>());
+        auto cam = make_shared<CameraComponent>();
+        camGO->AddComponent(cam);
         scene->AddGameObject(camGO);
         LUNA_LOG_INFO("Scene: added Main Camera");
     }
 
+    // --- Directional Light (scene object, replaces hardcoded light dir) ---
     {
         auto lightGO = make_shared<GameObject>();
         lightGO->Init();
-        lightGO->AddComponent(make_shared<LightComponent>());
+        auto light = make_shared<LightComponent>();
+        // Default direction = normalize(1,2,1), same as old hardcoded value
+        lightGO->AddComponent(light);
         scene->AddGameObject(lightGO);
         LUNA_LOG_INFO("Scene: added Directional Light");
     }
@@ -121,6 +131,7 @@ void SceneManager::LoadSceneFromFile(const std::string& absolutePath)
 
     LUNA_LOG_INFO("Importing scene: %s", absolutePath.c_str());
 
+    // Reset current scene (releases GPU resources while backend is alive)
     if (_activeScene)
         _activeScene.reset();
 
@@ -159,6 +170,7 @@ void SceneManager::LoadSceneFromFile(const std::string& absolutePath)
     _activeScene->Awake();
     _activeScene->Start();
 
+    // Add Camera + Light to imported scenes too
     {
         auto camGO = make_shared<GameObject>();
         camGO->Init();

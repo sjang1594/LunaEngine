@@ -10,7 +10,7 @@ namespace Luna
 {
 using namespace DirectX;  // scoped to Luna — avoids polluting global namespace
 struct Mesh;  // defined in Renderer/Mesh.h — forward-declared to avoid pulling in D3D12MA here
-class IGPUProfiler;
+class IGPUProfiler;  // Phase 22: GPU profiler interface
 
 class IRenderBackend
 {
@@ -50,17 +50,34 @@ class IRenderBackend
     /* Load meshes from a glTF file — backend-specific implementation */
     virtual std::vector<std::shared_ptr<Mesh>> LoadMeshes(const std::string& path) { return {}; }
 
+    /* Phase 21: retrieve per-mesh transforms from the last LoadMeshes() call */
     virtual std::vector<XMFLOAT4X4> GetLastLoadTransforms() const { return {}; }
+
+    /* Debug: load a procedural flat quad instead of a glTF file */
     virtual std::vector<std::shared_ptr<Mesh>> LoadDebugQuad() { return {}; }
+
+    /* VSync toggle — P2-04 */
     virtual void SetVSync(bool vsync) {}
 
-    /* FlushDraws: upload instances, dispatch GPU cull, execute indirect draws.
-       Must be called after all DrawMesh() calls and before CompositeFrame(). */
+    /* Phase 12: Flush recorded DrawMesh() calls — upload instances, dispatch GPU cull, execute indirect draws.
+       Called after all DrawMesh() calls and before CompositeFrame(). */
     virtual void FlushDraws() {}
 
+    /* Phase 7: Deferred composite — reads G-buffer, runs lighting, writes back buffer */
     virtual void CompositeFrame() {}
+
+    /* Phase 14: IBL — load equirectangular HDR and run GPU precompute. */
     virtual bool LoadHDREnvironment(const std::string& /*hdrPath*/) { return false; }
+
+    /* Phase 22: Get GPU profiler interface for timing queries */
     virtual IGPUProfiler* GetGPUProfiler() { return nullptr; }
+
+    /* Phase 24: Point light data for clustered lighting */
+    struct PointLightDesc {
+        float position[3]; float radius;
+        float color[3];    float intensity;
+    };
+    virtual void SetPointLights(const std::vector<PointLightDesc>& /*lights*/) {}
 
     virtual const char *GetBackendName() const = 0;
 };

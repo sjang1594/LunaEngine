@@ -7,6 +7,7 @@ class MeshRenderer;
 
 namespace Luna
 {
+// UNITY Style
 class GameObject : public std::enable_shared_from_this<GameObject>
 {
 public:

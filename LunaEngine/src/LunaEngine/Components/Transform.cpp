@@ -9,6 +9,7 @@ Transform::~Transform() {}
 
 XMMATRIX Transform::GetWorldMatrix() const
 {
+    // Phase 21: raw matrix override for glTF node transforms
     if (useRawMatrix)
         return XMLoadFloat4x4(&rawMatrix);
 

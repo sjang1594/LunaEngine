@@ -17,6 +17,10 @@
 //   set=1, binding=11 — gBrdfLUT   (BRDF split-sum, texture2D)
 //   set=1, binding=12 — gEnvSampler (trilinear clamp)
 //   set=1, binding=13 — rtShadowTex (texture2D, R8_UNORM — PARTIALLY_BOUND when RT disabled)
+//   set=2, binding=0  — ClusterParams (UBO)
+//   set=2, binding=1  — GPUPointLight[] (SSBO)
+//   set=2, binding=2  — clusterLightCounts (SSBO)
+//   set=2, binding=3  — clusterLightIndices (SSBO)
 #version 460
 
 layout(location = 0) in vec2 inUV;
@@ -30,7 +34,7 @@ layout(set = 0, binding = 0, std140) uniform DeferredSceneBuffer {
     layout(row_major) mat4 viewMatrix;
     layout(row_major) mat4 lightVP[4];
     vec4  cascadeSplits;
-    uint  rtEnabled;    uvec3 _pad2;
+    uint  rtEnabled;    uint numPointLights; uvec2 _pad2;
 };
 
 layout(set = 1, binding = 0)  uniform texture2D      gbuffer0;
@@ -48,12 +52,49 @@ layout(set = 1, binding = 11) uniform texture2D      gBrdfLUT;
 layout(set = 1, binding = 12) uniform sampler        gEnvSampler;
 layout(set = 1, binding = 13) uniform texture2D      rtShadowTex;
 
+// Phase 24: Clustered lighting data (set=2)
+const uint CLUSTER_X = 16u;
+const uint CLUSTER_Y = 9u;
+const uint CLUSTER_Z = 24u;
+const uint MAX_LIGHTS_PER_CLUSTER = 128u;
+
+struct GPUPointLight {
+    vec3  position;   // view-space
+    float radius;
+    vec3  color;
+    float intensity;
+};
+
+layout(std140, set = 2, binding = 0) uniform ClusterParams {
+    layout(row_major) mat4 clusterInvProj;
+    float clusterNearZ;
+    float clusterFarZ;
+    float clusterScreenW;
+    float clusterScreenH;
+    uint  clusterNumLights;
+    uint  _clPad[3];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer LightBuffer {
+    GPUPointLight pointLights[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer ClusterCounts {
+    uint clusterLightCount[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer ClusterIndices {
+    uint clusterLightIndex[];
+};
+
 // G-buffer debug visualization:
 //   0 = normal lit output
 //   1 = albedo (sRGB-encoded, as stored in G-buffer)
 //   2 = world-space normal (encoded [0,1])
 //   3 = metallic (R) + roughness (G)
 //   4 = SSAO only
+//   5 = depth raw value (for diagnostics)
+//   99 = magenta debug (test if pass executes)
 #define DEBUG_GBUFFER 0
 
 const float PI               = 3.14159265359;
@@ -146,6 +187,7 @@ void main()
     vec2  uv    = inUV;
     float depth = texture(sampler2D(depthTex, pointSampler), uv).r;
 
+
     if (depth >= 1.0)
     {
         // Environment mapping removed — gradient background same as non-IBL path
@@ -200,6 +242,63 @@ void main()
     float ao  = texture(sampler2D(ssaoBlurTex, bilinearClamp), uv).r;
     vec3  Lo  = (diffuse + specular) * radiance * NdL * shadow;
 
+    // Phase 24: Clustered point light accumulation
+    if (numPointLights > 0u)
+    {
+        // Determine cluster index from screen position + view-space depth
+        float logRatio = log(clusterFarZ / clusterNearZ);
+        uint cx = uint(uv.x * float(CLUSTER_X));
+        uint cy = uint(uv.y * float(CLUSTER_Y));
+        uint cz = uint(log(viewZ / clusterNearZ) / logRatio * float(CLUSTER_Z));
+        cx = min(cx, CLUSTER_X - 1u);
+        cy = min(cy, CLUSTER_Y - 1u);
+        cz = min(cz, CLUSTER_Z - 1u);
+
+        uint clusterIdx = cx + cy * CLUSTER_X + cz * CLUSTER_X * CLUSTER_Y;
+        uint lightCount = clusterLightCount[clusterIdx];
+        uint baseIdx    = clusterIdx * MAX_LIGHTS_PER_CLUSTER;
+
+        for (uint li = 0u; li < lightCount; ++li)
+        {
+            uint lightIdx = clusterLightIndex[baseIdx + li];
+            GPUPointLight pl = pointLights[lightIdx];
+
+            // Light is in view space — compute direction and attenuation
+            vec3 Lpl = pl.position - posVS.xyz;
+            float dist = length(Lpl);
+            if (dist >= pl.radius) continue;
+            Lpl /= dist;
+
+            float attenuation = 1.0 / (dist * dist + 0.01);
+            // Smooth radius falloff
+            float falloff = 1.0 - smoothstep(0.8 * pl.radius, pl.radius, dist);
+            attenuation *= falloff;
+
+            // Transform light direction to world space for BRDF (N, V are world-space)
+            // posVS = posWS * viewMatrix  →  Lpl_ws = inverse(viewMatrix) * Lpl_vs
+            // Since viewMatrix is row-major in UBO, transpose to get column-major for GLSL
+            vec3 LplWS = normalize(mat3(
+                viewMatrix[0].xyz,
+                viewMatrix[1].xyz,
+                viewMatrix[2].xyz
+            ) * Lpl);  // row-major mat3 * vec = transpose(col-major) * vec
+
+            vec3 Hpl = normalize(V + LplWS);
+
+            float Dpl = D_GGX(N, Hpl, roughness);
+            float Gpl = G_Smith(N, V, LplWS, roughness);
+            vec3  Fpl = F_Schlick(max(dot(Hpl, V), 0.0), F0);
+            vec3  specPl = (Dpl * Gpl * Fpl) / max(4.0 * dot(N, V) * max(dot(N, LplWS), 0.0), 0.001);
+            vec3  kDpl   = (1.0 - Fpl) * (1.0 - metallic);
+            vec3  diffPl = kDpl * albedo / PI;
+
+            float NdLpl = max(dot(N, LplWS), 0.0);
+            vec3  plRadiance = pl.color * pl.intensity;
+
+            Lo += (diffPl + specPl) * plRadiance * NdLpl * attenuation;
+        }
+    }
+
     // IBL ambient (split-sum)
     float NdV       = max(dot(N, V), 0.0);
     vec3  F_ibl     = F_SchlickRoughness(NdV, F0, roughness);
@@ -225,6 +324,8 @@ void main()
     outColor = vec4(metallic, roughness, 0.0, 1.0);  // R=metallic, G=roughness
 #elif DEBUG_GBUFFER == 4
     outColor = vec4(vec3(ao), 1.0);         // SSAO
+#elif DEBUG_GBUFFER == 99
+    outColor = vec4(1.0, 0.0, 1.0, 1.0);    // MAGENTA - test if deferred pass runs
 #else
     outColor = vec4(color, 1.0);
 #endif

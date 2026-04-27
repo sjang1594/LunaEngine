@@ -147,13 +147,92 @@ if (len > 0.0001f) {           // safety check
 
 ---
 
+## #011 Mesh Not Visible After Phase 24
+
+See `011_mesh_not_visible_after_phase24.md`.
+
+---
+
+## #012 Vulkan Tonemap Framebuffers Init
+
+See `012_vulkan_tonemap_framebuffers_init.md`.
+
+---
+
+## #013 DX12 IBL Pipeline Dangling Pointers
+
+**증상**: `CreateGraphicsPipelineState` 실패 (`0x80070057 E_INVALIDARG`). IBL deferred lighting 파이프라인 생성 시.
+
+**원인 2가지**:
+
+| # | 이슈 |
+|---|------|
+| 1 | `CreateRootSignature()` 내 로컬 배열(`ranges[]`, `params[]`)이 직렬화 전에 스코프 이탈 → dangling pointer |
+| 2 | Root parameter 개수 8개인데 binding index 7/8/9 사용 → access violation |
+
+**해결**:
+- Root signature 생성 함수에서 배열을 직렬화 완료까지 유지
+- Root parameter 개수/인덱스 일치시킴
+
+---
+
+## #014 Vulkan Shutdown Resource In Use
+
+**증상**: 종료 시 8개 Vulkan validation error — `vkDestroyBuffer`, `vkFreeDescriptorSets`, `vkDestroyPipeline`이 VkCommandBuffer에서 사용 중인 리소스에 호출됨.
+
+**원인**: `Application::Shutdown()`이 `ShutdownImGui()`를 `Backend::Shutdown()` **이전에** 호출. `ImGui_ImplVulkan_Shutdown()`이 내부 vertex/index buffer와 pipeline을 파괴할 때, frame command buffer가 여전히 참조 보유.
+
+**해결**: `ShutdownImGui()`에서 `ImGui_ImplVulkan_Shutdown()` 호출 전 모든 command pool을 `vkResetCommandPool()`로 리셋:
+```cpp
+vkDeviceWaitIdle(dev);
+for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+    if (_frames[i].cmdPool)    vkResetCommandPool(dev, _frames[i].cmdPool, 0);
+    if (_computeFrames[i].cmdPool) vkResetCommandPool(dev, _computeFrames[i].cmdPool, 0);
+}
+if (_transferCmdPool) vkResetCommandPool(dev, _transferCmdPool, 0);
+```
+
+---
+
+## #015 Vulkan Atmosphere Composite — Feedback Loop + Layout Mismatch + First-Frame Barrier Bug
+
+**증상**:
+1. Vulkan 검증 레이어: `vkCmdDraw(): VkImage ... layout VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL does not match previous known layout VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` — 매 프레임 10회 반복
+2. `vkQueueSubmit()`: 다른 이미지가 `VK_IMAGE_LAYOUT_GENERAL`인데 `SHADER_READ_ONLY_OPTIMAL` 기대
+3. `Exception 0xc0000005 at 0xffffffffffffffff` — 크래시
+
+**원인 3가지**:
+
+| # | 이슈 | 위치 |
+|---|------|------|
+| 1 | **Feedback loop**: `DrawComposite()`가 `_ppRenderPass`(`DONT_CARE` loadOp, `initialLayout=UNDEFINED`)를 사용 → HDR 씬 내용 폐기 + 렌더 패스 내부에서 `COLOR_ATTACHMENT_OPTIMAL`로 전환. `sceneTex` 디스크립터는 `SHADER_READ_ONLY_OPTIMAL` 기대 → layout mismatch + UB → 크래시 | `VulkanAtmosphere.cpp::DrawComposite()` |
+| 2 | **First-frame skyView 레이아웃 오류**: `if (_precomputed)` 조건이 첫 프레임에서 `SHADER_READ_ONLY_OPTIMAL → GENERAL` barrier를 내보냄. skyView는 실제로는 `CreateLUTImages()`에서 설정된 `GENERAL` 상태였음 → 검증 레이어가 old layout 불일치 감지 | `VulkanAtmosphere::Update()` |
+| 3 | **Render graph 선언 오류**: Sky Composite 패스가 `hHDR`에 대해 `.Read(SHADER_READ_ONLY)` + `.Write(SHADER_READ_ONLY, COLOR_ATTACHMENT_WRITE)` 선언 — layout과 access mask가 모순됨 | `VulkanBackend.cpp::CompositeFrame()` |
+
+**근본 원인 상세**:
+
+`_ppRenderPass`는 `initialLayout=UNDEFINED` + `DONT_CARE` loadOp 로 생성되어 있음 → render pass 시작 시 기존 픽셀(디퍼드 라이팅 결과)을 폐기하고 `COLOR_ATTACHMENT_OPTIMAL`로 전환. 동시에 `sceneTex` 디스크립터는 동일한 `_hdrView`를 `SHADER_READ_ONLY_OPTIMAL`로 바인딩 → 같은 이미지를 color attachment write + sampled read로 동시 접근하는 feedback loop. Vulkan은 별도 확장 없이 이를 허용하지 않음.
+
+**해결**:
+
+1. **`CreateAtmosphereRenderPass()` 신규 추가**: `LOAD_OP_LOAD` + `initialLayout=SHADER_READ_ONLY_OPTIMAL` + `finalLayout=SHADER_READ_ONLY_OPTIMAL` render pass 생성 (owned). 서브패스 의존성: `COLOR_ATTACHMENT_OUTPUT → COLOR_ATTACHMENT_OUTPUT`으로 디퍼드 라이팅 이후 sync 보장.
+
+2. **`sceneTex` 제거**: `_compositeDescLayout`에서 binding 3 삭제 (4 → 3 bindings). `atmosphere_composite_vk.frag.glsl`에서 `sceneTex` 샘플러 제거, 씬 픽셀(`depth < 0.999`)은 `discard` — `LOAD_OP_LOAD`로 기존 HDR 내용이 보존되므로 별도 read 불필요.
+
+3. **`_skyViewReady` 플래그 도입**: `Update()` 첫 호출 시에는 `SHADER_READ_ONLY → GENERAL` barrier 스킵 (skyView가 이미 `GENERAL`). 첫 Update 완료 후 `_skyViewReady = true` 설정.
+
+4. **Render graph 수정**: Sky Composite 패스에서 `.Read(hHDR, ...)` 제거. `_atmosphereRenderPass`가 내부적으로 layout transition 처리 (`SHADER_READ_ONLY → COLOR_ATTACHMENT → SHADER_READ_ONLY`).
+
+**결과**: 검증 레이어 오류 3종 모두 제거. 씬 픽셀은 `discard`로 보존, 하늘 픽셀만 sky-view LUT 값으로 오버라이트.
+
+---
+
 ## TODO
 
 | 항목 | 우선순위 |
 |------|----------|
 | Hi-Z double-buffer로 occlusion culling 재활성화 | HIGH |
 | Async compute redesign (separate command lists) | MEDIUM |
-| Vulkan shutdown validation 에러 정리 | LOW |
 
 ---
 
@@ -163,12 +242,16 @@ if (len > 0.0001f) {           // safety check
 |------|------|
 | `taa.frag.hlsl` | #001 |
 | `tonemapping.frag.hlsl` | #001 |
-| `VulkanBackend.cpp` | #002–009 |
+| `VulkanBackend.cpp` | #002–009, #014, #015 |
 | `VulkanBackend.h` | #006–007 |
 | `deferred_lighting_ibl.frag.hlsl` | #005 |
 | `gbuffer_vk.frag.glsl` | #005 |
 | `Application.cpp` | #008 |
-| `DX12Backend.cpp` | #009, #010 |
+| `DX12Backend.cpp` | #009, #010, #013 |
 | `DX12Backend.h` | #010 |
+| `DX12Pipeline.cpp` | #013 |
 | `gpu_cull.comp.hlsl` | #010 |
+| `VulkanAtmosphere.cpp` | #015 |
+| `VulkanAtmosphere.h` | #015 |
+| `atmosphere_composite_vk.frag.glsl` | #015 |
 

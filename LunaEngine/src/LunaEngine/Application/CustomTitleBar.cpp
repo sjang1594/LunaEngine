@@ -20,24 +20,29 @@ static LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         LRESULT hit = DefWindowProcW(hwnd, msg, wParam, lParam);
         if (hit == HTCLIENT)
         {
+            // Convert screen coords to client coords
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             ScreenToClient(hwnd, &pt);
 
             RECT rc;
             GetClientRect(hwnd, &rc);
 
+            // Resize border thickness
             const int border = 6;
 
+            // Corners (resize priority over title bar)
             if (pt.x < border && pt.y < border)            return HTTOPLEFT;
             if (pt.x > rc.right - border && pt.y < border)  return HTTOPRIGHT;
             if (pt.x < border && pt.y > rc.bottom - border) return HTBOTTOMLEFT;
             if (pt.x > rc.right - border && pt.y > rc.bottom - border) return HTBOTTOMRIGHT;
 
+            // Edges
             if (pt.y < border)                              return HTTOP;
             if (pt.y > rc.bottom - border)                  return HTBOTTOM;
             if (pt.x < border)                              return HTLEFT;
-            if (pt.x > rc.right - border) return HTRIGHT;
+            if (pt.x > rc.right - border)                   return HTRIGHT;
 
+            // Title bar drag area (top N pixels, but not the button zone on the right)
             int titleBarPx = (int)s_titleBarH;
             int buttonsZone = 46 * 3;  // 3 buttons × 46px each
             if (pt.y < titleBarPx && pt.x < rc.right - buttonsZone)
@@ -75,19 +80,25 @@ void CustomTitleBar::Init(GLFWwindow* window)
     s_hwnd      = hwnd;
     s_titleBarH = _titleBarHeight;
 
-    // Keep WS_THICKFRAME for resize borders; remove WS_CAPTION to suppress the DWM title bar.
+    // Keep WS_THICKFRAME (resize) but remove WS_CAPTION (title bar chrome)
+    // WS_OVERLAPPEDWINDOW without WS_CAPTION gives us a window with
+    // a resize border but no system title bar drawn by DWM
     LONG style = GetWindowLong(hwnd, GWL_STYLE);
     style &= ~WS_CAPTION;
     style |= WS_THICKFRAME;
     SetWindowLong(hwnd, GWL_STYLE, style);
 
+    // Extend DWM shadow/frame — { left, right, top, bottom }
+    // All 0 = no DWM frame visible (shadow still drawn by DWM)
     MARGINS margins = { 0, 0, 0, 0 };
     DwmExtendFrameIntoClientArea(hwnd, &margins);
 
+    // Subclass the window to intercept WM_NCHITTEST
     s_origProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(CustomWndProc)));
 
+    // Force re-layout
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 #endif
@@ -102,16 +113,19 @@ bool CustomTitleBar::Render()
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
 
+    // ── Colors ───────────────────────────────────────────────────────────────
     const ImVec4 bgColor    = ImVec4(0.08f, 0.08f, 0.08f, 1.0f);
     const ImVec4 logoColor  = ImVec4(0.45f, 0.35f, 0.80f, 1.0f);
     const ImVec4 textColor  = ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
     const ImVec4 btnHover   = ImVec4(0.25f, 0.25f, 0.25f, 1.0f);
     const ImVec4 closeHover = ImVec4(0.80f, 0.20f, 0.20f, 1.0f);
 
+    // ── FramePadding: make menubar height == _titleBarHeight ─────────────────
     float fontSize  = ImGui::GetFontSize();
     float framePadY = floorf((_titleBarHeight - fontSize) * 0.5f);
     if (framePadY < 0.0f) framePadY = 0.0f;
 
+    // ── Window setup ─────────────────────────────────────────────────────────
     ImGui::SetNextWindowPos(viewport->Pos);
     ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, _titleBarHeight));
     ImGui::SetNextWindowViewport(viewport->ID);
@@ -142,6 +156,7 @@ bool CustomTitleBar::Render()
     ImVec2      wPos  = ImGui::GetWindowPos();
     ImVec2      wSize = ImGui::GetWindowSize();
 
+    // Bottom border
     dl->AddLine(ImVec2(wPos.x,         wPos.y + wSize.y - 1.0f),
                 ImVec2(wPos.x + wSize.x, wPos.y + wSize.y - 1.0f),
                 IM_COL32(30, 30, 30, 255), 1.0f);
@@ -176,6 +191,7 @@ bool CustomTitleBar::Render()
             float  badgeX  = badgeAreaRight - badgeSz.x - padX * 2.0f;
             float  badgeY  = wPos.y + (_titleBarHeight - badgeSz.y) * 0.5f;
 
+            // Rounded background pill
             ImU32 pillCol = IM_COL32(50, 50, 70, 200);
             dl->AddRectFilled(ImVec2(badgeX - padX, badgeY - 2.0f),
                               ImVec2(badgeX + badgeSz.x + padX, badgeY + badgeSz.y + 2.0f),
@@ -187,6 +203,7 @@ bool CustomTitleBar::Render()
             badgeAreaRight = badgeX - padX - 6.0f; // move left for next badge
         }
 
+        // 4b. FPS badge (drawn left of backend badge)
         {
             char fpsBuf[48];
             snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS  %.1f ms", _fps, _frameTimeMs);
@@ -195,6 +212,7 @@ bool CustomTitleBar::Render()
             float  fpsX  = badgeAreaRight - fpsSz.x - padX * 2.0f;
             float  fpsY  = wPos.y + (_titleBarHeight - fpsSz.y) * 0.5f;
 
+            // Colour pill: green if >30fps, yellow if >15, red otherwise
             ImU32 pillCol = (_fps >= 30.0f) ? IM_COL32(30, 60, 30, 200)
                           : (_fps >= 15.0f) ? IM_COL32(60, 55, 20, 200)
                                             : IM_COL32(70, 30, 30, 200);
@@ -207,10 +225,12 @@ bool CustomTitleBar::Render()
             dl->AddText(ImVec2(fpsX, fpsY), textCol, fpsBuf);
         }
 
+        // SetCursorPosX is relative to window left; fill remaining space
         float rightEdge = wSize.x - totalBtnWidth;
         if (ImGui::GetCursorPosX() < rightEdge)
             ImGui::SetCursorPosX(rightEdge);
 
+        // Helper: transparent button, height = 0 means "use line height" (= menuBar height)
         auto CtrlBtn = [&](const char* id, ImVec4 hov) -> bool
         {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
@@ -221,6 +241,7 @@ bool CustomTitleBar::Render()
             return hit;
         };
 
+        // ── Minimize ─────────────────────────────────────────────────────────
         if (CtrlBtn("##Min", btnHover)) glfwIconifyWindow(_window);
         {
             ImVec2 rMin = ImGui::GetItemRectMin();
@@ -230,6 +251,7 @@ bool CustomTitleBar::Render()
         }
         ImGui::SameLine(0, 0);
 
+        // ── Maximize / Restore ───────────────────────────────────────────────
         if (CtrlBtn("##Max", btnHover))
         {
             if (_isMaximized) {
@@ -262,6 +284,7 @@ bool CustomTitleBar::Render()
         }
         ImGui::SameLine(0, 0);
 
+        // ── Close ────────────────────────────────────────────────────────────
         if (CtrlBtn("##Close", closeHover))
             glfwSetWindowShouldClose(_window, GLFW_TRUE);
         {
@@ -272,6 +295,7 @@ bool CustomTitleBar::Render()
             dl->AddLine(ImVec2(cx+5,cy-5),ImVec2(cx-5,cy+5),IM_COL32(200,200,200,255),1.5f);
         }
 
+        // ── Double-click drag area to maximize ───────────────────────────────
         {
             ImVec2 mp = ImGui::GetIO().MousePos;
             bool inDrag = mp.x >= wPos.x && mp.x < wPos.x + (wSize.x - totalBtnWidth) &&

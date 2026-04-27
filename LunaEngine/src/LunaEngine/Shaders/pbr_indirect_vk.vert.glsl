@@ -11,6 +11,11 @@
 // If stripes disappear, the issue is in SSBO data or row_major interpretation.
 #define DEBUG_IDENTITY_MODEL 0
 
+// Set to 1 to output fixed screen-filling triangle (bypass ALL transforms)
+// If nothing shows, issue is pipeline state (culling, depth, attachment, etc.)
+// If green triangle fills screen, issue is in vertex transform/matrices
+#define DEBUG_FIXED_NDC 0
+
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
@@ -44,6 +49,26 @@ void main()
 {
     uint objIdx = uint(gl_InstanceIndex);
     GPUObjectData obj = gObjectData[objIdx];
+
+#if DEBUG_FIXED_NDC
+    // Output a screen-filling triangle at fixed NDC positions (z=0.5, inside clip space)
+    // If this doesn't show, the render pass / framebuffer / pipeline is broken
+    const vec2 positions[3] = vec2[3](
+        vec2(-1.0, -3.0),  // off-screen top
+        vec2(-1.0,  1.0),  // bottom-left
+        vec2( 3.0,  1.0)   // off-screen right
+    );
+    int vid = gl_VertexIndex % 3;
+    gl_Position = vec4(positions[vid], 0.5, 1.0);
+    
+    outPosWS = vec3(0.0);
+    outNormalWS = vec3(0.0, 0.0, 1.0);
+    outTangentWS = vec3(1.0, 0.0, 0.0);
+    outBitanWS = vec3(0.0, 1.0, 0.0);
+    outUV = vec2(0.5);
+    outMaterialIndex = 0u;
+    return;
+#endif
 
 #if DEBUG_IDENTITY_MODEL
     mat4  modelMat = mat4(1.0);

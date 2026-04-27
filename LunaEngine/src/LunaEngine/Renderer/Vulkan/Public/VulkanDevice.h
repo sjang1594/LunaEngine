@@ -18,12 +18,13 @@ public:
     VkPhysicalDevice GetPhysicalDevice() const { return _physicalDevice; }
     VkQueue GetGraphicsQueue() const { return _graphicsQueue; }
     VkQueue GetPresentQueue() const { return _presentQueue; }
-    VkQueue GetComputeQueue() const { return _computeQueue; }
+    VkQueue GetComputeQueue() const { return _computeQueue; }  // Phase 20
     uint32_t GetGraphicsQueueFamily() const { return _graphicsQueueFamily; }
     uint32_t GetPresentQueueFamily()  const { return _presentQueueFamily; }
-    uint32_t GetComputeQueueFamily()  const { return _computeQueueFamily; }
-    bool     IsRTSupported()          const { return _rtSupported; }
-    bool     IsAsyncComputeSupported() const { return _asyncComputeSupported; }
+    uint32_t GetComputeQueueFamily()  const { return _computeQueueFamily; }  // Phase 20
+    bool     IsRTSupported()          const { return _rtSupported; }  // Phase 18D
+    bool     IsAsyncComputeSupported() const { return _asyncComputeSupported; }  // Phase 20
+    bool     IsMeshShaderSupported()  const { return _meshShaderSupported; }  // Phase 27
     
 private:
     bool PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface);
@@ -35,11 +36,12 @@ private:
     VkDevice            _device = VK_NULL_HANDLE;
     VkQueue             _graphicsQueue;
     VkQueue             _presentQueue;
-    VkQueue             _computeQueue = VK_NULL_HANDLE;
+    VkQueue             _computeQueue = VK_NULL_HANDLE;   // Phase 20
     uint32_t            _graphicsQueueFamily;
     uint32_t            _presentQueueFamily;
-    uint32_t            _computeQueueFamily = UINT32_MAX;
-    bool                _rtSupported = false;
-    bool                _asyncComputeSupported = false;
+    uint32_t            _computeQueueFamily = UINT32_MAX; // Phase 20
+    bool                _rtSupported = false;  // Phase 18D: set in CreateLogicalDevice
+    bool                _asyncComputeSupported = false;  // Phase 20
+    bool                _meshShaderSupported = false;  // Phase 27
 };
 }

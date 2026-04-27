@@ -13,8 +13,9 @@ namespace D3D12MA { class Allocator; }
 namespace Luna
 {
 
-// Raw material description from a glTF/GLB file.
-// Texture pixel data is pre-decoded RGBA8. Empty vector = texture absent; backend uses default.
+// Phase 5B: Raw material description extracted from a glTF/GLB file.
+// Texture pixel data is pre-decoded (RGBA8, 4 bytes per pixel) from embedded buffers.
+// An empty pixel vector means the texture is absent; the backend should use a default.
 struct MaterialCreateInfo
 {
     // Pre-decoded RGBA8 pixel data for each map; empty = texture absent
@@ -45,7 +46,7 @@ struct LoadResult
 {
     std::vector<std::unique_ptr<Mesh>>  meshes;
     std::vector<MaterialCreateInfo>     materials; // indexed by Mesh::materialIndex
-    std::vector<DirectX::XMFLOAT4X4>   transforms; // per-mesh world transform from glTF node hierarchy
+    std::vector<DirectX::XMFLOAT4X4>   transforms; // Phase 21: per-mesh world transform from glTF node hierarchy
     std::vector<std::string>            meshNames;  // display name per mesh (from glTF node/mesh name)
 };
 
@@ -68,6 +69,7 @@ class MeshLoader
         D3D12MA::Allocator*         allocator,
         ID3D12GraphicsCommandList*  cmdList);
 
+    // Phase 12: exposed publicly for merged geometry upload
     static ComPtr<ID3D12Resource> UploadBuffer(
         D3D12MA::Allocator*        allocator,
         ID3D12GraphicsCommandList* cmdList,

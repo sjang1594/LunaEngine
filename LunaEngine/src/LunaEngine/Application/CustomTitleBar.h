@@ -8,23 +8,35 @@ struct GLFWwindow;
 namespace Luna
 {
 
+// Custom title bar that replaces Windows default title bar
+// Similar to Unreal Engine / Visual Studio style
 class CustomTitleBar
 {
 public:
     CustomTitleBar() = default;
     ~CustomTitleBar() = default;
 
+    // Initialize with GLFW window (must call after window creation)
     void Init(GLFWwindow* window);
+
+    // Call this every frame in ImGui rendering
+    // Returns true if the title bar was rendered
     bool Render();
 
+    // Setters
     void SetTitle(const std::string& title) { _title = title; }
     void SetShowLogo(bool show) { _showLogo = show; }
     void SetLogoText(const std::string& text) { _logoText = text; }
     void SetBackendLabel(const std::string& label) { _backendLabel = label; }
     void SetFrameStats(float fps, float frameTimeMs) { _fps = fps; _frameTimeMs = frameTimeMs; }
     
+    // Menu callback - called to render menu items in title bar
     void SetMenuCallback(std::function<void()> callback) { _menuCallback = callback; }
+
+    // Check if we're currently dragging the title bar
     bool IsDragging() const { return _isDragging; }
+
+    // Get title bar height
     float GetHeight() const { return _titleBarHeight; }
 
 private:

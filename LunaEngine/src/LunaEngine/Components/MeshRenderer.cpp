@@ -26,6 +26,7 @@ void MeshRenderer::Render()
         return;
     }
 
+    // Build model matrix from this object's Transform component
     auto transform = GetTransform();
     XMMATRIX  world = transform ? transform->GetWorldMatrix() : XMMatrixIdentity();
     XMFLOAT4X4 model;

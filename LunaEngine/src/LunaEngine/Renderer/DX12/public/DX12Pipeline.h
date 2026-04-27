@@ -18,6 +18,13 @@ class DX12Pipeline : public IPipeline
     bool Initialize(const ComPtr<ID3D12Device> &device, const std::wstring &vsPath,
                     const std::wstring &psPath, const PipelineStateDesc &desc);
 
+    // Phase 25: Mesh shader pipeline initialization (AS + MS + PS)
+    bool InitializeMeshShader(const ComPtr<ID3D12Device>& device,
+                              const std::wstring& asPath,
+                              const std::wstring& msPath,
+                              const std::wstring& psPath,
+                              const PipelineStateDesc& desc);
+
     ComPtr<ID3D12PipelineState> GetPipelineState() const { return _pipelineState; }
     ID3D12PipelineState*        GetPSO()           const { return _pipelineState.Get(); }
     ComPtr<ID3D12RootSignature> GetRootSignature() const { return _rootSignature; }
@@ -34,6 +41,7 @@ class DX12Pipeline : public IPipeline
 #endif
 
   private:
+    // Phase 2B: DXC-based shader compilation (SM 6.0+, HLSL source)
     bool LoadShaderDXC(const std::wstring &path, const std::wstring &target,
                        ComPtr<IDxcBlob> &outBlob);
 
@@ -47,11 +55,16 @@ class DX12Pipeline : public IPipeline
     bool CreateRootSignature(const ComPtr<ID3D12Device> &device);
     bool CreatePipelineState(const ComPtr<ID3D12Device>& device,
                              ComPtr<IDxcBlob> vs, ComPtr<IDxcBlob> ps);
+    // Phase 25: Mesh shader PSO via pipeline state stream
+    bool CreateMeshShaderPSO(const ComPtr<ID3D12Device>& device,
+                             ComPtr<IDxcBlob> as, ComPtr<IDxcBlob> ms, ComPtr<IDxcBlob> ps);
 
     PipelineStateDesc           _desc;
     ComPtr<ID3D12PipelineState> _pipelineState;
     ComPtr<ID3D12RootSignature> _rootSignature;
     ComPtr<IDxcBlob>            _vsBlob;
     ComPtr<IDxcBlob>            _psBlob;
+    ComPtr<IDxcBlob>            _asBlob;  // Phase 25
+    ComPtr<IDxcBlob>            _msBlob;  // Phase 25
 };
 } // namespace Luna

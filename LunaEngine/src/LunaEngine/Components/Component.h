@@ -12,11 +12,13 @@ enum class ComponentType
     TRANSFORM,
     CAMERA,
     LIGHT,
+    SENSOR,
     END
 };
 
 enum
 {
+    // Size to hold all valid component indices (0..END-1 inclusive, NONE slot unused).
     FIXED_COMPONENT_COUNT = static_cast<uint8_t>(ComponentType::END)
 };
 

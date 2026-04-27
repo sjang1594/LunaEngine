@@ -9,7 +9,7 @@ struct ID3D12Resource;
 namespace Luna
 {
 
-// Material constant buffer — b1 in the PBR root signature.
+// Phase 5B: Material constant buffer — b1 in the PBR root signature.
 // Must be 256-byte aligned when placed in an UPLOAD heap CB.
 struct MaterialConstants
 {
@@ -21,8 +21,10 @@ struct MaterialConstants
 };
 static_assert(sizeof(MaterialConstants) == 32, "MaterialConstants size changed");
 
-// Per-material GPU resources. Descriptor slots [srvTableStart, srvTableStart+3] are
-// reserved for the four texture SRVs in the shared heap.
+// Phase 5B: Per-material GPU resources.
+// Owns four Texture shared_ptrs (albedo / normalMap / metalRough / emissive) and a small
+// constant buffer (MaterialConstants).  Descriptor slots [srvTableStart, srvTableStart+3]
+// in the shared SRV heap are reserved for the four SRVs.
 struct Material
 {
     std::shared_ptr<Texture> albedo;       // SRV at t0 (srvTableStart + 0)

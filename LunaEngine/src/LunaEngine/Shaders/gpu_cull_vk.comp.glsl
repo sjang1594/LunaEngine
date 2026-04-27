@@ -67,7 +67,7 @@ layout(set = 0, binding = 3, std430) buffer DrawCountBuffer {
 } gDrawCount;
 
 // Phase 23: Hi-Z UBO (viewProj matrix + screen size)
-layout(set = 0, binding = 4, std140) uniform HiZParamsUBO {
+layout(set = 0, binding = 4, std140, row_major) uniform HiZParamsUBO {
     mat4 viewProj;         // 64 B
     vec2 screenSize;       //  8 B
     vec2 _hizPad;          //  8 B → 80 B
@@ -134,6 +134,22 @@ void main()
 
     GPUObjectData obj = gObjects[idx];
 
+    // DEBUGGING: Bypass ALL culling - force all objects visible
+    // TODO: Remove after debugging
+    uint drawIdx = atomicAdd(gDrawCount.data[0], 1u);
+
+    MeshDrawInfo mi = gMeshInfo[obj.meshIndex];
+
+    VkDrawCmd cmd;
+    cmd.indexCount    = mi.indexCount;
+    cmd.instanceCount = 1u;
+    cmd.firstIndex    = mi.firstIndex;
+    cmd.vertexOffset  = mi.vertexOffset;
+    cmd.firstInstance = idx;
+
+    gDrawArgs[drawIdx] = cmd;
+
+    /* ORIGINAL CULLING CODE - DISABLED FOR DEBUGGING
     vec4  centreWS = vec4(obj.boundingSphere.xyz, 1.0) * obj.model;
     float radius   = obj.boundingSphere.w;
 
@@ -163,4 +179,5 @@ void main()
     cmd.firstInstance = idx;
 
     gDrawArgs[drawIdx] = cmd;
+    */
 }

@@ -22,7 +22,10 @@ public:
     void Update();
     void LoadScene(std::wstring sceneName);
 
+    // Phase 21: set the glTF asset to load (relative to Assets/ directory)
     void SetSceneAsset(const std::string& assetName) { _sceneAsset = assetName; }
+
+    // Phase 21: load a scene from an absolute file path at runtime (File > Import Scene)
     void LoadSceneFromFile(const std::string& absolutePath);
 
     // Release the active scene before backend shutdown so D3D12MA allocations

@@ -102,4 +102,13 @@ bool DX12Device::SupportsDXR() const
 
     return opts5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
 }
+
+bool DX12Device::SupportsMeshShaders() const
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7 = {};
+    if (FAILED(_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opts7, sizeof(opts7))))
+        return false;
+
+    return opts7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
+}
 }

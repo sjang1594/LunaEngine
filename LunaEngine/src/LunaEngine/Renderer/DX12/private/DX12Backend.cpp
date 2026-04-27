@@ -9,6 +9,7 @@
 #include "LunaEngine/Renderer/DX12/Public/DX12RTPipeline.h"
 #include "Renderer/DX12/Public/DX12Buffer.h"
 #include "Renderer/MeshLoader.h"
+#include "Renderer/Meshlet.h"
 #include "Renderer/RenderGraph.h"
 #include "Graphics/Texture.h"
 #include <directx/d3dx12_resource_helpers.h>  // GetRequiredIntermediateSize, UpdateSubresources
@@ -17,6 +18,9 @@
 namespace Luna
 {
 
+// ---------------------------------------------------------------------------
+// Test geometry — simple triangle kept from Phase 1 as a fallback visual
+// ---------------------------------------------------------------------------
 struct TriangleVertex
 {
     Vec3 position;
@@ -37,6 +41,7 @@ struct MVPConstants
     XMFLOAT4X4 proj;
 };
 
+// Phase 7+8: Scene-level constants for the deferred lighting pass.
 // Must match cbuffer SceneConstants in deferred_lighting.frag.hlsl.
 struct SceneConstants
 {
@@ -46,13 +51,21 @@ struct SceneConstants
     XMFLOAT3   lightDir;     //  12 B — toward-light, normalised
     float      _padLight;    //   4 B
     XMFLOAT4   lightColor;   //  16 B — xyz=color, w=intensity
+    // Phase 8: CSM
     XMFLOAT4X4 viewMatrix;   //  64 B — camera view matrix (for view-space depth)
     XMFLOAT4X4 lightVP[4];   // 256 B — light-space VP per cascade, row-major
     XMFLOAT4   cascadeSplits;//  16 B — view-space Z far plane per cascade
-};  // 448 B → round up to 512-byte aligned CB
+    // Phase 24: Clustered lighting
+    uint32_t   numPointLights; //  4 B
+    uint32_t   _pad2[3];       // 12 B
+};  // 464 B → round up to 512-byte aligned CB
 
-// Constructor is defined here (not in .h) so MSVC sees complete types for DX12AccelStructure
-// and DX12RTPipeline when instantiating unique_ptr destructor exception-cleanup paths.
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+// Constructor defined here (not in .h) so MSVC can see the complete types of
+// DX12AccelStructure and DX12RTPipeline when it instantiates the unique_ptr
+// members' destructors for exception-cleanup paths.
 DX12Backend::DX12Backend() = default;
 
 DX12Backend::~DX12Backend()
@@ -69,8 +82,10 @@ void DX12Backend::Shutdown()
         _fenceEvent = nullptr;
     }
 
+    // Phase 22: Shutdown GPU profiler
     _gpuProfiler.Shutdown();
 
+    // Phase 13: clean up async compute
     if (_computeFenceEvent)
     {
         CloseHandle(_computeFenceEvent);
@@ -78,13 +93,22 @@ void DX12Backend::Shutdown()
     }
     _asyncComputeReady = false;
 
-    // Release all render resources before destroying the D3D12MA allocator.
+    // Phase 12: release GPU-driven rendering resources before D3D12MA allocator
     DestroyIndirectResources();
+    // Phase 25: release mesh shader resources
+    DestroyMeshShaderResources();
+    // Phase 24: release clustered lighting resources
+    DestroyClusteredLightingResources();
+    // Phase 23: release Hi-Z resources
     DestroyHiZResources();
+    // Phase 14: release IBL resources before D3D12MA allocator
     DestroyIBLResources();
-    DestroyPostProcessResources();
+    // Phase 9: release SSAO resources before CSM / G-buffer (all before D3D12MA allocator)
+    DestroyPostProcessResources();  // Phase 10: must be before D3D12MA allocator
     DestroySSAOResources();
+    // Phase 8: release CSM resources before G-buffer (both before D3D12MA allocator)
     DestroyCSMResources();
+    // Phase 7: release G-buffer before D3D12MA allocator is destroyed
     DestroyGBuffer();
 
     // Release D3D12MA allocations before destroying the allocator.
@@ -161,6 +185,12 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
         LUNA_LOG_INFO("DXR not supported on this GPU — shadows disabled");
     }
 
+    // Phase 25: Check mesh shader support
+    _meshShadersSupported = _dx12Device->SupportsMeshShaders();
+    if (_meshShadersSupported)
+        LUNA_LOG_INFO("Phase 25: Mesh Shader Tier 1 supported");
+    else
+        LUNA_LOG_INFO("Phase 25: Mesh shaders not supported — using indirect draw fallback");
     // Phase 7: G-buffer pass — pbr.vert writes geometry into 3 MRTs
     if (!CreateGBuffer()) return false;
 
@@ -246,6 +276,10 @@ bool DX12Backend::Init(void *windowHandler, uint32_t width, uint32_t height)
     // Phase 22: GPU profiler
     if (!_gpuProfiler.Init(_device.Get(), _commandQueue.Get()))
         LUNA_LOG_WARN("GPU profiler init failed — timing disabled");
+
+    // Phase 24: Clustered lighting resources
+    if (!CreateClusteredLightingResources())
+        LUNA_LOG_WARN("Clustered lighting init failed — point lights disabled");
 
     LUNA_LOG_INFO("DX12 backend initialized (frames-in-flight: %u)", FRAMES_IN_FLIGHT);
     return true;
@@ -1458,6 +1492,17 @@ void DX12Backend::CompositeFrame()
            });
     }
 
+    // Phase 24: Cluster assignment compute pass (before deferred lighting)
+    if (_clusteredLightingReady && !_pointLights.empty())
+    {
+        rg2.AddPass("Cluster Assign")
+           .SideEffect()
+           .Execute([this](ID3D12GraphicsCommandList* cmd)
+           {
+               DispatchClusterAssign();
+           });
+    }
+
     // --- Deferred Lighting pass ---
     // Phase 10: if post-process stack is valid, write to _hdrRT (R16G16B16A16_FLOAT) instead
     // of the back buffer. The tone mapping pass will composite to the back buffer afterwards.
@@ -1513,18 +1558,29 @@ void DX12Backend::CompositeFrame()
 
             cmd->SetGraphicsRootConstantBufferView(0, _frames[_frameIndex].sceneCBGPUAddr);
 
+            // Phase 24: bind ClusterParams CBV at b1 (params[1]) if using IBL pipeline
+            if (_iblReady && _lightingPipelineIBL && pipe == _lightingPipelineIBL.get())
+            {
+                if (_clusteredLightingReady && _clusterParamsCB)
+                    cmd->SetGraphicsRootConstantBufferView(1, _clusterParamsCB->GetGPUVirtualAddress());
+            }
+
+            // Root param indices shifted by +1 when using IBL pipeline (b1 inserted)
+            UINT gbufferParam = (_iblReady && _lightingPipelineIBL && pipe == _lightingPipelineIBL.get()) ? 2 : 1;
+            UINT ssaoParam    = gbufferParam + 1;
+
             D3D12_GPU_DESCRIPTOR_HANDLE srvBase;
             srvBase.ptr = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart().ptr
                           + static_cast<UINT64>(_gbufferSRVIndex[0]) * _srvDescriptorSize;
-            cmd->SetGraphicsRootDescriptorTable(1, srvBase);
+            cmd->SetGraphicsRootDescriptorTable(gbufferParam, srvBase);
 
             UINT ssaoIdx = (_ssaoBlurSRVIndex != UINT_MAX) ? _ssaoBlurSRVIndex : _depthSRVIndex;
             D3D12_GPU_DESCRIPTOR_HANDLE ssaoGpu;
             ssaoGpu.ptr = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart().ptr
                           + static_cast<UINT64>(ssaoIdx) * _srvDescriptorSize;
-            cmd->SetGraphicsRootDescriptorTable(2, ssaoGpu);
+            cmd->SetGraphicsRootDescriptorTable(ssaoParam, ssaoGpu);
 
-            // Phase 14: bind IBL textures if using IBL pipeline
+            // Phase 14+24: bind IBL textures and clustered lighting data if using IBL pipeline
             if (_iblReady && _lightingPipelineIBL && pipe == _lightingPipelineIBL.get())
             {
                 auto MakeGpu = [&](UINT idx) -> D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -1533,9 +1589,17 @@ void DX12Backend::CompositeFrame()
                             + static_cast<UINT64>(idx) * _srvDescriptorSize;
                     return g;
                 };
-                cmd->SetGraphicsRootDescriptorTable(3, MakeGpu(_irrCubemapSRVIndex));
-                cmd->SetGraphicsRootDescriptorTable(4, MakeGpu(_prefilterCubemapSRVIndex));
-                cmd->SetGraphicsRootDescriptorTable(5, MakeGpu(_brdfLUTSRVIndex));
+                cmd->SetGraphicsRootDescriptorTable(4, MakeGpu(_irrCubemapSRVIndex));
+                cmd->SetGraphicsRootDescriptorTable(5, MakeGpu(_prefilterCubemapSRVIndex));
+                cmd->SetGraphicsRootDescriptorTable(6, MakeGpu(_brdfLUTSRVIndex));
+
+                // Phase 24: bind clustered lighting SRVs
+                if (_clusteredLightingReady)
+                {
+                    cmd->SetGraphicsRootDescriptorTable(7, MakeGpu(_clusterLightSRVIndex));
+                    cmd->SetGraphicsRootDescriptorTable(8, MakeGpu(_clusterCountsSRVIndex));
+                    cmd->SetGraphicsRootDescriptorTable(9, MakeGpu(_clusterIndicesSRVIndex));
+                }
             }
 
             cmd->DrawInstanced(3, 1, 0, 0);
@@ -1760,6 +1824,10 @@ void DX12Backend::UpdateMVP(const XMFLOAT4X4& model, const XMFLOAT4X4& view,
         for (UINT i = 0; i < CSM_CASCADE_COUNT; ++i)
             sc.lightVP[i] = _csmLightVP[i];
         sc.cascadeSplits = _csmCascadeSplits;
+
+        // Phase 24: Clustered lighting
+        sc.numPointLights = _clusteredLightingReady ? static_cast<uint32_t>(_pointLights.size()) : 0u;
+        sc._pad2[0] = sc._pad2[1] = sc._pad2[2] = 0;
 
         memcpy(_frames[_frameIndex].sceneCBMapped, &sc, sizeof(SceneConstants));
     }
@@ -2005,6 +2073,13 @@ std::vector<std::shared_ptr<Mesh>> DX12Backend::LoadMeshes(const std::string& pa
             LUNA_LOG_WARN("Phase 12: GPU-driven rendering init failed — using legacy per-draw path");
         else if (!CreateHiZResources())
             LUNA_LOG_WARN("Phase 23: Hi-Z occlusion culling init failed — frustum-only culling");
+
+        // Phase 25: Create mesh shader pipeline (after meshlets are built in BuildMergedGeometry)
+        if (_meshShadersSupported && _meshletBuffer)
+        {
+            if (!CreateMeshShaderResources())
+                LUNA_LOG_WARN("Phase 25: Mesh shader init failed — using indirect draw fallback");
+        }
     }
 
     return _sceneMeshes;
@@ -3235,6 +3310,142 @@ void DX12Backend::BuildMergedGeometry()
 
     LUNA_LOG_INFO("Phase 12: merged geometry -- %zu verts, %zu indices, %zu meshes",
                   allVertices.size(), allIndices.size(), meshInfos.size());
+
+    // Phase 25: Build meshlets for mesh shader pipeline
+    if (_meshShadersSupported)
+    {
+        std::vector<Meshlet>        allMeshlets;
+        std::vector<MeshletBounds>  allBounds;
+        std::vector<uint32_t>       allMeshletVerts;
+        std::vector<uint32_t>       allMeshletTris;
+        std::vector<MeshletMeshInfo> meshletMeshInfos;
+
+        _meshMeshletOffsets.clear();
+        _meshMeshletCounts.clear();
+
+        for (size_t m = 0; m < meshInfos.size(); ++m)
+        {
+            const MeshDrawInfo& mi = meshInfos[m];
+
+            // Extract positions for this mesh's vertices (adjusted for merged offsets)
+            std::vector<DirectX::XMFLOAT3> positions(mi.indexCount > 0 ? allVertices.size() : 0);
+            // We need positions for the vertices referenced by this mesh's indices
+            // Build a local index/vertex view
+            uint32_t localVertCount = 0;
+            // Find max vertex index referenced
+            uint32_t maxVtx = 0;
+            for (uint32_t i = 0; i < mi.indexCount; ++i)
+            {
+                uint32_t idx = allIndices[mi.firstIndex + i];
+                if (idx > maxVtx) maxVtx = idx;
+            }
+            localVertCount = maxVtx + 1;
+
+            // Extract positions for the vertex range
+            std::vector<DirectX::XMFLOAT3> localPositions(localVertCount);
+            for (uint32_t v = 0; v < localVertCount; ++v)
+            {
+                uint32_t globalV = mi.vertexOffset + v;
+                if (globalV < allVertices.size())
+                    localPositions[v] = allVertices[globalV].position;
+            }
+
+            // Build local indices (subtract vertexOffset to get 0-based)
+            std::vector<uint32_t> localIndices(mi.indexCount);
+            for (uint32_t i = 0; i < mi.indexCount; ++i)
+                localIndices[i] = allIndices[mi.firstIndex + i]; // these are already 0-based for this mesh in merged buffer - actually they're relative to vertexOffset
+
+            // The merged indices stored in allIndices are the original mesh-local indices.
+            // BuildMeshlets expects 0-based indices into localPositions.
+            MeshletBuildResult mbr = BuildMeshlets(
+                localPositions.data(), localVertCount,
+                localIndices.data(), mi.indexCount);
+
+            MeshletMeshInfo mmi{};
+            mmi.meshletOffset = static_cast<uint32_t>(allMeshlets.size());
+            mmi.meshletCount  = static_cast<uint32_t>(mbr.meshlets.size());
+
+            _meshMeshletOffsets.push_back(mmi.meshletOffset);
+            _meshMeshletCounts.push_back(mmi.meshletCount);
+
+            // Adjust meshlet vertex indices to global merged VB space
+            uint32_t vertBase = static_cast<uint32_t>(allMeshletVerts.size());
+            uint32_t triBase  = static_cast<uint32_t>(allMeshletTris.size());
+
+            for (auto& ml : mbr.meshlets)
+            {
+                Meshlet adjusted = ml;
+                adjusted.vertexOffset   += vertBase;
+                adjusted.triangleOffset += triBase;
+                allMeshlets.push_back(adjusted);
+            }
+            allBounds.insert(allBounds.end(), mbr.bounds.begin(), mbr.bounds.end());
+
+            // Offset meshlet vertex indices to global merged VB
+            for (uint32_t vi : mbr.meshletVertices)
+                allMeshletVerts.push_back(vi + mi.vertexOffset);
+
+            allMeshletTris.insert(allMeshletTris.end(), mbr.meshletTriangles.begin(), mbr.meshletTriangles.end());
+            meshletMeshInfos.push_back(mmi);
+        }
+
+        // Upload meshlet buffers
+        _frames[0].cmdAllocator->Reset();
+        _commandList->Reset(_frames[0].cmdAllocator.Get(), nullptr);
+
+        ComPtr<ID3D12Resource> mlStaging, mbStaging, mvStaging, mtStaging, mmStaging;
+        D3D12MA::Allocation* mlSA = nullptr, *mbSA = nullptr, *mvSA = nullptr, *mtSA = nullptr, *mmSA = nullptr;
+
+        if (!allMeshlets.empty())
+        {
+            _meshletBuffer = MeshLoader::UploadBuffer(
+                _d3d12maAllocator, _commandList.Get(),
+                allMeshlets.data(), allMeshlets.size() * sizeof(Meshlet),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                &_meshletBufferAlloc, mlStaging, &mlSA);
+
+            _meshletBoundsBuffer = MeshLoader::UploadBuffer(
+                _d3d12maAllocator, _commandList.Get(),
+                allBounds.data(), allBounds.size() * sizeof(MeshletBounds),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                &_meshletBoundsAlloc, mbStaging, &mbSA);
+
+            _meshletVertexBuffer = MeshLoader::UploadBuffer(
+                _d3d12maAllocator, _commandList.Get(),
+                allMeshletVerts.data(), allMeshletVerts.size() * sizeof(uint32_t),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                &_meshletVertexAlloc, mvStaging, &mvSA);
+
+            _meshletTriBuffer = MeshLoader::UploadBuffer(
+                _d3d12maAllocator, _commandList.Get(),
+                allMeshletTris.data(), allMeshletTris.size() * sizeof(uint32_t),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                &_meshletTriAlloc, mtStaging, &mtSA);
+
+            _meshletMeshInfoBuffer = MeshLoader::UploadBuffer(
+                _d3d12maAllocator, _commandList.Get(),
+                meshletMeshInfos.data(), meshletMeshInfos.size() * sizeof(MeshletMeshInfo),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                &_meshletMeshInfoAlloc, mmStaging, &mmSA);
+        }
+
+        _commandList->Close();
+        ID3D12CommandList* lists3[] = { _commandList.Get() };
+        _commandQueue->ExecuteCommandLists(1, lists3);
+        ++_globalFenceValue;
+        _commandQueue->Signal(_fence.Get(), _globalFenceValue);
+        _frames[0].fenceValue = _globalFenceValue;
+        WaitForFrame(0);
+
+        if (mlSA) mlSA->Release();
+        if (mbSA) mbSA->Release();
+        if (mvSA) mvSA->Release();
+        if (mtSA) mtSA->Release();
+        if (mmSA) mmSA->Release();
+
+        LUNA_LOG_INFO("Phase 25: meshlets -- %zu meshlets, %zu meshlet verts, %zu meshlet tris",
+                      allMeshlets.size(), allMeshletVerts.size(), allMeshletTris.size());
+    }
 }
 
 bool DX12Backend::CreateIndirectResources()
@@ -3726,6 +3937,105 @@ void DX12Backend::FlushDraws()
     auto* cmd = _commandList.Get();
     const UINT instanceCount = static_cast<UINT>(_cpuInstances.size());
 
+    // Phase 25: Mesh shader path — per-object DispatchMesh with AS+MS culling
+    if (_meshShaderReady && _meshShaderGBufPipeline)
+    {
+        // Upload object data
+        memcpy(_objectDataMapped[_frameIndex], _cpuInstances.data(), instanceCount * sizeof(GPUObjectData));
+
+        // Build frustum planes
+        XMMATRIX V = XMLoadFloat4x4(&_lastView);
+        XMMATRIX P = XMLoadFloat4x4(&_lastProj);
+        XMMATRIX VP = XMMatrixMultiply(V, P);
+        XMFLOAT4X4 vpMat;
+        XMStoreFloat4x4(&vpMat, VP);
+
+        XMFLOAT4 frustumPlanes[6];
+        frustumPlanes[0] = { vpMat._14 + vpMat._11, vpMat._24 + vpMat._21, vpMat._34 + vpMat._31, vpMat._44 + vpMat._41 };
+        frustumPlanes[1] = { vpMat._14 - vpMat._11, vpMat._24 - vpMat._21, vpMat._34 - vpMat._31, vpMat._44 - vpMat._41 };
+        frustumPlanes[2] = { vpMat._14 + vpMat._12, vpMat._24 + vpMat._22, vpMat._34 + vpMat._32, vpMat._44 + vpMat._42 };
+        frustumPlanes[3] = { vpMat._14 - vpMat._12, vpMat._24 - vpMat._22, vpMat._34 - vpMat._32, vpMat._44 - vpMat._42 };
+        frustumPlanes[4] = { vpMat._13, vpMat._23, vpMat._33, vpMat._43 };
+        frustumPlanes[5] = { vpMat._14 - vpMat._13, vpMat._24 - vpMat._23, vpMat._34 - vpMat._33, vpMat._44 - vpMat._43 };
+        for (int i = 0; i < 6; ++i)
+        {
+            XMVECTOR p = XMLoadFloat4(&frustumPlanes[i]);
+            float len = XMVectorGetX(XMVector3Length(p));
+            if (len > 0.0001f)
+            {
+                p = XMVectorScale(p, 1.0f / len);
+                XMStoreFloat4(&frustumPlanes[i], p);
+            }
+        }
+
+        // Set pipeline state
+        cmd->SetPipelineState(_meshShaderGBufPipeline->GetPSO());
+        cmd->SetGraphicsRootSignature(_meshShaderGBufPipeline->GetRootSignature().Get());
+        cmd->RSSetViewports(1, &_screenViewport);
+        cmd->RSSetScissorRects(1, &_scissorRect);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[GBUFFER_COUNT] = { _gbufferRTV[0], _gbufferRTV[1], _gbufferRTV[2] };
+        cmd->OMSetRenderTargets(GBUFFER_COUNT, rtvs, FALSE, &_dsvHandle);
+
+        ID3D12DescriptorHeap* heaps[] = { _imGuiSrvHeap.Get() };
+        cmd->SetDescriptorHeaps(1, heaps);
+
+        // Bind SRV buffers (shared across all dispatches)
+        cmd->SetGraphicsRootShaderResourceView(3, _objectDataBuffer[_frameIndex]->GetGPUVirtualAddress()); // t0: objects
+        cmd->SetGraphicsRootShaderResourceView(4, _meshletBuffer->GetGPUVirtualAddress());                 // t1: meshlets
+        cmd->SetGraphicsRootShaderResourceView(5, _meshletBoundsBuffer->GetGPUVirtualAddress());           // t2: bounds
+        cmd->SetGraphicsRootShaderResourceView(6, _mergedVB->GetGPUVirtualAddress());                      // t3: vertices
+        cmd->SetGraphicsRootShaderResourceView(7, _meshletVertexBuffer->GetGPUVirtualAddress());            // t4: meshletVerts
+        cmd->SetGraphicsRootShaderResourceView(8, _meshletTriBuffer->GetGPUVirtualAddress());               // t5: meshletTris
+
+        // Bindless texture heap
+        D3D12_GPU_DESCRIPTOR_HANDLE heapBase = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        cmd->SetGraphicsRootDescriptorTable(9, heapBase);
+
+        // Per-object dispatch
+        for (UINT obj = 0; obj < instanceCount; ++obj)
+        {
+            const GPUObjectData& inst = _cpuInstances[obj];
+            uint32_t meshIdx = inst.meshIndex;
+            if (meshIdx >= _meshMeshletOffsets.size()) continue;
+
+            uint32_t meshletOff   = _meshMeshletOffsets[meshIdx];
+            uint32_t meshletCount = _meshMeshletCounts[meshIdx];
+            if (meshletCount == 0) continue;
+
+            // Fill per-dispatch constants
+            MeshShaderConstants msc{};
+            msc.viewMatrix = _lastView;
+            msc.projMatrix = _lastProj;
+            memcpy(msc.frustumPlanes, frustumPlanes, sizeof(frustumPlanes));
+            msc.objectIndex   = obj;
+            msc.meshletOffset = meshletOff;
+            msc.meshletCount  = meshletCount;
+            memcpy(_meshShaderCBMapped[_frameIndex], &msc, sizeof(msc));
+
+            cmd->SetGraphicsRootConstantBufferView(0, _meshShaderCB[_frameIndex]->GetGPUVirtualAddress());
+
+            // Material
+            cmd->SetGraphicsRootConstantBufferView(1, inst.materialCBAddr);
+            cmd->SetGraphicsRoot32BitConstant(2, inst.materialIndex, 0);
+
+            // Dispatch mesh: ceil(meshletCount / 32) groups
+            UINT groupCount = (meshletCount + 31) / 32;
+
+            ComPtr<ID3D12GraphicsCommandList6> cmd6;
+            cmd->QueryInterface(IID_PPV_ARGS(&cmd6));
+            if (cmd6)
+                cmd6->DispatchMesh(groupCount, 1, 1);
+        }
+
+        // Build Hi-Z pyramid for next frame
+        if (_hizTexture)
+            BuildHiZPyramid();
+
+        _cpuInstances.clear();
+        return;
+    }
+
     // Phase 13: async compute path — dispatch cull on compute queue
     if (_asyncComputeReady)
     {
@@ -3911,6 +4221,92 @@ void DX12Backend::FlushDraws()
         BuildHiZPyramid();
 
     _cpuInstances.clear();
+}
+
+// ===========================================================================
+// Phase 25: Mesh Shader Pipeline
+// ===========================================================================
+
+bool DX12Backend::CreateMeshShaderResources()
+{
+    if (!_meshShadersSupported || !_meshletBuffer) return false;
+
+    // Create mesh shader pipeline (AS + MS + PS)
+    _meshShaderGBufPipeline = std::make_unique<DX12Pipeline>();
+    PipelineStateDesc msDesc{};
+    msDesc.meshShaderPipeline = true;
+    msDesc.rootLayout         = RootSignatureLayout::MeshShaderGBuffer;
+    msDesc.enableDepthTest    = true;
+    msDesc.numRenderTargets   = GBUFFER_COUNT;
+    msDesc.rtvFormats[0]      = DXGI_FORMAT_R8G8B8A8_UNORM;       // GB0 albedo
+    msDesc.rtvFormats[1]      = DXGI_FORMAT_R16G16B16A16_FLOAT;   // GB1 normal
+    msDesc.rtvFormats[2]      = DXGI_FORMAT_R8G8B8A8_UNORM;       // GB2 metalRough
+
+    if (!_meshShaderGBufPipeline->InitializeMeshShader(
+            _device,
+            L"meshlet_cull.as.hlsl",
+            L"gbuffer_mesh.ms.hlsl",
+            L"gbuffer_mesh.frag.hlsl",
+            msDesc))
+    {
+        LUNA_LOG_ERROR("Phase 25: mesh shader pipeline creation failed");
+        _meshShaderGBufPipeline.reset();
+        return false;
+    }
+
+    // Create per-frame constant buffers for MeshShaderConstants
+    D3D12_HEAP_PROPERTIES uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC cbDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(MeshShaderConstants));
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc = {};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+        HRESULT hr = _d3d12maAllocator->CreateResource(
+            &allocDesc, &cbDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            &_meshShaderCBAlloc[i],
+            IID_PPV_ARGS(&_meshShaderCB[i]));
+        if (FAILED(hr))
+        {
+            LUNA_LOG_ERROR("Phase 25: mesh shader CB[%u] creation failed", i);
+            return false;
+        }
+        D3D12_RANGE readRange = { 0, 0 };
+        _meshShaderCB[i]->Map(0, &readRange, &_meshShaderCBMapped[i]);
+    }
+
+    _meshShaderReady = true;
+    LUNA_LOG_INFO("Phase 25: Mesh shader pipeline ready (%zu meshlets across %zu meshes)",
+                  _meshMeshletCounts.empty() ? 0 :
+                  _meshMeshletOffsets.back() + _meshMeshletCounts.back(),
+                  _meshMeshletCounts.size());
+    return true;
+}
+
+void DX12Backend::DestroyMeshShaderResources()
+{
+    _meshShaderReady = false;
+    _meshShaderGBufPipeline.reset();
+
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    {
+        if (_meshShaderCBAlloc[i]) { _meshShaderCBAlloc[i]->Release(); _meshShaderCBAlloc[i] = nullptr; }
+        _meshShaderCB[i].Reset();
+        _meshShaderCBMapped[i] = nullptr;
+    }
+
+    if (_meshletBufferAlloc)    { _meshletBufferAlloc->Release();    _meshletBufferAlloc = nullptr; }
+    if (_meshletBoundsAlloc)    { _meshletBoundsAlloc->Release();    _meshletBoundsAlloc = nullptr; }
+    if (_meshletVertexAlloc)    { _meshletVertexAlloc->Release();    _meshletVertexAlloc = nullptr; }
+    if (_meshletTriAlloc)       { _meshletTriAlloc->Release();       _meshletTriAlloc = nullptr; }
+    if (_meshletMeshInfoAlloc)  { _meshletMeshInfoAlloc->Release();  _meshletMeshInfoAlloc = nullptr; }
+    _meshletBuffer.Reset();
+    _meshletBoundsBuffer.Reset();
+    _meshletVertexBuffer.Reset();
+    _meshletTriBuffer.Reset();
+    _meshletMeshInfoBuffer.Reset();
+    _meshMeshletOffsets.clear();
+    _meshMeshletCounts.clear();
 }
 
 // ===========================================================================
@@ -4970,6 +5366,253 @@ void DX12Backend::DrawMotionBlurPass()
         D3D12_RESOURCE_STATE_DEPTH_WRITE);
     cmd->ResourceBarrier(2, post);
     // _hdrRT remains SRV — not needed by TAA (which reads _motionBlurSRVIndex)
+}
+
+// ===========================================================================
+// Phase 24: Clustered Lighting
+// ===========================================================================
+
+void DX12Backend::SetPointLights(const std::vector<PointLightDesc>& lights)
+{
+    _pointLights = lights;
+}
+
+bool DX12Backend::CreateClusteredLightingResources()
+{
+    // ─── Light buffer: host-visible UPLOAD heap (32 KB for 1024 lights) ───
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc = {};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(
+            MAX_POINT_LIGHTS * sizeof(DX12GPUPointLight));
+
+        HRESULT hr = _d3d12maAllocator->CreateResource(
+            &allocDesc, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, &_clusterLightBufferAlloc, IID_PPV_ARGS(&_clusterLightBuffer));
+        if (FAILED(hr)) return false;
+
+        _clusterLightBuffer->Map(0, nullptr, &_clusterLightBufferMapped);
+
+        // Create SRV for lights structured buffer
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu; D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+        _clusterLightSRVIndex = AllocateSRVSlot(cpu, gpu);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = 0;
+        srv.Buffer.NumElements = MAX_POINT_LIGHTS;
+        srv.Buffer.StructureByteStride = sizeof(DX12GPUPointLight);
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        _device->CreateShaderResourceView(_clusterLightBuffer.Get(), &srv, cpu);
+    }
+
+    // ─── ClusterParams constant buffer (96 bytes) ───
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc = {};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(256);  // 256-byte aligned
+
+        HRESULT hr = _d3d12maAllocator->CreateResource(
+            &allocDesc, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, &_clusterParamsCBAlloc, IID_PPV_ARGS(&_clusterParamsCB));
+        if (FAILED(hr)) return false;
+
+        _clusterParamsCB->Map(0, nullptr, &_clusterParamsCBMapped);
+    }
+
+    // ─── Cluster counts buffer: DEFAULT heap with UAV+SRV (~14 KB) ───
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc = {};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        UINT64 size = TOTAL_CLUSTERS * sizeof(uint32_t);
+        D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(
+            size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        HRESULT hr = _d3d12maAllocator->CreateResource(
+            &allocDesc, &rd, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, &_clusterCountsBufferAlloc, IID_PPV_ARGS(&_clusterCountsBuffer));
+        if (FAILED(hr)) return false;
+
+        // SRV
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuS, cpuU; D3D12_GPU_DESCRIPTOR_HANDLE gpuS, gpuU;
+        _clusterCountsSRVIndex = AllocateSRVSlot(cpuS, gpuS);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.NumElements = TOTAL_CLUSTERS;
+        srv.Buffer.StructureByteStride = sizeof(uint32_t);
+        _device->CreateShaderResourceView(_clusterCountsBuffer.Get(), &srv, cpuS);
+
+        // UAV
+        _clusterCountsUAVIndex = AllocateSRVSlot(cpuU, gpuU);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav.Buffer.NumElements = TOTAL_CLUSTERS;
+        uav.Buffer.StructureByteStride = sizeof(uint32_t);
+        _device->CreateUnorderedAccessView(_clusterCountsBuffer.Get(), nullptr, &uav, cpuU);
+    }
+
+    // ─── Cluster indices buffer: DEFAULT heap with UAV+SRV (~1.7 MB) ───
+    {
+        D3D12MA::ALLOCATION_DESC allocDesc = {};
+        allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+
+        UINT64 size = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER * sizeof(uint32_t);
+        D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(
+            size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        HRESULT hr = _d3d12maAllocator->CreateResource(
+            &allocDesc, &rd, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, &_clusterIndicesBufferAlloc, IID_PPV_ARGS(&_clusterIndicesBuffer));
+        if (FAILED(hr)) return false;
+
+        // SRV
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuS, cpuU; D3D12_GPU_DESCRIPTOR_HANDLE gpuS, gpuU;
+        _clusterIndicesSRVIndex = AllocateSRVSlot(cpuS, gpuS);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.NumElements = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER;
+        srv.Buffer.StructureByteStride = sizeof(uint32_t);
+        _device->CreateShaderResourceView(_clusterIndicesBuffer.Get(), &srv, cpuS);
+
+        // UAV
+        _clusterIndicesUAVIndex = AllocateSRVSlot(cpuU, gpuU);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav.Buffer.NumElements = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER;
+        uav.Buffer.StructureByteStride = sizeof(uint32_t);
+        _device->CreateUnorderedAccessView(_clusterIndicesBuffer.Get(), nullptr, &uav, cpuU);
+    }
+
+    // ─── Cluster assign compute pipeline ───
+    _clusterAssignPipeline = std::make_unique<DX12Pipeline>();
+    {
+        PipelineStateDesc desc;
+        desc.rootLayout    = RootSignatureLayout::ClusterAssign;
+        desc.computeShader = true;
+        if (!_clusterAssignPipeline->Initialize(_device, L"cluster_assign.comp.hlsl", L"", desc))
+        {
+            LUNA_LOG_WARN("Failed to create cluster assign compute pipeline");
+            _clusterAssignPipeline.reset();
+            return false;
+        }
+    }
+
+    _clusteredLightingReady = true;
+    LUNA_LOG_INFO("DX12: Clustered lighting initialized (16x9x24 = %u clusters, max %u lights)",
+                  TOTAL_CLUSTERS, MAX_POINT_LIGHTS);
+    return true;
+}
+
+void DX12Backend::DestroyClusteredLightingResources()
+{
+    _clusteredLightingReady = false;
+    _clusterAssignPipeline.reset();
+
+    if (_clusterLightBufferAlloc)   { _clusterLightBufferAlloc->Release();   _clusterLightBufferAlloc = nullptr; }
+    if (_clusterParamsCBAlloc)      { _clusterParamsCBAlloc->Release();      _clusterParamsCBAlloc = nullptr; }
+    if (_clusterCountsBufferAlloc)  { _clusterCountsBufferAlloc->Release();  _clusterCountsBufferAlloc = nullptr; }
+    if (_clusterIndicesBufferAlloc) { _clusterIndicesBufferAlloc->Release(); _clusterIndicesBufferAlloc = nullptr; }
+
+    _clusterLightBuffer.Reset();
+    _clusterParamsCB.Reset();
+    _clusterCountsBuffer.Reset();
+    _clusterIndicesBuffer.Reset();
+}
+
+void DX12Backend::DispatchClusterAssign()
+{
+    if (!_clusteredLightingReady || _pointLights.empty()) return;
+
+    auto cmd = _commandList.Get();
+
+    // ─── Transform lights to view-space and upload ───
+    XMMATRIX view = XMLoadFloat4x4(&_lastView);
+    uint32_t numLights = (uint32_t)std::min(_pointLights.size(), (size_t)MAX_POINT_LIGHTS);
+
+    auto* dst = static_cast<DX12GPUPointLight*>(_clusterLightBufferMapped);
+    for (uint32_t i = 0; i < numLights; ++i)
+    {
+        const auto& src = _pointLights[i];
+        XMVECTOR posW = XMVectorSet(src.position[0], src.position[1], src.position[2], 1.0f);
+        XMVECTOR posV = XMVector3TransformCoord(posW, view);
+        XMFLOAT3 pv; XMStoreFloat3(&pv, posV);
+
+        dst[i].position[0] = pv.x;
+        dst[i].position[1] = pv.y;
+        dst[i].position[2] = pv.z;
+        dst[i].radius = src.radius;
+        dst[i].color[0] = src.color[0];
+        dst[i].color[1] = src.color[1];
+        dst[i].color[2] = src.color[2];
+        dst[i].intensity = src.intensity;
+    }
+
+    // ─── Upload ClusterParams ───
+    XMMATRIX proj = XMLoadFloat4x4(&_lastProj);
+    XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
+    ClusterParamsData params;
+    XMStoreFloat4x4(&params.invProj, invProj);
+    params.nearZ = 0.1f;
+    params.farZ = 100.0f;
+    params.screenW = (float)_screenWidth;
+    params.screenH = (float)_screenHeight;
+    params.numLights = numLights;
+    params._pad[0] = params._pad[1] = params._pad[2] = 0;
+    memcpy(_clusterParamsCBMapped, &params, sizeof(params));
+
+    // ─── Barrier: cluster buffers to UAV state ───
+    D3D12_RESOURCE_BARRIER pre[2];
+    pre[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+        _clusterCountsBuffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    pre[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+        _clusterIndicesBuffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmd->ResourceBarrier(2, pre);
+
+    // ─── Clear cluster counts to zero ───
+    D3D12_GPU_DESCRIPTOR_HANDLE countsUAVGpu;
+    countsUAVGpu.ptr = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart().ptr
+                     + static_cast<UINT64>(_clusterCountsUAVIndex) * _srvDescriptorSize;
+    D3D12_CPU_DESCRIPTOR_HANDLE countsUAVCpu;
+    countsUAVCpu.ptr = _imGuiSrvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+                     + static_cast<UINT64>(_clusterCountsUAVIndex) * _srvDescriptorSize;
+    UINT clearVal[4] = {0, 0, 0, 0};
+    cmd->ClearUnorderedAccessViewUint(countsUAVGpu, countsUAVCpu, 
+        _clusterCountsBuffer.Get(), clearVal, 0, nullptr);
+
+    // ─── Dispatch cluster assignment ───
+    ID3D12DescriptorHeap* heaps[] = { _imGuiSrvHeap.Get() };
+    cmd->SetDescriptorHeaps(1, heaps);
+
+    BindPipeline(_clusterAssignPipeline.get());
+    cmd->SetComputeRootConstantBufferView(0, _clusterParamsCB->GetGPUVirtualAddress());
+
+    D3D12_GPU_DESCRIPTOR_HANDLE lightSrvGpu;
+    lightSrvGpu.ptr = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart().ptr
+                    + static_cast<UINT64>(_clusterLightSRVIndex) * _srvDescriptorSize;
+    cmd->SetComputeRootDescriptorTable(1, lightSrvGpu);
+    cmd->SetComputeRootDescriptorTable(2, countsUAVGpu);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE indicesUAVGpu;
+    indicesUAVGpu.ptr = _imGuiSrvHeap->GetGPUDescriptorHandleForHeapStart().ptr
+                      + static_cast<UINT64>(_clusterIndicesUAVIndex) * _srvDescriptorSize;
+    cmd->SetComputeRootDescriptorTable(3, indicesUAVGpu);
+
+    cmd->Dispatch(CLUSTER_X, CLUSTER_Y, CLUSTER_Z);
+
+    // ─── Barrier: UAV → SRV for deferred lighting ───
+    D3D12_RESOURCE_BARRIER post[2];
+    post[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+        _clusterCountsBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    post[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+        _clusterIndicesBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmd->ResourceBarrier(2, post);
 }
 
 } // namespace Luna

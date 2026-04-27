@@ -31,7 +31,8 @@ class Texture
               ComPtr<ID3D12Resource>& stagingOut,
               D3D12MA::Allocation**   stagingAllocOut);
 
-    // Load from pre-decoded RGBA8 buffer (4 bytes per pixel, width*height pixels).
+    // Phase 5B: Load from in-memory compressed image data (e.g. PNG/JPEG embedded in GLB).
+    // pixels_rgba8 is a pre-decoded RGBA8 buffer (4 bytes per pixel, width*height pixels).
     bool LoadFromRGBA8(const uint8_t* pixels_rgba8, UINT width, UINT height,
                        ID3D12Device* device,
                        D3D12MA::Allocator* allocator,

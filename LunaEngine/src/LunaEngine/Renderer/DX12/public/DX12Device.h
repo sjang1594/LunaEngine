@@ -17,7 +17,11 @@ public:
     IDXGIAdapter*         GetAdapter()       const { return _adapter.Get(); }
     UINT                  GetMSAAQuality()   const { return m4xMsaaQuality; }
 
+    // Phase 4A: DXR capability check
     bool SupportsDXR() const;
+
+    // Phase 25: Mesh shader capability check
+    bool SupportsMeshShaders() const;
 
 private:
     void CreateDebugLayer();

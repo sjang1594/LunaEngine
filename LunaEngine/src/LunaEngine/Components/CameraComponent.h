@@ -12,12 +12,16 @@ public:
     CameraComponent();
     virtual ~CameraComponent() = default;
 
+    // Orbital controls (called from Application input callbacks)
     void Orbit(float dYaw, float dPitch);
     void Zoom(float delta);
     void SetOrientation(XMVECTOR quat);
 
+    // Matrices for the rendering pipeline (Y-up LH)
     XMMATRIX GetViewMatrix() const;
     XMMATRIX GetProjectionMatrix() const;
+
+    // Accessors
     XMFLOAT3 GetEyePosition() const;
     void     SetAspect(float aspect) { _aspect = aspect; }
     float    GetFovDegrees() const { return XMConvertToDegrees(_fovRad); }

@@ -4,7 +4,7 @@
 **Platform:** Windows 11 · DirectX 12 · Vulkan
 **Language:** C++17
 **Build system:** Premake5 → MSBuild / Visual Studio 2022
-**Last updated:** 2026-04-25
+**Last updated:** 2026-04-28
 
 ---
 
@@ -95,6 +95,9 @@ GLFW window → DX12Device (DXGI adapter selection) → ID3D12CommandQueue
 | 22    | 2026-04-24 | GPU profiler overlay — per-pass GPU timestamp queries (DX12: ID3D12QueryHeap + ResolveQueryData; Vulkan: vkCmdWriteTimestamp + vkGetQueryPoolResults); named Begin/End regions (GBuffer Fill, GPU Cull, Indirect Draw, CSM Shadows, Hi-Z Build, SSAO, Deferred Lighting, SSR, TAA, Bloom, Tonemap); ImGui overlay window with per-pass ms timings and bar chart; both backends |
 | 23    | 2026-04-25 | Hi-Z occlusion culling (both backends) — Hi-Z pyramid generation: blit depth (D32_SFLOAT) → R32_SFLOAT mip 0, then iterative min-downsample via compute (hiz_generate.comp.hlsl / hiz_generate_vk.comp.glsl, 8×8 workgroups, min of 2×2 parent texels); ~11 mip levels for 1080p; per-mip descriptor sets + GENERAL layout storage images; DX12: CreateHiZResources() (committed R32_FLOAT, UAV+SRV per mip, HiZGenerate root sig + PSO), BuildHiZPyramid() (resource barriers + Dispatch per mip), called at end of FlushDraws(); Vulkan: CreateHiZResources() (VkImage R32_SFLOAT, per-mip VkImageView, compute pipeline + descriptor pool), BuildHiZPyramid(cmd) (vkCmdBlitImage depth→mip0, then vkCmdDispatch per mip with inter-mip COMPUTE→COMPUTE barriers), called in FlushDraws() pre-cull AND CompositeFrame() post-draw with depth layout restore barrier (READ_ONLY→ATTACHMENT→TRANSFER_SRC→ATTACHMENT→READ_ONLY); gpu_cull.comp.hlsl / gpu_cull_vk.comp.glsl extended: HiZTestSphere() projects bounding sphere to screen AABB, picks mip where 1 texel covers AABB, samples 4 corners, rejects if object.z > min(occluder depths); enableHiZ push constant / CullConstants flag; _hizReady bool gates activation (first frame = frustum-only); Bug #009: depth layout mismatch fix (see Docs/bug-fix/009) |
 | 20    | 2026-04-25 | Vulkan async compute — dedicated compute queue discovery (VK_QUEUE_COMPUTE_BIT without VK_QUEUE_GRAPHICS_BIT, fallback: second queue from graphics family); per-frame VkCommandPool + VkCommandBuffer + VkSemaphore + VkFence for compute-only submissions; DispatchCullAsync() records cull dispatch on compute queue with queue ownership release barriers (srcQueueFamilyIndex=compute, dstQueueFamilyIndex=graphics) for _indirectArgBuffer and _drawCountBuffer; FlushDraws() restructured: async path dispatches cull on compute queue + records acquire barriers on graphics cmd, fallback path keeps single-queue dispatch; EndFrame() chains computeDoneSemaphore into graphics VkSubmitInfo (DRAW_INDIRECT stage wait); same-family handling uses VK_QUEUE_FAMILY_IGNORED; Hi-Z pyramid stays on graphics queue; graceful fallback when async not available |
+| 24    | 2026-04-26 | Clustered lighting (both backends) — 16×9×24 view-frustum clusters with logarithmic depth slicing; cluster_assign compute shader (Vulkan GLSL + DX12 HLSL, sphere-AABB light test per cluster, dispatch 16×9×24); GPUPointLight SSBO (32B per light, max 1024, host-visible); ClusterParams UBO (invProj, near/far, screen dims); cluster counts + indices SSBOs (device-local, ~1.7 MB total); lights transformed to view space per frame; render graph compute pass before deferred lighting with COMPUTE→FRAGMENT buffer barriers; deferred_lighting_ibl shaders extended with cluster data bindings for per-pixel cluster index + Cook-Torrance BRDF per point light; SceneConstants/DeferredSceneUBO extended with numPointLights; pipeline layouts expanded; IRenderBackend::SetPointLights() API; ImGui Point Lights editor panel |
+| 26    | 2026-04-27 | Vulkan render graph: transient resource aliasing — VulkanRenderGraph extended with CreateTransientImage() API; graph-owned VkImages backed by aliased VkDeviceMemory; Compile() pipeline: DAG reference-count flood-fill cull → transient lifetime analysis (firstPass/lastPass per image) → greedy interval-graph colouring assigns alias slots → per-slot VkAllocateMemory (DEVICE_LOCAL) + VkCreateImage + VkBindImageMemory at offset 0; Execute() emits aliasing barriers (VkImageMemoryBarrier with oldLayout=UNDEFINED) when a new transient takes over a memory slot; FindMemoryType helper queries VkPhysicalDeviceMemoryProperties; memory savings logged at Compile() time; Shutdown() destroys owned VkImages + VkFreeMemory; constructor accepts VkDevice + VkPhysicalDevice (optional, backward-compatible default ctor preserved); CompositeFrame() passes device info; all existing images remain imported (persistent) — aliasing infrastructure ready for migration of short-lived intermediates |
+| 28    | 2026-04-27 | Physically-based atmosphere rendering (Hillaire 2020, Vulkan) — 3-LUT pipeline: transmittance (256×64, 64-step ray march, one-time), multi-scattering (32×32, 64 hemisphere dirs × 20 steps + ground bounce, one-time), sky-view (192×108, 32 steps single+multi scatter, per-frame); VulkanAtmosphere subsystem (Create/Update/DrawComposite lifecycle); 6 GLSL shaders (atmosphere_common.glsl shared include, transmittance/multiscatter/skyview compute, composite fragment, fullscreen vertex); Hillaire parameterization: non-linear V (square-root zenith mapping), azimuth [0, 2π]; sun disk with limb-darkening (Schlick approximation); Earth defaults (Rayleigh 5.8/13.6/33.1 × 10⁻⁶ /m, Mie 4.0 × 10⁻⁶ /m, ozone layer, ground radius 6360 km); render graph: Atmo SkyView LUT compute pass (.SideEffect) + Sky Composite graphics pass (.SideEffect, writes hHDR); Bug #015 post-ship fix: replaced _ppRenderPass (DONT_CARE) with owned _atmosphereRenderPass (LOAD_OP_LOAD, initialLayout=SHADER_READ_ONLY_OPTIMAL) — eliminates sceneTex feedback loop; fragment shader now discards scene pixels; fixed first-frame skyView barrier (_precomputed → _skyViewReady flag) |
 
 ---
 
@@ -830,6 +833,112 @@ Without anisotropic filtering, UV seam artifacts were amplified.
 
 ---
 
+## Phase 25 — Mesh Shaders (DX12 SM 6.5)
+
+**Date:** 2026-04-27
+
+Replace the Phase 12 vertex/index `ExecuteIndirect` pipeline with DX12 mesh shaders. An amplification shader performs per-meshlet frustum culling on the GPU; visible meshlets are dispatched to a mesh shader that reads vertex/index data from structured buffers and outputs triangles directly to the existing G-buffer MRT layout. No input assembler is involved.
+
+### Why Mesh Shaders Matter
+
+The traditional GPU-driven pipeline (Phase 12) still relies on the fixed-function input assembler:
+
+```
+CPU: record GPUObjectData[] → GPU compute: frustum cull → ExecuteIndirect
+     ↓                                                          ↓
+     Upload N objects                                   IA fetches vertices
+                                                        from merged VB/IB
+```
+
+**Mesh shaders eliminate the input assembler entirely.** The key differences:
+
+| Aspect | Phase 12 (ExecuteIndirect) | Phase 25 (Mesh Shaders) |
+|--------|---------------------------|------------------------|
+| **Cull granularity** | Per-object (whole mesh) | Per-meshlet (~124 tris) — finer rejection |
+| **Vertex fetch** | Fixed-function IA reads VB/IB | Programmable: mesh shader reads `StructuredBuffer<PBRVertex>` |
+| **Index format** | 32-bit per index (4 B) | Packed uint8×3 per triangle (3 B) — ~25% index memory savings |
+| **Draw call** | `ExecuteIndirect` (CPU-initiated) | `DispatchMesh` (GPU-initiated from AS) |
+| **Pipeline** | VS → Rasterizer → PS | AS → MS → Rasterizer → PS |
+| **Culling location** | Separate compute dispatch + barrier + indirect | Inline in amplification shader — zero barrier overhead |
+| **Thread model** | 1 VS invocation per vertex (IA-driven) | Cooperative threadgroups (128 threads share meshlet work) |
+
+The main win is **meshlet-level culling**: a 15K-triangle mesh (~125 meshlets) can reject individual 124-tri clusters behind walls, instead of the all-or-nothing per-object test. On Sponza, this means rooms behind the camera are rejected at meshlet granularity rather than only at mesh granularity.
+
+### Implementation
+
+1. **Meshlet generation** (CPU, at load time in `BuildMergedGeometry`)
+   - Greedy algorithm: walk triangles in order, add to current meshlet until 64-vertex or 124-triangle limit hit
+   - Per-meshlet bounding sphere computed from vertex positions (AABB centre + max radius)
+   - Triangle indices packed as `uint32`: `idx0 | (idx1 << 8) | (idx2 << 16)` — 3 bytes per tri vs 12 bytes for 3×uint32
+   - Output: `Meshlet[]`, `MeshletBounds[]`, `meshletVertices[]` (global VB indices), `meshletTriangles[]` (packed local indices)
+
+2. **Amplification shader** (`meshlet_cull.as.hlsl`, SM 6.5)
+   - `[numthreads(32,1,1)]` — one thread per meshlet, one group per 32-meshlet batch
+   - Per-meshlet: transform bounding sphere to world space → 6-plane frustum test
+   - Wave intrinsics (`WavePrefixCountBits`, `WaveActiveCountBits`) compact visible meshlets
+   - `DispatchMesh(visibleCount, 1, 1)` — only visible meshlets proceed
+
+3. **Mesh shader** (`gbuffer_mesh.ms.hlsl`, SM 6.5)
+   - `[numthreads(128,1,1)]` with `[outputtopology("triangle")]`
+   - Reads `StructuredBuffer<PBRVertex>` via meshlet vertex indices (no IA, no VBV/IBV)
+   - Transforms position/normal/tangent identically to `pbr_indirect.vert.hlsl`
+   - Outputs match `PSInput` in `gbuffer.frag.hlsl` — pixel shader is unchanged
+
+4. **Pixel shader** (`gbuffer_mesh.frag.hlsl`, SM 6.5)
+   - Same G-buffer output as `gbuffer.frag.hlsl`
+   - Bindless textures via `gAllTextures[] : register(t0, space1)` + `materialIndex` root constant
+
+5. **Root signature** (`MeshShaderGBuffer`)
+   - `b0` = MeshShaderConstants CBV (view/proj + frustum planes + object/meshlet info)
+   - `b1` = MaterialConstants CBV, `b2` = materialIndex root constant
+   - `t0-t5 space0` = object data, meshlets, bounds, merged vertices, meshlet vertices, meshlet triangles
+   - `t0+ space1` = unbounded bindless SRV heap
+   - `s0` = anisotropic sampler
+
+6. **PSO creation** via `D3D12_PIPELINE_STATE_STREAM_DESC` + `ID3D12Device2::CreatePipelineState`
+   - Pipeline state stream with `CD3DX12_PIPELINE_STATE_STREAM_AS`, `_MS`, `_PS` subobjects
+   - No input layout, no VS — mesh shader pipeline is a fundamentally different PSO type
+
+7. **Feature detection** — `D3D12_FEATURE_DATA_D3D12_OPTIONS7::MeshShaderTier >= D3D12_MESH_SHADER_TIER_1`
+   - Graceful fallback: if unsupported, `_meshShaderReady = false` → Phase 12 indirect draw path used
+
+### Frame Execution (Mesh Shader Path)
+
+```
+FlushDraws():
+  for each object in _cpuInstances[]:
+    fill MeshShaderConstants (viewProj + frustum + objectIdx + meshletRange)
+    SetGraphicsRootCBV(0, meshShaderCB)
+    SetGraphicsRootCBV(1, materialCB)
+    SetGraphicsRoot32BitConstant(2, materialIndex)
+    DispatchMesh(ceil(meshletCount / 32), 1, 1)
+      ↓
+    AS: 32 threads cull 32 meshlets → compact → DispatchMesh(visibleCount)
+      ↓
+    MS: 128 threads process 1 meshlet → SetMeshOutputCounts → emit verts + tris
+      ↓
+    PS: gbuffer_mesh.frag.hlsl → G-buffer MRT (same as Phase 12)
+```
+
+### Files Added/Modified
+
+| File | Type | Description |
+|------|------|-------------|
+| `Renderer/Meshlet.h` | New | `Meshlet`, `MeshletBounds`, `MeshletMeshInfo` structs + `BuildMeshlets()` |
+| `Renderer/Meshlet.cpp` | New | Greedy meshlet builder with bounding sphere computation |
+| `Shaders/meshlet_cull.as.hlsl` | New | Amplification shader — per-meshlet frustum cull + wave compact |
+| `Shaders/gbuffer_mesh.ms.hlsl` | New | Mesh shader — structured buffer vertex fetch + G-buffer output |
+| `Shaders/gbuffer_mesh.frag.hlsl` | New | Pixel shader for mesh shader pipeline (bindless textures) |
+| `Graphics/IPipeline.h` | Modified | Added `MeshShaderGBuffer` root sig layout, `meshShaderPipeline` flag |
+| `DX12/Public/DX12Pipeline.h` | Modified | Added `InitializeMeshShader()`, `CreateMeshShaderPSO()`, AS/MS blobs |
+| `DX12/Private/DX12Pipeline.cpp` | Modified | Mesh shader root sig + PSO via pipeline state stream API |
+| `DX12/Public/DX12Device.h` | Modified | Added `SupportsMeshShaders()` |
+| `DX12/Private/DX12Device.cpp` | Modified | `D3D12_FEATURE_DATA_D3D12_OPTIONS7` mesh shader tier check |
+| `DX12/Public/DX12Backend.h` | Modified | Mesh shader members: pipeline, meshlet buffers, per-frame CB |
+| `DX12/Private/DX12Backend.cpp` | Modified | Meshlet generation in `BuildMergedGeometry()`, `CreateMeshShaderResources()`, `DispatchMesh` path in `FlushDraws()` |
+
+---
+
 ## Remaining Roadmap
 
 | Phase | Priority | Feature | Status |
@@ -856,6 +965,26 @@ Without anisotropic filtering, UV seam artifacts were amplified.
 | 22    | ★★★      | GPU profiler overlay (timestamp queries + ImGui bar chart) | ✅ Done |
 | 23    | ★★★      | Hi-Z occlusion culling (2-pass GPU cull) | ✅ Done |
 | 20    | ★★☆      | Vulkan async compute | ✅ Done |
-| 24    | ★★☆      | Clustered/tiled forward lighting (multi-light support) | Planned |
-| 25    | ★★☆      | Mesh shaders (DX12 SM 6.5 amplification + mesh shader) | Planned |
-| 26    | ★☆☆      | Vulkan render graph: transient resource aliasing | Planned |
+| 24    | ★★☆      | Clustered lighting (16×9×24 clusters, compute assign, deferred accumulation) | ✅ Done (both backends) |
+| 25    | ★★☆      | Mesh shaders (DX12 SM 6.5 amplification + mesh shader) | ✅ Done |
+| 26    | ★☆☆      | Vulkan render graph: transient resource aliasing | ✅ Done |
+| 27    | ★★★      | Vulkan mesh shaders (VK_EXT_mesh_shader) | ✅ Done |
+| 28    | ★★★      | Atmosphere / sky rendering (Hillaire 2020) | ✅ Done |
+| 29    | ★★☆      | Volumetric lighting / fog (froxel-based) | Planned |
+| 30    | ★★☆      | Global illumination (SSGI + irradiance probes) | Planned |
+| 31    | ★★☆      | Order-independent transparency (OIT) | Planned |
+| 32    | ★★☆      | Visibility buffer rendering | Planned |
+| 33    | ★☆☆      | Variable rate shading (VRS) | Planned |
+
+### Simulation Track (deferred)
+
+Sensor simulation phases use separate S-series numbering. Work begins after the rendering track is complete.
+
+| Phase | Priority | Feature | Status |
+|-------|----------|---------|--------|
+| S1    | ★☆☆      | Sensor simulation foundation (data structures, ImGui panels, BEV) | ✅ Done |
+| S2    | ★★☆      | Camera sensor offscreen rendering | Deferred |
+| S3    | ★★☆      | LiDAR GPU raycasting (DXR RayQuery compute) | Deferred |
+| S4    | ★★☆      | Radar scene query + CPU FFT → range-Doppler | Deferred |
+| S5    | ★☆☆      | Sensor data export (PNG, PLY/PCD, CSV) | Deferred |
+

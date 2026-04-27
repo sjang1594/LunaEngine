@@ -137,6 +137,10 @@ bool VulkanDevice::CreateLogicalDevice()
     VkPhysicalDeviceRayQueryFeaturesKHR rqFeatures{};
     rqFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
 
+    // Phase 27: probe mesh shader support
+    VkPhysicalDeviceMeshShaderFeaturesEXT msFeatures{};
+    msFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+
     // Chain all feature structs and query
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -144,6 +148,7 @@ bool VulkanDevice::CreateLogicalDevice()
     asFeatures.pNext = &rtFeatures;
     rtFeatures.pNext = &bdaFeatures;
     bdaFeatures.pNext = &rqFeatures;
+    rqFeatures.pNext = &msFeatures;
     vkGetPhysicalDeviceFeatures2(_physicalDevice, &features2);
 
     _rtSupported = asFeatures.accelerationStructure && rtFeatures.rayTracingPipeline
@@ -152,6 +157,13 @@ bool VulkanDevice::CreateLogicalDevice()
         LUNA_LOG_INFO("VK RT: hardware ray tracing supported — enabling RT extensions");
     else
         LUNA_LOG_INFO("VK RT: ray tracing not supported — falling back to CSM shadows");
+
+    // Phase 27: check mesh shader support
+    _meshShaderSupported = msFeatures.taskShader && msFeatures.meshShader;
+    if (_meshShaderSupported)
+        LUNA_LOG_INFO("VK Mesh Shader: VK_EXT_mesh_shader supported — enabling task+mesh shaders");
+    else
+        LUNA_LOG_INFO("VK Mesh Shader: not supported — using indirect draw path");
 
     // Vulkan 1.2 features — covers descriptor indexing, drawIndirectCount, bufferDeviceAddress.
     // VkPhysicalDeviceVulkan12Features must not coexist with VkPhysicalDeviceDescriptorIndexingFeatures
@@ -170,6 +182,7 @@ bool VulkanDevice::CreateLogicalDevice()
     deviceFeatures.multiDrawIndirect = VK_TRUE;
 
     // Build pNext chain: vk12Features → [asFeatures → rtFeatures → rqFeatures] if RT
+    //                                  → [msFeatures] if mesh shader
     // bdaFeatures removed — bufferDeviceAddress lives in vk12Features now
     void** ppNextTail = &vk12Features.pNext;
     if (_rtSupported)
@@ -182,6 +195,20 @@ bool VulkanDevice::CreateLogicalDevice()
         rtFeatures.pNext = &rqFeatures;
         rqFeatures.pNext = nullptr;
         *ppNextTail = &asFeatures;
+        ppNextTail = &rqFeatures.pNext;
+    }
+
+    // Phase 27: chain mesh shader features
+    if (_meshShaderSupported)
+    {
+        msFeatures.taskShader = VK_TRUE;
+        msFeatures.meshShader = VK_TRUE;
+        // Disable sub-features that require additional dependencies we don't enable
+        msFeatures.multiviewMeshShader                    = VK_FALSE;
+        msFeatures.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+        msFeatures.meshShaderQueries                      = VK_FALSE;
+        msFeatures.pNext = nullptr;
+        *ppNextTail = &msFeatures;
     }
 
     VkDeviceCreateInfo createInfo {};
@@ -203,6 +230,11 @@ bool VulkanDevice::CreateLogicalDevice()
         deviceExtensions.push_back("VK_KHR_deferred_host_operations");
         deviceExtensions.push_back("VK_KHR_buffer_device_address");
         deviceExtensions.push_back("VK_KHR_ray_query");
+    }
+    // Phase 27: mesh shader extension
+    if (_meshShaderSupported)
+    {
+        deviceExtensions.push_back("VK_EXT_mesh_shader");
     }
     createInfo.enabledExtensionCount   = static_cast<uint32_t>(deviceExtensions.size());
     createInfo.ppEnabledExtensionNames = deviceExtensions.data();

@@ -127,6 +127,7 @@ void Application::Init()
     glfwSetMouseButtonCallback(_windowHandle, OnMouseButton);
     glfwSetScrollCallback(_windowHandle,     OnScroll);
 
+    // Load icon
     GLFWimage icon = {};
     if (!_specification.iconPath.empty())
     {
@@ -144,6 +145,7 @@ void Application::Init()
         }
     }
 
+    // Initialize render backend (use actual framebuffer size — may differ from spec after title bar init)
     if (_specification.backend == RenderBackendType::DirectX12)
     {
 #ifdef _WIN32
@@ -170,18 +172,22 @@ void Application::Init()
         LUNA_LOG_ERROR("MoltenVK backend is not supported yet");
     }
 
+    // P2-04: propagate vsync preference to the backend
     IRenderContext::SetVSync(_specification.vsync);
 
     IRenderContext::InitImGui(_windowHandle);
 
+    // Apply Walnut-style dark theme with black borders
     ImGuiTheme::ApplyWalnutTheme();
 
+    // Update camera aspect ratio for the actual framebuffer size
     if (initWidth != _specification.width || initHeight != _specification.height)
     {
         float aspect = static_cast<float>(initWidth) / static_cast<float>(initHeight);
         _camera.SetAspect(aspect);
     }
 
+    // Load the initial test scene (glTF mesh upload happens here)
     SceneManager::GetInstance()->LoadScene(L"Test");
 
     _lastFrameTime = GetTime();
@@ -198,7 +204,10 @@ void Application::Run()
         float time   = GetTime();
         _frameTime   = time - _lastFrameTime;
         _lastFrameTime = time;
-        
+
+        // ----------------------------------------------------------------
+        // Update MVP — prefer scene CameraComponent, fallback to legacy _camera
+        // ----------------------------------------------------------------
         {
             XMMATRIX model = XMMatrixIdentity();
             XMMATRIX view, proj;
@@ -226,6 +235,7 @@ void Application::Run()
         IRenderContext::BeginFrame();
         IRenderContext::StartImGuiFrame();
 
+        // Render custom title bar (minimize/maximize/close, badges)
         if (_specification.customTitleBar)
         {
             float fps = (_frameTime > 0.0f) ? 1.0f / _frameTime : 0.0f;
@@ -233,11 +243,13 @@ void Application::Run()
             _titleBar.Render();
         }
 
+        // Menu bar — rendered below the custom title bar (or at top if no custom bar)
         float menuBarHeight = 0.0f;
         if (_menubarCallBack)
         {
             if (_specification.customTitleBar)
             {
+                // Position a dedicated menu bar window just below the title bar
                 ImGuiViewport* vp = ImGui::GetMainViewport();
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -270,6 +282,7 @@ void Application::Run()
             }
             else
             {
+                // Standard ImGui main menu bar (no custom title bar)
                 if (ImGui::BeginMainMenuBar())
                 {
                     _menubarCallBack();
@@ -279,6 +292,7 @@ void Application::Run()
             }
         }
 
+        // DockSpace — offset Y by title bar + menu bar height
         float titleBarOffset = (_specification.customTitleBar ? _titleBar.GetHeight() : 0.0f)
                              + menuBarHeight;
         ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -304,12 +318,25 @@ void Application::Run()
             layer->OnUIRender();
 
 
-        // DrawFrame binds G-buffer → Update records meshes → FlushDraws executes → CompositeFrame reads G-buffer.
+        // DrawFrame() sets up G-buffer RTVs and clears them; command list stays open.
         IRenderContext::DrawFrame();
+
+        // Scene update: calls MeshRenderer::Render() per object, which records
+        // DrawIndexedInstanced into the open command list via IRenderContext::DrawMesh().
+        // DrawMesh() writes geometry into the G-buffer RTVs (Phase 7 deferred rendering).
+        // IMPORTANT: must happen AFTER DrawFrame() (which binds G-buffer RTVs) and
+        // BEFORE CompositeFrame() (which reads the G-buffer as SRVs).
         SceneManager::GetInstance()->Update();
+
+        // Phase 12: Flush recorded DrawMesh() calls — uploads instances, dispatches
+        // GPU frustum cull compute, executes indirect draws into the G-buffer.
         IRenderContext::FlushDraws();
+
+        // Phase 7: Deferred composite — reads G-buffer + shadow, runs Cook-Torrance
+        // lighting, writes final color to the back buffer.
         IRenderContext::CompositeFrame();
 
+        // GPU profiler overlay (rendered as ImGui window before ImGui::Render())
         {
             auto* backend = IRenderContext::GetBackend();
             if (backend)
@@ -383,6 +410,9 @@ float Application::GetTime() const
     return static_cast<float>(glfwGetTime());
 }
 
+// ---------------------------------------------------------------------------
+// GLFW static callbacks — retrieve the Application* from the user pointer
+// ---------------------------------------------------------------------------
 void Application::OnFramebufferResize(GLFWwindow* w, int width, int height)
 {
     if (width == 0 || height == 0) return;
@@ -396,6 +426,7 @@ void Application::OnFramebufferResize(GLFWwindow* w, int width, int height)
 
 void Application::OnMouseButton(GLFWwindow* w, int button, int action, int /*mods*/)
 {
+    // Don't process camera input when ImGui wants the mouse or gizmo is active/hovered
     if (ImGui::GetIO().WantCaptureMouse || IsGizmoDragging() || IsGizmoHovered()) return;
 
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
@@ -418,12 +449,14 @@ void Application::OnMouseMove(GLFWwindow* w, double x, double y)
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));
     if (!app->_mouseDown) return;
 
+    // Don't process camera input when ImGui wants the mouse or gizmo is active/hovered
     if (ImGui::GetIO().WantCaptureMouse || IsGizmoDragging() || IsGizmoHovered())
     {
-        app->_mouseDown = false;  // prevent stuck drag state
+        app->_mouseDown = false;  // Reset to prevent stuck drag state
         return;
     }
 
+    // Sensitivity: 0.3 degrees per pixel
     constexpr float kSensitivity = 0.3f;
     float dYaw   = static_cast<float>(x - app->_lastMouseX) * kSensitivity;
     float dPitch = static_cast<float>(y - app->_lastMouseY) * kSensitivity;
@@ -433,6 +466,7 @@ void Application::OnMouseMove(GLFWwindow* w, double x, double y)
     if (app->_specification.backend == RenderBackendType::Vulkan)
         dPitch = -dPitch;
 
+    // Route to scene camera if available, else legacy camera
     auto sceneCam = app->GetSceneCamera();
     if (sceneCam)
         sceneCam->Orbit(dYaw, dPitch);
@@ -444,6 +478,7 @@ void Application::OnMouseMove(GLFWwindow* w, double x, double y)
 
 void Application::OnScroll(GLFWwindow* w, double /*xOffset*/, double yOffset)
 {
+    // Don't process camera input when ImGui wants the mouse
     if (ImGui::GetIO().WantCaptureMouse) return;
 
     auto* app = static_cast<Application*>(glfwGetWindowUserPointer(w));

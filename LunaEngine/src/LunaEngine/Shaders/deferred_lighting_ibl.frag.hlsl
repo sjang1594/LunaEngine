@@ -1,12 +1,18 @@
 // deferred_lighting_ibl.frag.hlsl — Phase 14: IBL-enhanced deferred lighting
 // Extends deferred_lighting_hdr.frag.hlsl with full IBL (diffuse irradiance +
 // specular split-sum) replacing the flat ambient term.
+// Phase 24: Clustered point light support
 //
 // Additional bindings vs. the Phase 10 HDR variant:
 //   t6 = irradiance cubemap  (TextureCube, R16G16B16A16_FLOAT, 32²×6)
 //   t7 = prefiltered env map  (TextureCube, R16G16B16A16_FLOAT, 128²×6 + 5 mips)
 //   t8 = BRDF integration LUT (Texture2D,   RG16F, 512×512)
 //   s2 = trilinear-clamp sampler (IBL)
+// Phase 24 bindings (t9-t11, b1):
+//   b1 = ClusterParams UBO
+//   t9 = GPUPointLight[] (StructuredBuffer)
+//   t10 = clusterLightCounts (StructuredBuffer<uint>)
+//   t11 = clusterLightIndices (StructuredBuffer<uint>)
 
 
 cbuffer SceneConstants : register(b0)
@@ -18,6 +24,34 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 viewMatrix;
     row_major float4x4 lightVP[4];
     float4 cascadeSplits;
+    uint   numPointLights;  // Phase 24
+    uint3  _pad2;
+};
+
+// Phase 24: Cluster lighting constants
+cbuffer ClusterParams : register(b1)
+{
+    row_major float4x4 clusterInvProj;
+    float clusterNearZ;
+    float clusterFarZ;
+    float clusterScreenW;
+    float clusterScreenH;
+    uint  clusterNumLights;
+    uint3 _clPad;
+};
+
+// Phase 24: Cluster data structures
+static const uint CLUSTER_X = 16u;
+static const uint CLUSTER_Y = 9u;
+static const uint CLUSTER_Z = 24u;
+static const uint MAX_LIGHTS_PER_CLUSTER = 128u;
+
+struct GPUPointLight
+{
+    float3 position;  // view-space
+    float  radius;
+    float3 color;
+    float  intensity;
 };
 
 Texture2D             gbuffer0     : register(t0);
@@ -31,6 +65,11 @@ Texture2D<float>      ssaoBlurTex  : register(t5);
 TextureCube<float4>   irrMap       : register(t6);
 TextureCube<float4>   prefilterMap : register(t7);
 Texture2D<float2>     brdfLUT      : register(t8);
+
+// Phase 24: Clustered lighting data
+StructuredBuffer<GPUPointLight> pointLights         : register(t9);
+StructuredBuffer<uint>          clusterLightCounts  : register(t10);
+StructuredBuffer<uint>          clusterLightIndices : register(t11);
 
 SamplerState pointClamp    : register(s0);
 SamplerState bilinearClamp : register(s1);
@@ -178,6 +217,58 @@ float4 main(PSInput input) : SV_Target0
     float  ao = ssaoBlurTex.Sample(bilinearClamp, input.uv);
 
     float3 Lo = (diffuseDirect + specularDirect) * radiance * NdL * shadow;
+
+    // Phase 24: Clustered point light accumulation
+    if (numPointLights > 0u)
+    {
+        // Determine cluster index from screen position + view-space depth
+        float logRatio = log(clusterFarZ / clusterNearZ);
+        uint cx = uint(input.uv.x * float(CLUSTER_X));
+        uint cy = uint(input.uv.y * float(CLUSTER_Y));
+        uint cz = uint(log(viewZ / clusterNearZ) / logRatio * float(CLUSTER_Z));
+        cx = min(cx, CLUSTER_X - 1u);
+        cy = min(cy, CLUSTER_Y - 1u);
+        cz = min(cz, CLUSTER_Z - 1u);
+
+        uint clusterIdx = cx + cy * CLUSTER_X + cz * CLUSTER_X * CLUSTER_Y;
+        uint lightCount = clusterLightCounts[clusterIdx];
+        uint baseIdx    = clusterIdx * MAX_LIGHTS_PER_CLUSTER;
+
+        for (uint li = 0u; li < lightCount; ++li)
+        {
+            uint lightIdx = clusterLightIndices[baseIdx + li];
+            GPUPointLight pl = pointLights[lightIdx];
+
+            // Light is in view space — compute direction and attenuation
+            float3 Lpl = pl.position - posVS.xyz;
+            float dist = length(Lpl);
+            if (dist >= pl.radius) continue;
+            Lpl /= dist;
+
+            float attenuation = 1.0f / (dist * dist + 0.01f);
+            // Smooth radius falloff
+            float falloff = 1.0f - smoothstep(0.8f * pl.radius, pl.radius, dist);
+            attenuation *= falloff;
+
+            // Transform light direction to world space for BRDF (N, V are world-space)
+            // posVS = posWS * viewMatrix → Lpl_ws = transpose(viewMatrix) * Lpl_vs
+            float3 LplWS = normalize(mul(Lpl, (float3x3)viewMatrix));
+
+            float3 Hpl = normalize(V + LplWS);
+
+            float Dpl = D_GGX(N, Hpl, roughness);
+            float Gpl = G_SmithSchlick(N, V, LplWS, roughness);
+            float3 Fpl = F_Schlick(max(dot(Hpl, V), 0.0f), F0);
+            float3 specPl = (Dpl * Gpl * Fpl) / max(4.0f * dot(N, V) * max(dot(N, LplWS), 0.0f), 0.001f);
+            float3 kDpl   = (1.0f - Fpl) * (1.0f - metallic);
+            float3 diffPl = kDpl * albedo / PI;
+
+            float NdLpl = max(dot(N, LplWS), 0.0f);
+            float3 plRadiance = pl.color * pl.intensity;
+
+            Lo += (diffPl + specPl) * plRadiance * NdLpl * attenuation;
+        }
+    }
 
     // Phase 14: IBL ambient (split-sum approximation)
     float  NdV      = max(dot(N, V), 0.0f);

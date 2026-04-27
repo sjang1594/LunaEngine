@@ -22,10 +22,12 @@ struct FrameResource
     ComPtr<ID3D12Resource>         mvpCB;
     void*                          mvpCBMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS      mvpCBGPUAddr = 0;
+    // Phase 7: per-frame scene constants (invVP, eyePos, lightDir/Color)
     ComPtr<ID3D12Resource>         sceneCB;
     void*                          sceneCBMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS      sceneCBGPUAddr = 0;
     UINT64                         fenceValue   = 0;
+    // Phase 13: per-frame async compute command allocator
     ComPtr<ID3D12CommandAllocator> computeCmdAllocator;
     UINT64                         computeFenceValue = 0;
 };
@@ -54,8 +56,11 @@ class DX12Backend : public IRenderBackend
     void DrawMesh(const Mesh* mesh, const XMFLOAT4X4& model) override;
     void SetVSync(bool vsync) override { _vsync = vsync; }
 
+    // Phase 22: GPU profiler
     IGPUProfiler* GetGPUProfiler() override { return &_gpuProfiler; }
 
+    // Load all primitives from a glTF/GLB file and store them in _sceneMeshes.
+    // Returns references (shared_ptrs) so callers can hand them to MeshRenderers.
     std::vector<std::shared_ptr<Mesh>> LoadMeshes(const std::string& path) override;
     std::vector<XMFLOAT4X4> GetLastLoadTransforms() const override { return _lastLoadTransforms; }
 
@@ -71,6 +76,8 @@ class DX12Backend : public IRenderBackend
     D3D12_CPU_DESCRIPTOR_HANDLE       GetRTV(int32 index) const { return _rtvHandle[index]; }
     D3D12_CPU_DESCRIPTOR_HANDLE       GetBackBufferView();
 
+    // SRV heap slot allocation — callers get the next free CPU/GPU descriptor handle pair
+    // Returns the index so callers can refer back to it
     UINT AllocateSRVSlot(D3D12_CPU_DESCRIPTOR_HANDLE& outCPU, D3D12_GPU_DESCRIPTOR_HANDLE& outGPU);
 
     D3D12MA::Allocator* GetD3D12MAAllocator() const { return _d3d12maAllocator; }
@@ -85,16 +92,19 @@ class DX12Backend : public IRenderBackend
     bool CreateDepthBuffer();
     bool CreateVertexBuffer();
     bool CreateMVPConstantBuffer();
-    bool CreateSceneCBs();
+    bool CreateSceneCBs();   // Phase 7: per-frame SceneConstants CB
     bool InitD3D12MA();
     bool CreateShadowUAV();
-    bool CreateGBuffer();
-    void DestroyGBuffer();
-    bool CreateCSMResources();
-    void DestroyCSMResources();
-    void UpdateCSMMatrices(const XMFLOAT4X4& view, const XMFLOAT4X4& proj);
-    void DrawCSMPass();
+    bool CreateGBuffer();    // Phase 7: G-buffer textures + SRV/RTV descriptors
+    void DestroyGBuffer();   // Phase 7: release G-buffer resources (not SRV slot indices)
+    bool CreateCSMResources();  // Phase 8: CSM shadow map array + DSV heap + SRV slot
+    void DestroyCSMResources(); // Phase 8: release CSM resources (not SRV slot index)
+    void UpdateCSMMatrices(const XMFLOAT4X4& view, const XMFLOAT4X4& proj); // Phase 8
+    void DrawCSMPass();         // Phase 8: 4-cascade depth draw
 
+    // Phase 9: SSAO (declared in private section with members below)
+
+    // post-process — declared here (TAAConstants is in private members below)
     bool CreatePostProcessResources();
     void DestroyPostProcessResources();
     void DrawTAAPass();
@@ -147,7 +157,7 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12GraphicsCommandList> _commandList;
 
     // -----------------------------------------------------------------------
-    // Async compute queue
+    // Phase 13: Async compute queue — GPU cull dispatch overlaps graphics
     // -----------------------------------------------------------------------
     ComPtr<ID3D12CommandQueue>        _computeQueue;
     ComPtr<ID3D12GraphicsCommandList> _computeCommandList;
@@ -193,7 +203,7 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12Resource>  _depthBuffer;
 
     // -----------------------------------------------------------------------
-    // Triangle geometry (fallback, UPLOAD heap)
+    // Triangle geometry (UPLOAD heap — Phase 1 legacy, replaced by D3D12MA in Phase 2C)
     // -----------------------------------------------------------------------
     ComPtr<ID3D12Resource>   _vertexBuffer;
     D3D12_VERTEX_BUFFER_VIEW _vertexBufferView = {};
@@ -202,16 +212,16 @@ class DX12Backend : public IRenderBackend
     // -----------------------------------------------------------------------
     // Pipelines
     // -----------------------------------------------------------------------
-    std::unique_ptr<class DX12Pipeline> _cbvPipeline;
-    std::unique_ptr<class DX12Pipeline> _gbufferPipeline;
-    std::unique_ptr<class DX12Pipeline> _lightingPipeline;
-    std::unique_ptr<class DX12Pipeline> _meshPreviewPipeline;
+    std::unique_ptr<class DX12Pipeline> _cbvPipeline;           // triangle (constantbuffer shaders)
+    std::unique_ptr<class DX12Pipeline> _gbufferPipeline;       // Phase 7: G-buffer fill (PBR vert + gbuffer.frag)
+    std::unique_ptr<class DX12Pipeline> _lightingPipeline;      // Phase 7: deferred lighting (fullscreen vert + deferred_lighting.frag)
+    std::unique_ptr<class DX12Pipeline> _meshPreviewPipeline;   // PBR vertex + normal shading
 
     // -----------------------------------------------------------------------
     // Scene meshes — loaded from glTF, drawn via MeshRenderer::Render()
     // -----------------------------------------------------------------------
     std::vector<std::shared_ptr<Mesh>> _sceneMeshes;
-    std::vector<XMFLOAT4X4>            _lastLoadTransforms;
+    std::vector<XMFLOAT4X4>            _lastLoadTransforms; // Phase 21
 
     // Cached camera matrices — set by UpdateMVP(), used by DrawMesh() per object
     XMFLOAT4X4 _lastView = {};
@@ -220,7 +230,7 @@ class DX12Backend : public IRenderBackend
     // -----------------------------------------------------------------------
     // Presentation
     // -----------------------------------------------------------------------
-    bool _vsync = false;
+    bool _vsync = false;  // P2-04: controlled via SetVSync()
 
     // -----------------------------------------------------------------------
     // DXR shadow map
@@ -235,12 +245,12 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12RTPipeline>     _rtPipeline;
 
     // -----------------------------------------------------------------------
-    // G-buffer
+    // Phase 7: G-buffer resources
     // -----------------------------------------------------------------------
     static constexpr UINT GBUFFER_COUNT = 3;
 
     // -----------------------------------------------------------------------
-    // Cascaded Shadow Maps
+    // Phase 8: Cascaded Shadow Maps (CSM)
     // -----------------------------------------------------------------------
     static constexpr UINT CSM_CASCADE_COUNT = 4;
     static constexpr UINT CSM_SHADOW_SIZE   = 2048;
@@ -278,7 +288,7 @@ class DX12Backend : public IRenderBackend
     UINT _shadowSRVIndex = UINT_MAX;  // read-only SRV for shadow UAV (consecutive after depth)
 
     // -----------------------------------------------------------------------
-    // SSAO
+    // Phase 9: Screen-Space Ambient Occlusion (SSAO)
     // -----------------------------------------------------------------------
     bool CreateSSAOResources();
     void DestroySSAOResources();
@@ -327,7 +337,7 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12Pipeline> _ssaoBlurPipeline;
 
     // -----------------------------------------------------------------------
-    // Post-process stack — HDR, TAA, Bloom, ACES tone mapping
+    // Phase 10: Post-process stack — HDR buffer, TAA, Bloom, ACES tone map
     // -----------------------------------------------------------------------
     struct TAAConstants
     {
@@ -376,16 +386,18 @@ class DX12Backend : public IRenderBackend
     D3D12_CPU_DESCRIPTOR_HANDLE  _bloomBlurRTV      = {};
     UINT                         _bloomBlurSRVIndex = UINT_MAX;
 
+    // Combined RTV heap for all Phase 10 targets: [HDR, hist0, hist1, bright, blurH]
     ComPtr<ID3D12DescriptorHeap> _ppRtvHeap;
 
-    std::unique_ptr<class DX12Pipeline> _lightingPipelineHDR;
+    // Phase 10 pipelines
+    std::unique_ptr<class DX12Pipeline> _lightingPipelineHDR;  // DeferredLighting, R16G16B16A16_FLOAT output
     std::unique_ptr<class DX12Pipeline> _taaPipeline;
     std::unique_ptr<class DX12Pipeline> _bloomBrightPipeline;
     std::unique_ptr<class DX12Pipeline> _bloomBlurPipeline;
     std::unique_ptr<class DX12Pipeline> _toneMappingPipeline;
 
     // -----------------------------------------------------------------------
-    // GPU-driven indirect rendering
+    // Phase 12: GPU-driven rendering — indirect draw + GPU frustum culling
     // -----------------------------------------------------------------------
     void FlushDraws() override;
     bool CreateIndirectResources();
@@ -447,7 +459,52 @@ class DX12Backend : public IRenderBackend
     std::unique_ptr<class DX12Pipeline> _indirectGBufPipeline;
 
     // -----------------------------------------------------------------------
-    // Hi-Z Occlusion Culling
+    // Phase 25: Mesh Shader Pipeline
+    // -----------------------------------------------------------------------
+    bool _meshShadersSupported = false;
+    bool _meshShaderReady      = false;
+
+    bool CreateMeshShaderResources();
+    void DestroyMeshShaderResources();
+
+    std::unique_ptr<class DX12Pipeline> _meshShaderGBufPipeline;
+
+    // Meshlet GPU buffers (uploaded alongside merged geometry)
+    ComPtr<ID3D12Resource>  _meshletBuffer;        // StructuredBuffer<Meshlet>
+    D3D12MA::Allocation*    _meshletBufferAlloc = nullptr;
+    ComPtr<ID3D12Resource>  _meshletBoundsBuffer;  // StructuredBuffer<MeshletBounds>
+    D3D12MA::Allocation*    _meshletBoundsAlloc = nullptr;
+    ComPtr<ID3D12Resource>  _meshletVertexBuffer;  // StructuredBuffer<uint> (vertex indices)
+    D3D12MA::Allocation*    _meshletVertexAlloc = nullptr;
+    ComPtr<ID3D12Resource>  _meshletTriBuffer;     // StructuredBuffer<uint> (packed triangle indices)
+    D3D12MA::Allocation*    _meshletTriAlloc = nullptr;
+    ComPtr<ID3D12Resource>  _meshletMeshInfoBuffer;// StructuredBuffer<MeshletMeshInfo>
+    D3D12MA::Allocation*    _meshletMeshInfoAlloc = nullptr;
+
+    // Per-frame mesh shader constants CB
+    struct MeshShaderConstants
+    {
+        DirectX::XMFLOAT4X4 viewMatrix;      // 64 B
+        DirectX::XMFLOAT4X4 projMatrix;      // 64 B
+        DirectX::XMFLOAT4   frustumPlanes[6]; // 96 B
+        uint32_t objectIndex;     //  4 B
+        uint32_t meshletOffset;   //  4 B
+        uint32_t meshletCount;    //  4 B
+        uint32_t _pad0;           //  4 B → 240 B → pad to 256 B
+        uint32_t _pad1[4];        // 16 B → 256 B total
+    };
+    static_assert(sizeof(MeshShaderConstants) == 256, "MeshShaderConstants must be 256 bytes");
+
+    ComPtr<ID3D12Resource>  _meshShaderCB[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _meshShaderCBAlloc[FRAMES_IN_FLIGHT] = {};
+    void*                   _meshShaderCBMapped[FRAMES_IN_FLIGHT] = {};
+
+    // Meshlet metadata per mesh (populated during BuildMergedGeometry)
+    std::vector<uint32_t>   _meshMeshletOffsets;  // per-mesh: first meshlet index
+    std::vector<uint32_t>   _meshMeshletCounts;   // per-mesh: meshlet count
+
+    // -----------------------------------------------------------------------
+    // Phase 23: Hi-Z Occlusion Culling
     // -----------------------------------------------------------------------
     bool CreateHiZResources();
     void DestroyHiZResources();
@@ -474,9 +531,11 @@ class DX12Backend : public IRenderBackend
     ComPtr<ID3D12DescriptorHeap> _hizNonVisUAVHeap;
 
     // -----------------------------------------------------------------------
-    // IBL Environment Mapping
+    // Phase 14: IBL Environment Mapping
     // -----------------------------------------------------------------------
 public:
+    // Load an equirectangular HDR file and kick off GPU precompute.
+    // Call once after Init(). Returns true on success.
     bool LoadHDREnvironment(const std::string& hdrPath);
 
 private:
@@ -531,7 +590,7 @@ private:
     std::unique_ptr<class DX12Pipeline> _lightingPipelineIBL;  // deferred lighting + IBL variant
 
     // -----------------------------------------------------------------------
-    // Screen-Space Reflections (SSR)
+    // Phase 16B: Screen-Space Reflections (SSR)
     // -----------------------------------------------------------------------
     bool CreateSSRResources();
     void DestroySSRResources();
@@ -552,7 +611,7 @@ private:
     void*                   _ssrCBMapped[FRAMES_IN_FLIGHT] = {};
 
     // -----------------------------------------------------------------------
-    // Screen-Space Motion Blur
+    // Phase 18B: Screen-Space Motion Blur
     // -----------------------------------------------------------------------
     bool CreateMotionBlurResources();
     void DestroyMotionBlurResources();
@@ -591,8 +650,75 @@ private:
     XMFLOAT4X4 _mbLastViewProj = {};
 
     // -----------------------------------------------------------------------
-    // GPU Profiler
+    // Phase 22: GPU Profiler
     // -----------------------------------------------------------------------
     DX12GPUProfiler _gpuProfiler;
+
+    // -----------------------------------------------------------------------
+    // Phase 24: Clustered Lighting
+    // -----------------------------------------------------------------------
+public:
+    void SetPointLights(const std::vector<PointLightDesc>& lights) override;
+
+private:
+    bool CreateClusteredLightingResources();
+    void DestroyClusteredLightingResources();
+    void DispatchClusterAssign();  // compute dispatch before deferred lighting
+
+    static constexpr UINT CLUSTER_X = 16u;
+    static constexpr UINT CLUSTER_Y = 9u;
+    static constexpr UINT CLUSTER_Z = 24u;
+    static constexpr UINT MAX_LIGHTS_PER_CLUSTER = 128u;
+    static constexpr UINT MAX_POINT_LIGHTS = 1024u;
+    static constexpr UINT TOTAL_CLUSTERS = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;  // 3456
+
+    bool _clusteredLightingReady = false;
+    std::vector<PointLightDesc> _pointLights;
+
+    // GPU data structures (32B per light, std430-compatible)
+    struct DX12GPUPointLight
+    {
+        float position[3]; float radius;
+        float color[3];    float intensity;
+    };
+
+    struct ClusterParamsData
+    {
+        XMFLOAT4X4 invProj;
+        float nearZ;
+        float farZ;
+        float screenW;
+        float screenH;
+        uint32_t numLights;
+        uint32_t _pad[3];
+    };
+
+    // Light buffer — host-visible (upload per frame)
+    ComPtr<ID3D12Resource>  _clusterLightBuffer;
+    D3D12MA::Allocation*    _clusterLightBufferAlloc = nullptr;
+    void*                   _clusterLightBufferMapped = nullptr;
+
+    // ClusterParams constant buffer
+    ComPtr<ID3D12Resource>  _clusterParamsCB;
+    D3D12MA::Allocation*    _clusterParamsCBAlloc = nullptr;
+    void*                   _clusterParamsCBMapped = nullptr;
+
+    // Cluster counts buffer — UAV/SRV (written by compute, read by fragment)
+    ComPtr<ID3D12Resource>  _clusterCountsBuffer;
+    D3D12MA::Allocation*    _clusterCountsBufferAlloc = nullptr;
+    UINT                    _clusterCountsSRVIndex = UINT_MAX;
+    UINT                    _clusterCountsUAVIndex = UINT_MAX;
+
+    // Cluster indices buffer — UAV/SRV (~1.7 MB)
+    ComPtr<ID3D12Resource>  _clusterIndicesBuffer;
+    D3D12MA::Allocation*    _clusterIndicesBufferAlloc = nullptr;
+    UINT                    _clusterIndicesSRVIndex = UINT_MAX;
+    UINT                    _clusterIndicesUAVIndex = UINT_MAX;
+
+    // Light buffer SRV
+    UINT                    _clusterLightSRVIndex = UINT_MAX;
+
+    // Cluster assign compute pipeline
+    std::unique_ptr<class DX12Pipeline> _clusterAssignPipeline;
 };
 } // namespace Luna

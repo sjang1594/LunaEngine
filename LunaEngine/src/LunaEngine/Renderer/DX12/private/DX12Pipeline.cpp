@@ -6,6 +6,7 @@
 #include "Logger/Logger.h"
 
 #include <dxcapi.h>
+#include <directx/d3dx12_pipeline_state_stream.h>
 #include <fstream>
 #include <vector>
 
@@ -357,6 +358,14 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
     ComPtr<ID3DBlob>            errorBlob;
     HRESULT                     hr;
 
+    // Declare arrays at function scope to prevent dangling pointers.
+    // rootSigDesc.Init() stores pointers to these, so they must persist until
+    // D3D12SerializeRootSignature is called after the if-else chain.
+    // Zero-initialize to avoid garbage in unused slots.
+    CD3DX12_ROOT_PARAMETER      rootParams[10] = {};  // max: DeferredLightingIBL uses 10
+    CD3DX12_DESCRIPTOR_RANGE    descRanges[8] = {};   // max: DeferredLightingIBL uses 8
+    D3D12_STATIC_SAMPLER_DESC   staticSamplers[3] = {}; // max: 3 samplers
+
     if (_desc.rootLayout == RootSignatureLayout::PBR)
     {
         // Phase 11: Bindless PBR root signature
@@ -371,32 +380,29 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //              albedo    = gAllTextures[gMaterialIndex + 0].Sample(s0, uv)
         //              normalMap = gAllTextures[gMaterialIndex + 1].Sample(s0, uv)
         //              metalRough= gAllTextures[gMaterialIndex + 2].Sample(s0, uv)
-        CD3DX12_ROOT_PARAMETER params[4];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: MVP
-        params[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL);// b1: MaterialConstants
-        params[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL);      // b2: materialIndex
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: MVP
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL);// b1: MaterialConstants
+        rootParams[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL);      // b2: materialIndex
 
         // Unbounded SRV array — covers the whole descriptor heap (space1 avoids clash with any
         // explicit t0-t4 bindings in space0 that the lighting pass uses on the same heap)
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0…, space1
-        params[3].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0…, space1
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        D3D12_STATIC_SAMPLER_DESC samplerDesc = {};
-        samplerDesc.Filter           = D3D12_FILTER_ANISOTROPIC;
-        samplerDesc.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.MaxAnisotropy    = 8;
-        samplerDesc.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-        samplerDesc.BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
-        samplerDesc.MinLOD           = 0.0f;
-        samplerDesc.MaxLOD           = D3D12_FLOAT32_MAX;
-        samplerDesc.ShaderRegister   = 0;   // s0
-        samplerDesc.RegisterSpace    = 0;
-        samplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].Filter           = D3D12_FILTER_ANISOTROPIC;
+        staticSamplers[0].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].MaxAnisotropy    = 8;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;   // s0
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        rootSigDesc.Init(4, params, 1, &samplerDesc,
+        rootSigDesc.Init(4, rootParams, 1, staticSamplers,
                          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
     }
     else if (_desc.rootLayout == RootSignatureLayout::DeferredLighting)
@@ -407,46 +413,41 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[2]    — Descriptor table: t5 (SSAO blur R8_UNORM) — pixel-visible  [Phase 9]
         //   static sampler s0 — point-clamp  (G-buffer reads)
         //   static sampler s1 — bilinear-clamp (SSAO upscale)                         [Phase 9]
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0
 
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0); // t0-t4
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0); // t0-t4
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_DESCRIPTOR_RANGE ssaoRange;
-        ssaoRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5 — SSAO blur
-        params[2].InitAsDescriptorTable(1, &ssaoRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5 — SSAO blur
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
         // s0 = point-clamp (G-buffer / depth / shadow reads — no interpolation artefacts)
         // s1 = bilinear-clamp (SSAO half-res -> full-res upscale)
-        D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
-        samplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
                              = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samplers[0].MaxAnisotropy    = 1;
-        samplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-        samplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
-        samplers[0].MinLOD           = 0.0f;
-        samplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
-        samplers[0].ShaderRegister   = 0;   // s0
-        samplers[0].RegisterSpace    = 0;
-        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].MaxAnisotropy    = 1;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;   // s0
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        samplers[1]                = samplers[0];
-        samplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-        samplers[1].ShaderRegister = 1;   // s1
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[1].ShaderRegister = 1;   // s1
 
         // No input layout — fullscreen triangle uses SV_VertexID
-        rootSigDesc.Init(3, params, 2, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::CSMDepth)
     {
         // Phase 8: CSM depth-only root signature
         //   params[0] — 16 inline root constants at b0 (light-space MVP, 4×4 = 16 DWORDs)
         //   Vertex-only visibility; pixel shader denied for GPU optimization
-        CD3DX12_ROOT_PARAMETER params[1];
-        params[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+        rootParams[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
 
         D3D12_ROOT_SIGNATURE_FLAGS flags =
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
@@ -455,7 +456,7 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
             D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS   |
             D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
 
-        rootSigDesc.Init(1, params, 0, nullptr, flags);
+        rootSigDesc.Init(1, rootParams, 0, nullptr, flags);
     }
     else if (_desc.rootLayout == RootSignatureLayout::SSAO)
     {
@@ -466,25 +467,22 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[3]    — SRV table t2: 4×4 noise texture (R8G8_UNORM)
         //   s0           — point-clamp (depth / normal sampling)
         //   s1           — point-wrap  (noise tiling)
-        CD3DX12_DESCRIPTOR_RANGE srvRanges[3];
-        srvRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 depth
-        srvRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1 normal
-        srvRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2 noise
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 depth
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1 normal
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2 noise
 
-        CD3DX12_ROOT_PARAMETER params[4];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &srvRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[2].InitAsDescriptorTable(1, &srvRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[3].InitAsDescriptorTable(1, &srvRanges[2], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_PIXEL);
 
         // s0=point-clamp, s1=point-wrap
-        CD3DX12_STATIC_SAMPLER_DESC samplers[2];
-        samplers[0].Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                         D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        samplers[1].Init(1, D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                         D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+                         D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[1], 1, D3D12_FILTER_MIN_MAG_MIP_POINT,
+                         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
 
-        rootSigDesc.Init(4, params, 2, samplers,
+        rootSigDesc.Init(4, rootParams, 2, staticSamplers,
                          D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::SSAOBlur)
@@ -492,17 +490,14 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         // Phase 9: SSAO blur root signature
         //   params[0] — SRV table t0: raw SSAO (R8_UNORM)
         //   s0        — point-clamp
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 raw SSAO
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 raw SSAO
 
-        CD3DX12_ROOT_PARAMETER params[1];
-        params[0].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                     D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+                     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(1, params, 1, &sampler,
+        rootSigDesc.Init(1, rootParams, 1, staticSamplers,
                          D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::TAA)
@@ -513,24 +508,21 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[2]    — SRV t1: history buffer
         //   params[3]    — SRV t2: hardware depth
         //   s0=bilinear-clamp, s1=point-clamp
-        CD3DX12_DESCRIPTOR_RANGE ranges[3];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
-        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
 
-        CD3DX12_ROOT_PARAMETER params[4];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[2].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[3].InitAsDescriptorTable(1, &ranges[2], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC samplers[2];
-        samplers[0].Init(0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
                          D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        samplers[1].Init(1, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[1], 1, D3D12_FILTER_MIN_MAG_MIP_POINT,
                          D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(4, params, 2, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(4, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::BloomBright)
     {
@@ -538,18 +530,15 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[0] b0 — 4 inline root constants (threshold, knee, 0, 0)
         //   params[1]    — SRV t0: HDR input
         //   s0=point-clamp
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[2];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(2, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::BloomBlur)
     {
@@ -557,18 +546,15 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[0] b0 — 4 inline root constants (texelStep.xy, 0, 0)
         //   params[1]    — SRV t0: bloom input
         //   s0=bilinear-clamp (avoids seams at edges)
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[2];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(2, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::ToneMap)
     {
@@ -577,20 +563,17 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV t0: TAA-resolved HDR
         //   params[2]    — SRV t1: blurred bloom
         //   s0=point-clamp
-        CD3DX12_DESCRIPTOR_RANGE ranges[2];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[2].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::GPUCull)
     {
@@ -602,22 +585,19 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[4]    — UAV u1: RWByteAddressBuffer (draw count)
         //   params[5]    — SRV table t2: Texture2D<float> Hi-Z pyramid (Phase 23)
         //   s0 = point-clamp sampler (for Hi-Z sampling)
-        CD3DX12_DESCRIPTOR_RANGE hizSrvRange;
-        hizSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
 
-        CD3DX12_ROOT_PARAMETER params[6];
-        params[0].InitAsConstants(48, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: CullConstants (192 B)
-        params[1].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // t0: objects
-        params[2].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);  // t1: meshInfo
-        params[3].InitAsUnorderedAccessView(0, 0, D3D12_SHADER_VISIBILITY_ALL); // u0: drawArgs
-        params[4].InitAsUnorderedAccessView(1, 0, D3D12_SHADER_VISIBILITY_ALL); // u1: drawCount
-        params[5].InitAsDescriptorTable(1, &hizSrvRange, D3D12_SHADER_VISIBILITY_ALL); // t2: Hi-Z
+        rootParams[0].InitAsConstants(48, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: CullConstants (192 B)
+        rootParams[1].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // t0: objects
+        rootParams[2].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);  // t1: meshInfo
+        rootParams[3].InitAsUnorderedAccessView(0, 0, D3D12_SHADER_VISIBILITY_ALL); // u0: drawArgs
+        rootParams[4].InitAsUnorderedAccessView(1, 0, D3D12_SHADER_VISIBILITY_ALL); // u1: drawCount
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL); // t2: Hi-Z
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(6, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(6, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::PBRIndirect)
     {
@@ -629,32 +609,30 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[4]    — SRV t0 space0: StructuredBuffer<GPUObjectData> (vertex visible)
         //   params[5]    — Unbounded SRV table: t0+ space1 (pixel visible, bindless textures)
         //   s0 = static anisotropic sampler
-        CD3DX12_ROOT_PARAMETER params[6];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);   // b0: ViewProj
-        params[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL); // b1: MaterialConstants
-        params[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL);       // b2: materialIndex
-        params[3].InitAsConstants(1, 3, 0, D3D12_SHADER_VISIBILITY_VERTEX);      // b3: objectIndex
-        params[4].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);// t0 space0: objects SSBO
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);   // b0: ViewProj
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL); // b1: MaterialConstants
+        rootParams[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL);       // b2: materialIndex
+        rootParams[3].InitAsConstants(1, 3, 0, D3D12_SHADER_VISIBILITY_VERTEX);      // b3: objectIndex
+        rootParams[4].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);// t0 space0: objects SSBO
 
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0…, space1
-        params[5].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0…, space1
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        D3D12_STATIC_SAMPLER_DESC samplerDesc = {};
-        samplerDesc.Filter           = D3D12_FILTER_ANISOTROPIC;
-        samplerDesc.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samplerDesc.MaxAnisotropy    = 8;
-        samplerDesc.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-        samplerDesc.BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
-        samplerDesc.MinLOD           = 0.0f;
-        samplerDesc.MaxLOD           = D3D12_FLOAT32_MAX;
-        samplerDesc.ShaderRegister   = 0;   // s0
-        samplerDesc.RegisterSpace    = 0;
-        samplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_ANISOTROPIC;
+        staticSamplers[0].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].MaxAnisotropy    = 8;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;   // s0
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        rootSigDesc.Init(6, params, 1, &samplerDesc,
+        rootSigDesc.Init(6, rootParams, 1, staticSamplers,
                          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
     }
     else if (_desc.rootLayout == RootSignatureLayout::EquirectToCube)
@@ -664,21 +642,18 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV  t0: equirect Texture2D
         //   params[2]    — UAV  u0: RWTexture2DArray output
         //   s0 = bilinear-clamp
-        CD3DX12_DESCRIPTOR_RANGE srvRange, uavRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL);
-        params[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::IrradianceConv)
     {
@@ -687,21 +662,18 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV  t0: envCube TextureCube
         //   params[2]    — UAV  u0: RWTexture2DArray irradiance output
         //   s0 = trilinear-clamp
-        CD3DX12_DESCRIPTOR_RANGE srvRange, uavRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL);
-        params[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::PrefilterEnv)
     {
@@ -710,34 +682,29 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV  t0: envCube TextureCube
         //   params[2]    — UAV  u0: RWTexture2DArray prefilter output (specific mip)
         //   s0 = trilinear-clamp
-        CD3DX12_DESCRIPTOR_RANGE srvRange, uavRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL);
-        params[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::BrdfLut)
     {
         // Phase 14: BRDF integration LUT compute
         //   params[0]  — UAV  u0: RWTexture2D<float2> BRDF LUT
         //   no SRV, no CB, no sampler
-        CD3DX12_DESCRIPTOR_RANGE uavRange;
-        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[1];
-        params[0].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[0].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
 
-        rootSigDesc.Init(1, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(1, rootParams, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::Skybox)
     {
@@ -745,68 +712,74 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[0] b0 — 16 root constants (row-major invViewProj float4x4), VS + PS visible
         //   params[1]    — SRV t0: TextureCube env cubemap, pixel-visible
         //   s0 = trilinear-clamp, pixel-visible
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
 
-        CD3DX12_ROOT_PARAMETER params[2];
-        params[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        rootSigDesc.Init(2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(2, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::DeferredLightingIBL)
     {
-        // Phase 14: Deferred Lighting with IBL
+        // Phase 14+24: Deferred Lighting with IBL + Clustered Lighting
         //   params[0] b0 — SceneConstants CBV
-        //   params[1]    — SRV table t0-t4 (GB0/1/2/depth/shadow)
-        //   params[2]    — SRV t5 (SSAO blur)
-        //   params[3]    — SRV t6 (irradiance cubemap)
-        //   params[4]    — SRV t7 (prefiltered env cubemap)
-        //   params[5]    — SRV t8 (BRDF LUT)
+        //   params[1] b1 — ClusterParams CBV (Phase 24)
+        //   params[2]    — SRV table t0-t4 (GB0/1/2/depth/shadow)
+        //   params[3]    — SRV t5 (SSAO blur)
+        //   params[4]    — SRV t6 (irradiance cubemap)
+        //   params[5]    — SRV t7 (prefiltered env cubemap)
+        //   params[6]    — SRV t8 (BRDF LUT)
+        //   params[7]    — SRV t9 (point lights)
+        //   params[8]    — SRV t10 (cluster counts)
+        //   params[9]    — SRV t11 (cluster indices)
         //   s0 = point-clamp, s1 = bilinear-clamp, s2 = trilinear-clamp
-        CD3DX12_DESCRIPTOR_RANGE ranges[5];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0); // t0-t4
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5 SSAO
-        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6); // t6 irradiance
-        ranges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7); // t7 prefilter
-        ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8); // t8 BRDF LUT
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);  // t0-t4 G-buffer + shadow
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5);  // t5 SSAO
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);  // t6 irradiance
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);  // t7 prefilter
+        descRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8);  // t8 BRDF LUT
+        descRanges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9);  // t9 point lights
+        descRanges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 10); // t10 cluster counts
+        descRanges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 11); // t11 cluster indices
 
-        CD3DX12_ROOT_PARAMETER params[6];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[2].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[3].InitAsDescriptorTable(1, &ranges[2], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[4].InitAsDescriptorTable(1, &ranges[3], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[5].InitAsDescriptorTable(1, &ranges[4], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);       // b0 SceneConstants
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_ALL);       // b1 ClusterParams (Phase 24)
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL); // t0-t4
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL); // t5
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_PIXEL); // t6
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_PIXEL); // t7
+        rootParams[6].InitAsDescriptorTable(1, &descRanges[4], D3D12_SHADER_VISIBILITY_PIXEL); // t8
+        rootParams[7].InitAsDescriptorTable(1, &descRanges[5], D3D12_SHADER_VISIBILITY_PIXEL); // t9
+        rootParams[8].InitAsDescriptorTable(1, &descRanges[6], D3D12_SHADER_VISIBILITY_PIXEL); // t10
+        rootParams[9].InitAsDescriptorTable(1, &descRanges[7], D3D12_SHADER_VISIBILITY_PIXEL); // t11
 
         // s0=point-clamp, s1=bilinear-clamp, s2=trilinear-clamp (IBL)
-        D3D12_STATIC_SAMPLER_DESC samplers[3] = {};
-        samplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
                              = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samplers[0].MaxAnisotropy    = 1;
-        samplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-        samplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
-        samplers[0].MinLOD           = 0.0f;
-        samplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
-        samplers[0].ShaderRegister   = 0;
-        samplers[0].RegisterSpace    = 0;
-        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].MaxAnisotropy    = 1;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        samplers[1]                = samplers[0];
-        samplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-        samplers[1].ShaderRegister = 1;
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[1].ShaderRegister = 1;
 
-        samplers[2]                = samplers[0];
-        samplers[2].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        samplers[2].ShaderRegister = 2;
+        staticSamplers[2]                = staticSamplers[0];
+        staticSamplers[2].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[2].ShaderRegister = 2;
 
-        rootSigDesc.Init(6, params, 3, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(10, rootParams, 3, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::SSRCompute)
     {
@@ -818,54 +791,49 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[4]    — SRV t3: sceneHDR
         //   params[5]    — UAV u0: ssrOut
         //   s0 = point-clamp, s1 = linear-clamp (ALL visible)
-        CD3DX12_DESCRIPTOR_RANGE ranges[5];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
-        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
-        ranges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);
-        ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);
+        descRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[6];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
-        params[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
-        params[2].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_ALL);
-        params[3].InitAsDescriptorTable(1, &ranges[2], D3D12_SHADER_VISIBILITY_ALL);
-        params[4].InitAsDescriptorTable(1, &ranges[3], D3D12_SHADER_VISIBILITY_ALL);
-        params[5].InitAsDescriptorTable(1, &ranges[4], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[4], D3D12_SHADER_VISIBILITY_ALL);
 
-        D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
-        samplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
                              = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samplers[0].MaxAnisotropy    = 1;
-        samplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-        samplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
-        samplers[0].ShaderRegister   = 0;
-        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        staticSamplers[0].MaxAnisotropy    = 1;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        samplers[1]                = samplers[0];
-        samplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-        samplers[1].ShaderRegister = 1;
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[1].ShaderRegister = 1;
 
-        rootSigDesc.Init(6, params, 2, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(6, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::SSRBlend)
     {
         // Phase 16B: SSR additive blend pass
         //   params[0] — SRV t0: ssrTex
         //   s0 = point-clamp (PIXEL)
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 
-        CD3DX12_ROOT_PARAMETER params[1];
-        params[0].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        rootSigDesc.Init(1, params, 1, &sampler,
+        rootSigDesc.Init(1, rootParams, 1, staticSamplers,
                          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
     }
     else if (_desc.rootLayout == RootSignatureLayout::MotionBlur)
@@ -875,21 +843,18 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV t0: HDR color
         //   params[2]    — SRV t1: depth
         //   s0 = point-clamp (PIXEL)
-        CD3DX12_DESCRIPTOR_RANGE ranges[2];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
-        params[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-        params[2].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else if (_desc.rootLayout == RootSignatureLayout::HiZGenerate)
     {
@@ -898,28 +863,85 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
         //   params[1]    — SRV table t0: source mip (Texture2D<float>)
         //   params[2]    — UAV table u0: destination mip (RWTexture2D<float>)
         //   s0 = point-clamp (compute-visible)
-        CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
-        CD3DX12_DESCRIPTOR_RANGE uavRange;
-        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
 
-        CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: 4 DWORDs
-        params[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL); // t0
-        params[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL); // u0
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0: 4 DWORDs
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL); // t0
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL); // u0
 
-        CD3DX12_STATIC_SAMPLER_DESC sampler;
-        sampler.Init(0, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        CD3DX12_STATIC_SAMPLER_DESC::Init(staticSamplers[0], 0, D3D12_FILTER_MIN_MAG_MIP_POINT,
                      D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
 
-        rootSigDesc.Init(3, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::ClusterAssign)
+    {
+        // Phase 24: Cluster lighting assignment compute root signature
+        //   params[0] b0 — ClusterParams CBV (96 bytes)
+        //   params[1]    — SRV table t0: StructuredBuffer<GPUPointLight>
+        //   params[2]    — UAV table u0: RWStructuredBuffer<uint> clusterCounts
+        //   params[3]    — UAV table u1: RWStructuredBuffer<uint> clusterIndices
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1); // u1
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // b0
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);  // t0
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL); // u0
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL); // u1
+
+        rootSigDesc.Init(4, rootParams, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::MeshShaderGBuffer)
+    {
+        // Phase 25: Mesh shader G-buffer fill root signature
+        //   params[0] b0 — MeshShaderConstants CBV (viewProj + frustum + object/meshlet info)
+        //   params[1] b1 — MaterialConstants CBV (pixel visible)
+        //   params[2] b2 — 1 DWORD root const: materialIndex (pixel visible)
+        //   params[3]    — SRV t0 space0: StructuredBuffer<GPUObjectData>       (ALL)
+        //   params[4]    — SRV t1 space0: StructuredBuffer<Meshlet>             (ALL)
+        //   params[5]    — SRV t2 space0: StructuredBuffer<MeshletBounds>       (ALL)
+        //   params[6]    — SRV t3 space0: StructuredBuffer<PBRVertex> (merged)  (ALL)
+        //   params[7]    — SRV t4 space0: StructuredBuffer<uint> meshletVertices(ALL)
+        //   params[8]    — SRV t5 space0: StructuredBuffer<uint> meshletTriangles(ALL)
+        //   params[9]    — Unbounded SRV table: t0+ space1 (pixel visible, bindless textures)
+        //   s0 = static anisotropic sampler (pixel visible)
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);   // b0
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL); // b1
+        rootParams[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_PIXEL);       // b2
+
+        rootParams[3].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_ALL);   // t0: objects
+        rootParams[4].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);   // t1: meshlets
+        rootParams[5].InitAsShaderResourceView(2, 0, D3D12_SHADER_VISIBILITY_ALL);   // t2: bounds
+        rootParams[6].InitAsShaderResourceView(3, 0, D3D12_SHADER_VISIBILITY_ALL);   // t3: vertices
+        rootParams[7].InitAsShaderResourceView(4, 0, D3D12_SHADER_VISIBILITY_ALL);   // t4: meshletVerts
+        rootParams[8].InitAsShaderResourceView(5, 0, D3D12_SHADER_VISIBILITY_ALL);   // t5: meshletTris
+
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0+, space1
+        rootParams[9].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_ANISOTROPIC;
+        staticSamplers[0].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].MaxAnisotropy    = 8;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        rootSigDesc.Init(10, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
     else
     {
         // Default MVP-only root signature
-        CD3DX12_ROOT_PARAMETER params[1];
-        params[0].InitAsConstantBufferView(0); // b0 — MVP transform
-        rootSigDesc.Init(1, params, 0, nullptr,
+        rootParams[0].InitAsConstantBufferView(0); // b0 — MVP transform
+        rootSigDesc.Init(1, rootParams, 0, nullptr,
                          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
     }
 
@@ -1065,6 +1087,107 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
         LUNA_LOG_ERROR("CreateGraphicsPipelineState failed: 0x%08lX", (unsigned long)hr);
         return false;
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 25: Mesh shader pipeline initialization
+// ---------------------------------------------------------------------------
+bool DX12Pipeline::InitializeMeshShader(const ComPtr<ID3D12Device>& device,
+                                         const std::wstring& asPath,
+                                         const std::wstring& msPath,
+                                         const std::wstring& psPath,
+                                         const PipelineStateDesc& desc)
+{
+    _desc = desc;
+    EnsureDXCInitialized();
+
+    std::wstring asFullPath = GetShaderFullPath(asPath);
+    std::wstring msFullPath = GetShaderFullPath(msPath);
+    std::wstring psFullPath = GetShaderFullPath(psPath);
+
+    if (!LoadShaderDXC(asFullPath, L"as_6_5", _asBlob)) return false;
+    if (!LoadShaderDXC(msFullPath, L"ms_6_5", _msBlob)) return false;
+    if (!LoadShaderDXC(psFullPath, L"ps_6_5", _psBlob)) return false;
+
+    if (!CreateRootSignature(device)) return false;
+    if (!CreateMeshShaderPSO(device, _asBlob, _msBlob, _psBlob)) return false;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 25: Mesh shader PSO via pipeline state stream API
+// Requires ID3D12Device2::CreatePipelineState with D3D12_PIPELINE_STATE_STREAM_DESC
+// ---------------------------------------------------------------------------
+bool DX12Pipeline::CreateMeshShaderPSO(const ComPtr<ID3D12Device>& device,
+                                        ComPtr<IDxcBlob> as, ComPtr<IDxcBlob> ms, ComPtr<IDxcBlob> ps)
+{
+    // Need ID3D12Device2 for CreatePipelineState(stream desc)
+    ComPtr<ID3D12Device2> device2;
+    HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&device2));
+    if (FAILED(hr))
+    {
+        LUNA_LOG_ERROR("Phase 25: ID3D12Device2 not available (mesh shader PSO needs it)");
+        return false;
+    }
+
+    // Build pipeline state stream
+    struct MeshShaderPipelineStream
+    {
+        CD3DX12_PIPELINE_STATE_STREAM_ROOT_SIGNATURE   pRootSignature;
+        CD3DX12_PIPELINE_STATE_STREAM_AS               AS;
+        CD3DX12_PIPELINE_STATE_STREAM_MS               MS;
+        CD3DX12_PIPELINE_STATE_STREAM_PS               PS;
+        CD3DX12_PIPELINE_STATE_STREAM_RASTERIZER       RasterizerState;
+        CD3DX12_PIPELINE_STATE_STREAM_BLEND_DESC       BlendState;
+        CD3DX12_PIPELINE_STATE_STREAM_DEPTH_STENCIL    DepthStencilState;
+        CD3DX12_PIPELINE_STATE_STREAM_RENDER_TARGET_FORMATS RTVFormats;
+        CD3DX12_PIPELINE_STATE_STREAM_DEPTH_STENCIL_FORMAT  DSVFormat;
+        CD3DX12_PIPELINE_STATE_STREAM_SAMPLE_DESC      SampleDesc;
+        CD3DX12_PIPELINE_STATE_STREAM_SAMPLE_MASK      SampleMask;
+    } stream = {};
+
+    stream.pRootSignature = _rootSignature.Get();
+    stream.AS = D3D12_SHADER_BYTECODE{ as->GetBufferPointer(), as->GetBufferSize() };
+    stream.MS = D3D12_SHADER_BYTECODE{ ms->GetBufferPointer(), ms->GetBufferSize() };
+    stream.PS = D3D12_SHADER_BYTECODE{ ps->GetBufferPointer(), ps->GetBufferSize() };
+
+    CD3DX12_RASTERIZER_DESC raster(D3D12_DEFAULT);
+    stream.RasterizerState = raster;
+
+    stream.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+
+    CD3DX12_DEPTH_STENCIL_DESC depthDesc(D3D12_DEFAULT);
+    depthDesc.DepthEnable = TRUE;
+    depthDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    depthDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    stream.DepthStencilState = depthDesc;
+
+    D3D12_RT_FORMAT_ARRAY rtvFormats = {};
+    rtvFormats.NumRenderTargets = _desc.numRenderTargets;
+    for (UINT i = 0; i < _desc.numRenderTargets; ++i)
+        rtvFormats.RTFormats[i] = _desc.rtvFormats[i];
+    stream.RTVFormats = rtvFormats;
+
+    stream.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+
+    DXGI_SAMPLE_DESC sampleDesc = { 1, 0 };
+    stream.SampleDesc = sampleDesc;
+    stream.SampleMask = UINT_MAX;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {};
+    streamDesc.SizeInBytes = sizeof(stream);
+    streamDesc.pPipelineStateSubobjectStream = &stream;
+
+    hr = device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&_pipelineState));
+    if (FAILED(hr))
+    {
+        LUNA_LOG_ERROR("Phase 25: CreatePipelineState (mesh shader) failed: 0x%08lX", (unsigned long)hr);
+        return false;
+    }
+
+    LUNA_LOG_INFO("Phase 25: Mesh shader pipeline created successfully");
     return true;
 }
 

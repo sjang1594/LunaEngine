@@ -25,7 +25,7 @@ struct ApplicationSpecification
 
     std::filesystem::path iconPath;
     bool windowResizeable = true;
-    bool customTitleBar   = true;
+    bool customTitleBar   = true;   // Enable custom title bar by default
     bool useDockSpace     = true;
     bool centerWindow     = true;
     RenderBackendType backend = RenderBackendType::Vulkan;
@@ -52,6 +52,7 @@ public:
     void* GetNativeWindow() const;
 
     Camera& GetCamera() { return _camera; }
+    // Get the scene's CameraComponent (preferred over legacy _camera)
     std::shared_ptr<CameraComponent> GetSceneCamera() const;
     const ApplicationSpecification& GetSpec() const { return _specification; }
 
@@ -60,6 +61,7 @@ private:
     void Shutdown();
     bool ShouldContinueRunning() const;
 
+    // GLFW callbacks
     static void OnFramebufferResize(GLFWwindow* w, int width, int height);
     static void OnMouseMove(GLFWwindow* w, double x, double y);
     static void OnMouseButton(GLFWwindow* w, int button, int action, int mods);
@@ -76,14 +78,21 @@ private:
     std::vector<std::shared_ptr<Layer>> _layerStack;
     std::function<void()> _menubarCallBack;
 
+    // Custom title bar
     CustomTitleBar _titleBar;
+
+    // Orbital camera
     Camera _camera;
+
+    // GPU profiler overlay
     GPUProfilerOverlay _profilerOverlay;
 
+    // Mouse drag state
     bool   _mouseDown    = false;
     double _lastMouseX   = 0.0;
     double _lastMouseY   = 0.0;
 };
 
+// Implemented by CLIENT
 Application *CreateApplication(int argc, char **argv);
 } // namespace Luna
