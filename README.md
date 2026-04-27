@@ -1,6 +1,40 @@
 # LunaEngine
 
-A cross-API real-time rendering engine written in C++20, targeting **DirectX 12** and **Vulkan 1.3**.
+## Overview
+LunaEngine — Cross-API Real-Time Renderer
+C++20, DirectX 12 Ultimate + Vulkan 1.3 | github.com/sjang1594/luna-engine
+
+Working:
+- Hardware Abstraction Layer over DX12 Ultimate + Vulkan 1.3 with
+  capability-flag feature exposure.
+- Frame-graph compile step with automatic barrier insertion, layout
+  transitions, and transient-resource aliasing across ~30 passes.
+- Mesh-shader GPU geometry pipeline: meshlet generation
+  (meshopt_buildMeshlets) → task/amplification two-phase culling
+  (frustum + cone + Hi-Z) → DispatchMeshIndirect with GPU-side
+  argument generation.
+- Frames-in-flight ring buffer with per-frame command allocators,
+  fence values, and persistently-mapped UPLOAD-heap constant
+  buffers (2-3 frame CPU/GPU overlap).
+- Cook-Torrance PBR with Image-Based Lighting (split-sum
+  approximation: irradiance convolution + prefiltered environment
+  maps on compute queue).
+- 4-cascade Cascaded Shadow Maps with PSSM split selection,
+  slope-scaled depth bias, and 3x3 PCF.
+- Hillaire 2020 sky-atmosphere (transmittance, multi-scattering,
+  sky-view, aerial perspective LUTs — all compute).
+- HDR post stack: TAA (history reprojection + neighborhood AABB
+  clamp), SSAO with bilateral blur, hierarchical SSR, bloom, ACES
+  tonemapping with auto-exposure.
+- Embedded GPU profiler with D3D12 timestamp queries and
+  VK_KHR_performance_query, surfaced via ImGui dockspace overlay.
+
+In development:
+- DXR Tier 1.1 / VK_KHR_ray_tracing pipeline (BLAS/TLAS/SBT
+  lifecycle implemented; bring-up in progress).
+- Slang shader integration alongside HLSL (DXC) and GLSL (glslang)
+  via custom IDxcBlob adapter, building toward auto-diff support
+  for differentiable rendering experiments.
 
 ## Features
 
@@ -29,6 +63,8 @@ msbuild LunaApp.sln /p:Configuration=Debug /p:Platform=x64 /m
 ```
 
 The Vulkan backend is built only if `VULKAN_SDK` is set; otherwise the engine builds DX12-only.
+
+### Checkpoints w RenderDoc
 
 ## License
 
