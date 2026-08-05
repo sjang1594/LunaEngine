@@ -14,6 +14,7 @@ project "LunaApp"
       "../vendor/imgui/backends",
       "../vendor/dxheaders/include",
       "../vendor/dxheaders/include/directx",
+      "../vendor/d3d12ma/include",
       "../vendor/glm",
       "../LunaEngine/src",
       "../LunaEngine/src/LunaEngine",  -- needed for headers that use bare "Renderer/..." paths

@@ -110,18 +110,24 @@ bool DX12AccelStructure::BuildBLAS(ID3D12Device5*              device,
 }
 
 // ---------------------------------------------------------------------------
-// BuildTLAS — one instance per BLAS (identity transform)
+// BuildTLAS — one TLAS instance per entry in `instances` (blasIndex + world transform)
 // ---------------------------------------------------------------------------
-bool DX12AccelStructure::BuildTLAS(ID3D12Device5*              device,
-                                    ID3D12GraphicsCommandList4* cmdList)
+bool DX12AccelStructure::BuildTLAS(ID3D12Device5*                        device,
+                                    ID3D12GraphicsCommandList4*            cmdList,
+                                    const std::vector<TLASInstanceDesc>&   instances)
 {
     if (_blases.empty())
     {
         LUNA_LOG_WARN("BuildTLAS: no BLASes to reference");
         return false;
     }
+    if (instances.empty())
+    {
+        LUNA_LOG_WARN("BuildTLAS: instance list is empty");
+        return false;
+    }
 
-    const UINT instanceCount = static_cast<UINT>(_blases.size());
+    const UINT instanceCount = static_cast<UINT>(instances.size());
 
     // Write instance descriptors to an UPLOAD heap buffer (read by the GPU)
     const UINT64 instBufSize = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * instanceCount;
@@ -145,17 +151,24 @@ bool DX12AccelStructure::BuildTLAS(ID3D12Device5*              device,
 
     for (UINT i = 0; i < instanceCount; ++i)
     {
+        const TLASInstanceDesc&         src  = instances[i];
         D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
-        // Identity 3x4 transform (row-major)
+        const DirectX::XMFLOAT4X4&     m    = src.worldTransform;
+
         memset(&inst, 0, sizeof(inst));
-        inst.Transform[0][0] = 1.0f;
-        inst.Transform[1][1] = 1.0f;
-        inst.Transform[2][2] = 1.0f;
+        // Row-major 4x4 → 3x4 (drop last row)
+        inst.Transform[0][0] = m._11; inst.Transform[0][1] = m._12;
+        inst.Transform[0][2] = m._13; inst.Transform[0][3] = m._14;
+        inst.Transform[1][0] = m._21; inst.Transform[1][1] = m._22;
+        inst.Transform[1][2] = m._23; inst.Transform[1][3] = m._24;
+        inst.Transform[2][0] = m._31; inst.Transform[2][1] = m._32;
+        inst.Transform[2][2] = m._33; inst.Transform[2][3] = m._34;
+
         inst.InstanceID                          = i;
         inst.InstanceMask                        = 0xFF;
         inst.InstanceContributionToHitGroupIndex = 0;
         inst.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
-        inst.AccelerationStructure               = _blases[i].blas->GetGPUVirtualAddress();
+        inst.AccelerationStructure               = _blases[src.blasIndex].blas->GetGPUVirtualAddress();
     }
     _instanceDescs->Unmap(0, nullptr);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LunaEngine/LunaPCH.h>
+#include <unordered_map>
 #include <LunaEngine/Renderer/HAL/Public/IRenderBackend.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanGPUProfiler.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanCore.h>
@@ -10,6 +11,8 @@
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanHiZ.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanIBL.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanAtmosphere.h>
+#include <LunaEngine/Renderer/Vulkan/Public/VulkanVolumetricFog.h>
+#include <LunaEngine/Renderer/Vulkan/Public/VulkanGI.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanSwapchain.h>
 #include <LunaEngine/Renderer/Vulkan/Public/VulkanGBuffer.h>
 
@@ -18,6 +21,7 @@ namespace Luna
 // Forward declarations — only types actually used in the public interface
 struct Mesh;        // returned by LoadMeshes; also in IRenderBackend.h (redundant but explicit)
 class  VulkanDevice;
+class  CameraSensor;  // S2b
 
 class VulkanBackend : public IRenderBackend
 {
@@ -56,6 +60,7 @@ class VulkanBackend : public IRenderBackend
 
     // Debug: procedural 2×2m quad (bypasses glTF, uses default white material)
     std::vector<std::shared_ptr<Mesh>> LoadDebugQuad() override;
+    std::vector<std::shared_ptr<Mesh>> LoadCalibrationScene() override;
 
     // Phase 15B: flush accumulated DrawMesh() calls via GPU-driven indirect rendering
     void FlushDraws() override;
@@ -65,6 +70,30 @@ class VulkanBackend : public IRenderBackend
 
     const char* GetBackendName() const override { return "Vulkan"; }
     IGPUProfiler* GetGPUProfiler() override { return &_gpuProfiler; }
+
+    // Phase 30: Set GI params from UI
+    void SetGIParams(const GIParams& p) override {
+        _gi.temporalAlpha   = p.temporalAlpha;
+        _gi.numSSGIRays     = (uint32_t)p.numSSGIRays;
+        _gi.maxRayDist      = p.maxRayDist;
+        _gi.probeOrigin[0]  = p.probeGridOrigin[0];
+        _gi.probeOrigin[1]  = p.probeGridOrigin[1];
+        _gi.probeOrigin[2]  = p.probeGridOrigin[2];
+        _gi.probeSpacing[0] = p.probeGridSpacing[0];
+        _gi.probeSpacing[1] = p.probeGridSpacing[1];
+        _gi.probeSpacing[2] = p.probeGridSpacing[2];
+    }
+
+    // Phase 29: Set volumetric fog params from UI
+    void SetVolumetricFogParams(const VolumetricFogParams& p) override {
+        _volFogEnabled               = p.enabled;
+        _volumetricFog.density       = p.density;
+        _volumetricFog.heightFalloff = p.heightFalloff;
+        _volumetricFog.baseHeight    = p.baseHeight;
+        _volumetricFog.scattering    = p.scattering;
+        _volumetricFog.extinction    = p.extinction;
+        _volumetricFog.phaseG        = p.phaseG;
+    }
 
     // Phase 24: Set point lights from UI
     void SetPointLights(const std::vector<PointLightDesc>& lights) override
@@ -144,7 +173,10 @@ class VulkanBackend : public IRenderBackend
     VulkanShadows _shadows;  // CSM subsystem (replaces inline CSM code)
     VulkanHiZ _hiZ;  // Hi-Z pyramid subsystem (replaces inline Hi-Z code)
     VulkanIBL _ibl;  // IBL subsystem (replaces inline IBL precompute code)
-    VulkanAtmosphere _atmosphere;  // Phase 28: physically-based sky rendering
+    VulkanAtmosphere    _atmosphere;     // Phase 28: physically-based sky rendering
+    VulkanVolumetricFog _volumetricFog;  // Phase 29: froxel-based volumetric fog
+    bool                _volFogEnabled = false;
+    VulkanGI            _gi;             // Phase 30: screen-space GI + irradiance probes
     VulkanSwapchain _vkSwapchain;  // Swapchain + depth + present render pass
     VulkanGBuffer _gBuffer;  // G-buffer images + render passes
 
@@ -249,6 +281,10 @@ class VulkanBackend : public IRenderBackend
     // Cached view/proj matrices for deferred scene UBO (set in UpdateMVP, used in CompositeFrame)
     XMFLOAT4X4 _deferredView{};
     XMFLOAT4X4 _deferredProj{};
+
+    // S2b: cached scene lighting for sensor renders
+    XMFLOAT3 _cachedLightDir   = {0.408f, 0.816f, 0.408f};
+    XMFLOAT4 _cachedLightColor = {1.0f, 1.0f, 1.0f, 3.0f};
 
     // ---------------------------------------------------------------------------
     // CSM — mesh model cache (used to build ShadowDraw list for VulkanShadows)
@@ -448,6 +484,30 @@ class VulkanBackend : public IRenderBackend
     // IBL deferred lighting pipeline (replaces _deferredPipeline when IBL is ready)
     VkPipeline _deferredIBLPipeline = VK_NULL_HANDLE;
 
+    // ---------------------------------------------------------------------------
+    // Phase 30: GI deferred lighting pipeline (set=3: ssgiTex + probeIrr + UBO)
+    // ---------------------------------------------------------------------------
+    struct ProbeGridUBO {
+        float    origin[4];    // xyz + pad
+        float    spacing[4];   // xyz + pad
+        uint32_t dims[4];      // xyz + pad  → 48 bytes
+    };
+    static_assert(sizeof(ProbeGridUBO) == 48);
+
+    VkDescriptorSetLayout _giDescLayout           = VK_NULL_HANDLE;
+    VkDescriptorPool      _giDescPool             = VK_NULL_HANDLE;
+    VkDescriptorSet       _giDescSet[FRAMES_IN_FLIGHT] = {};
+    VkPipelineLayout      _deferredGIPipeLayout    = VK_NULL_HANDLE;
+    VkPipeline            _deferredGIPipeline      = VK_NULL_HANDLE;
+    VkSampler             _giSampler               = VK_NULL_HANDLE;
+    VkBuffer              _giProbeGridUBO[FRAMES_IN_FLIGHT]    = {};
+    VkDeviceMemory        _giProbeGridMem[FRAMES_IN_FLIGHT]    = {};
+    void*                 _giProbeGridMapped[FRAMES_IN_FLIGHT] = {};
+
+    bool CreateGIDeferredResources();
+    void DestroyGIDeferredResources();
+    void UpdateGIDescriptorSet(uint32_t frameIndex);
+
 
     // ---------------------------------------------------------------------------
     // Scene meshes
@@ -471,6 +531,7 @@ class VulkanBackend : public IRenderBackend
         float albedoFactor[4]  = {1,1,1,1};
         float metallicFactor   = 0.0f;
         float roughnessFactor  = 0.5f;
+        float alpha            = 1.0f;  // Phase 31: OIT — <1.0 routes mesh to transparent pass
     };
 
     struct VkSceneMesh
@@ -801,6 +862,208 @@ class VulkanBackend : public IRenderBackend
 
     // ── GPU Profiler ──
     VulkanGPUProfiler _gpuProfiler;
+
+    // ---------------------------------------------------------------------------
+    // Phase 31: Order-Independent Transparency (WBOIT)
+    // ---------------------------------------------------------------------------
+private:
+    static constexpr uint32_t MAX_OIT_MESHES = 256;
+
+    struct VKOITMeshDraw
+    {
+        const VkSceneMesh* mesh;
+        XMFLOAT4X4          model;
+        float               alpha;
+    };
+
+    bool _vkOitReady = false;
+    std::vector<VKOITMeshDraw> _vkOitMeshes;
+
+    bool CreateVKOITResources();
+    void DestroyVKOITResources();
+    void DrawVKOITForward(VkCommandBuffer cmd);
+    void DrawVKOITComposite(VkCommandBuffer cmd);
+
+    // OIT accum image (RGBA16F) and revealage image (R8_UNORM)
+    VkImage        _oitAccumImage  = VK_NULL_HANDLE;
+    VkDeviceMemory _oitAccumMem    = VK_NULL_HANDLE;
+    VkImageView    _oitAccumView   = VK_NULL_HANDLE;
+
+    VkImage        _oitRevealImage = VK_NULL_HANDLE;
+    VkDeviceMemory _oitRevealMem   = VK_NULL_HANDLE;
+    VkImageView    _oitRevealView  = VK_NULL_HANDLE;
+
+    // OIT Forward render pass: 2 color (accum+revealage) + depth READ_ONLY
+    VkRenderPass  _oitFwdRenderPass  = VK_NULL_HANDLE;
+    VkFramebuffer _oitFwdFramebuffer = VK_NULL_HANDLE;
+
+    // OIT Composite render pass: 1 color (HDR, LOAD_OP_LOAD blend)
+    VkRenderPass  _oitCmpRenderPass  = VK_NULL_HANDLE;
+    VkFramebuffer _oitCmpFramebuffer = VK_NULL_HANDLE;
+
+    // Scene UBO for OIT forward pass (view + proj + lightDir + lightColor, 160B → 256B buffer)
+    struct OITSceneData
+    {
+        float view[16];        //  64 B
+        float proj[16];        //  64 B
+        float lightDir[3];     //  12 B
+        float _p0;             //   4 B
+        float lightColor[4];   //  16 B → 160 B total, stored in 256 B buffer
+    };
+
+    VkBuffer        _oitSceneUBO[FRAMES_IN_FLIGHT]       = {};
+    VkDeviceMemory  _oitSceneUBOMem[FRAMES_IN_FLIGHT]    = {};
+    void*           _oitSceneUBOMapped[FRAMES_IN_FLIGHT] = {};
+
+    // Descriptor set layouts
+    VkDescriptorSetLayout _oitSceneLayout  = VK_NULL_HANDLE;  // set=0: OITSceneUBO
+    VkDescriptorSetLayout _oitAlbedoLayout = VK_NULL_HANDLE;  // set=1: albedoTex (combined sampler)
+    VkDescriptorSetLayout _oitCmpLayout    = VK_NULL_HANDLE;  // set=0 composite: accum+revealage
+
+    // Descriptor pool (scene per frame + albedo MAX_OIT_MESHES×FRAMES + composite)
+    VkDescriptorPool _oitDescPool                              = VK_NULL_HANDLE;
+    VkDescriptorSet  _oitSceneDescSet[FRAMES_IN_FLIGHT]        = {};
+    VkDescriptorSet  _oitAlbedoDescSets[FRAMES_IN_FLIGHT][256] = {};  // [frame][meshSlot]
+    VkDescriptorSet  _oitCmpDescSet                            = VK_NULL_HANDLE;
+
+    VkSampler _oitLinearSampler = VK_NULL_HANDLE;  // for albedo in OIT forward
+    VkSampler _oitPointSampler  = VK_NULL_HANDLE;  // for accum/revealage in OIT composite
+
+    // Pipeline layouts and pipelines
+    VkPipelineLayout _oitFwdPipeLayout = VK_NULL_HANDLE;
+    VkPipeline       _oitFwdPipeline   = VK_NULL_HANDLE;
+    VkPipelineLayout _oitCmpPipeLayout = VK_NULL_HANDLE;
+    VkPipeline       _oitCmpPipeline   = VK_NULL_HANDLE;
+
+    // ── Phase 32: Visibility Buffer ───────────────────────────────────────────
+    bool _vkVisBufferReady = false;
+    bool _vkVisBufferMode  = false;
+
+    // Visibility RT (VK_FORMAT_R32_UINT, full-res)
+    VkImage        _visImage      = VK_NULL_HANDLE;
+    VkDeviceMemory _visImageMem   = VK_NULL_HANDLE;
+    VkImageView    _visImageView  = VK_NULL_HANDLE;
+
+    // Render pass + framebuffer for vis pass (single R32_UINT attachment + depth)
+    VkRenderPass   _visRenderPass   = VK_NULL_HANDLE;
+    VkFramebuffer  _visFramebuffer  = VK_NULL_HANDLE;
+
+    // G-buffer storage image views for shade compute UAV write
+    VkImageView    _visGB0StorageView = VK_NULL_HANDLE;
+    VkImageView    _visGB1StorageView = VK_NULL_HANDLE;
+    VkImageView    _visGB2StorageView = VK_NULL_HANDLE;
+
+    // Descriptor sets for shade compute
+    VkDescriptorSetLayout _visShadeSet0Layout = VK_NULL_HANDLE; // UBO + vis RT
+    VkDescriptorSetLayout _visShadeSet1Layout = VK_NULL_HANDLE; // VB + IB + objects + meshInfos
+    VkDescriptorSetLayout _visShadeSet2Layout = VK_NULL_HANDLE; // G-buffer UAVs
+    VkDescriptorPool      _visShadePool       = VK_NULL_HANDLE;
+    VkDescriptorSet       _visShadeSet0[FRAMES_IN_FLIGHT] = {};
+    VkDescriptorSet       _visShadeSet1       = VK_NULL_HANDLE;
+    VkDescriptorSet       _visShadeSet2       = VK_NULL_HANDLE;
+
+    // Per-frame shade constants UBO
+    VkBuffer       _visShadeUBO[FRAMES_IN_FLIGHT]    = {};
+    VkDeviceMemory _visShadeUBOMem[FRAMES_IN_FLIGHT] = {};
+    void*          _visShadeUBOMapped[FRAMES_IN_FLIGHT] = {};
+
+    // Sampler for shade compute (anisotropic wrap)
+    VkSampler      _visShadeSampler = VK_NULL_HANDLE;
+
+    // Vis pass pipeline (VS+PS)
+    VkPipelineLayout _visPipeLayout  = VK_NULL_HANDLE;
+    VkPipeline       _visPipeline    = VK_NULL_HANDLE;
+
+    // Shade compute pipeline
+    VkPipelineLayout _visShadeLayout  = VK_NULL_HANDLE;
+    VkPipeline       _visShadePipeline = VK_NULL_HANDLE;
+
+    bool CreateVKVisibilityResources();
+    void DestroyVKVisibilityResources();
+    void DrawVKVisibilityPass(VkCommandBuffer cmd);
+    void DispatchVKVisibilityShade(VkCommandBuffer cmd);
+
+    // ── S2b: Vulkan Camera Sensor Rendering ─────────────────────────────────
+    // Per-sensor GPU resource bundle
+    struct VulkanCameraResources
+    {
+        static constexpr uint32_t MAX_DRAWS = 512; // max meshes per sensor render
+
+        // G-buffer (reuse Phase 32 class)
+        VulkanGBuffer gbuffer;
+        // Dedicated depth
+        VkImage        depthImage   = VK_NULL_HANDLE;
+        VkDeviceMemory depthMemory  = VK_NULL_HANDLE;
+        VkImageView    depthView    = VK_NULL_HANDLE;
+        // Lit HDR output (RGBA16F)
+        VkImage        litImage     = VK_NULL_HANDLE;
+        VkDeviceMemory litMemory    = VK_NULL_HANDLE;
+        VkImageView    litView      = VK_NULL_HANDLE;
+        VkRenderPass   litRP        = VK_NULL_HANDLE;
+        VkFramebuffer  litFB        = VK_NULL_HANDLE;
+        // Distorted output (RGBA8, GENERAL layout)
+        VkImage        distortImage = VK_NULL_HANDLE;
+        VkDeviceMemory distortMemory= VK_NULL_HANDLE;
+        VkImageView    distortView  = VK_NULL_HANDLE;
+        // CPU readback staging (HOST_VISIBLE | HOST_COHERENT, persistently mapped)
+        VkBuffer       stagingRGB   = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMem   = VK_NULL_HANDLE;
+        void*          stagingMapped= nullptr;
+        // G-buffer fill: sensor MVP UBO (MAX_DRAWS * 256B per frame, triple-buffered)
+        VkBuffer       sensorMVPBuf = VK_NULL_HANDLE;
+        VkDeviceMemory sensorMVPMem = VK_NULL_HANDLE;
+        void*          sensorMVPMapped = nullptr;
+        VkDescriptorPool gbufPool   = VK_NULL_HANDLE;
+        VkDescriptorSet  gbufSets[3]= {};  // [fi]: mvpBuf (dynamic) + scene UBO
+        // Sensor lighting pass
+        VkBuffer       litSceneUBO[3]   = {};
+        VkDeviceMemory litSceneUBOMem[3]= {};
+        void*          litSceneUBOMapped[3]= {};
+        VkDescriptorPool litPool        = VK_NULL_HANDLE;
+        VkDescriptorSet  litSceneSets[3]= {};  // set=0: scene UBO [fi]
+        VkDescriptorSet  litGBufSet     = VK_NULL_HANDLE;  // set=1: G-buffer samplers
+        VkSampler        litSampler     = VK_NULL_HANDLE;  // for G-buffer + litRT sampling
+        // Distortion compute
+        VkBuffer       distortUBO[3]    = {};
+        VkDeviceMemory distortUBOMem[3] = {};
+        void*          distortUBOMapped[3] = {};
+        VkDescriptorPool distortPool    = VK_NULL_HANDLE;
+        VkDescriptorSet  distortUBOSets[3] = {};  // set=0: distort UBO [fi]
+        VkDescriptorSet  distortLitSet  = VK_NULL_HANDLE;  // set=1: litRT sampler
+        VkDescriptorSet  distortOutSet  = VK_NULL_HANDLE;  // set=2: distortRT storage
+        // ImGui display (from ImGui_ImplVulkan_AddTexture)
+        VkDescriptorSet  imguiSet       = VK_NULL_HANDLE;
+        // Tracking
+        uint32_t width  = 0, height = 0;
+        bool     ready  = false;
+        bool     firstRender = true;
+    };
+
+    std::unordered_map<CameraSensor*, VulkanCameraResources> _vkCameraRTs;
+
+    // Shared sensor pipelines (created once in Init)
+    VkDescriptorSetLayout _sensorSceneLayout   = VK_NULL_HANDLE; // set=0: scene UBO
+    VkDescriptorSetLayout _sensorGBufLayout    = VK_NULL_HANDLE; // set=1: 4 COMBINED_IMAGE_SAMPLER
+    VkDescriptorSetLayout _sensorIBLLayout     = VK_NULL_HANDLE; // set=2: 3 COMBINED_IMAGE_SAMPLER
+    VkPipelineLayout      _sensorLitPipeLayout = VK_NULL_HANDLE;
+    VkPipeline            _sensorLitPipeline   = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout _sensorDistUBOLayout   = VK_NULL_HANDLE; // set=0: distort UBO
+    VkDescriptorSetLayout _sensorDistInputLayout = VK_NULL_HANDLE; // set=1: litRT sampler
+    VkDescriptorSetLayout _sensorDistOutLayout   = VK_NULL_HANDLE; // set=2: distortRT storage
+    VkPipelineLayout      _sensorDistPipeLayout  = VK_NULL_HANDLE;
+    VkPipeline            _sensorDistPipeline    = VK_NULL_HANDLE;
+
+    VkDescriptorPool _sensorIBLPool    = VK_NULL_HANDLE;
+    VkDescriptorSet  _sensorIBLSet     = VK_NULL_HANDLE; // shared IBL set for all cameras
+
+    bool CreateSensorLightingPipeline();
+    bool CreateSensorDistortPipeline();
+    bool CreateSensorIBLDescriptorSet();
+    bool InitVKCameraResources(CameraSensor* cam);
+    void DestroyVKCameraResources(CameraSensor* cam);
+    void RenderVKCameraSensorInternal(CameraSensor* cam, VkCommandBuffer cmd, uint32_t fi);
+    void RenderCameraSensors() override;
 };
 
 } // namespace Luna

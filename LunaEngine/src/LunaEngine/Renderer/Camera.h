@@ -40,7 +40,7 @@ class Camera
     XMFLOAT3 ComputeEye() const;
 
     XMFLOAT4 _orientation;         // unit quaternion
-    float    _radius =   3.0f;     // orbit radius
+    float    _radius =  10.0f;     // orbit radius
 
     XMFLOAT3 _target = {0.0f, 0.0f, 0.0f};
 

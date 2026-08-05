@@ -178,8 +178,10 @@ bool VulkanDevice::CreateLogicalDevice()
     // bufferDeviceAddress enabled conditionally below (requires RT)
 
     VkPhysicalDeviceFeatures deviceFeatures {};
-    deviceFeatures.samplerAnisotropy = VK_TRUE;
-    deviceFeatures.multiDrawIndirect = VK_TRUE;
+    deviceFeatures.samplerAnisotropy  = VK_TRUE;
+    deviceFeatures.multiDrawIndirect  = VK_TRUE;
+    deviceFeatures.independentBlend   = VK_TRUE;  // required for OIT (different blend per MRT attachment)
+    deviceFeatures.geometryShader     = VK_TRUE;  // required for gl_PrimitiveID in fragment stage (OpCapability Geometry)
 
     // Build pNext chain: vk12Features → [asFeatures → rtFeatures → rqFeatures] if RT
     //                                  → [msFeatures] if mesh shader

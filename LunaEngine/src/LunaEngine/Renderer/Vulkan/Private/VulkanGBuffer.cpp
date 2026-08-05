@@ -88,7 +88,7 @@ bool VulkanGBuffer::CreateImages()
 
     auto mkGB = [&](VkFormat fmt, VkImage& img, VkDeviceMemory& mem, VkImageView& view) -> bool {
         if (!_core->CreateImage(W, H, fmt, VK_IMAGE_TILING_OPTIMAL,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, img, mem))
             return false;
         view = _core->CreateImageView(img, fmt, VK_IMAGE_ASPECT_COLOR_BIT);

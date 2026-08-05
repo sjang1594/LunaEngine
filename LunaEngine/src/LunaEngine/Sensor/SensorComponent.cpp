@@ -12,20 +12,8 @@ SensorComponent::SensorComponent()
 
 void SensorComponent::Update()
 {
-    auto transform = GetTransform();
-    if (!transform) return;
-
-    XMFLOAT4X4 worldMat;
-    XMStoreFloat4x4(&worldMat, transform->GetWorldMatrix());
-
-    for (auto& sensor : _sensors)
-    {
-        if (sensor && sensor->enabled)
-        {
-            sensor->UpdateExtrinsicFromPosRot();
-            sensor->Simulate(worldMat, 0.016f); // TODO: pass actual dt
-        }
-    }
+    // Sensor tick (UpdateExtrinsicFromPosRot + Simulate) is owned by SensorManager::Update()
+    // which has correct dt. Nothing to do here.
 }
 
 ISensor* SensorComponent::AddSensor(std::shared_ptr<ISensor> sensor)

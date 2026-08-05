@@ -51,7 +51,8 @@ public:
 class GPUProfilerOverlay
 {
 public:
-    void Render(IGPUProfiler* profiler);
+    void Render(IGPUProfiler* profiler);        // standalone window (Begin/End included)
+    void RenderContent(IGPUProfiler* profiler); // content only — for embedding in a tab
 
     bool IsVisible() const { return _visible; }
     void SetVisible(bool visible) { _visible = visible; }

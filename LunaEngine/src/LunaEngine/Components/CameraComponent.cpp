@@ -12,8 +12,8 @@ CameraComponent::CameraComponent()
     , _nearZ(0.1f)
     , _farZ(500.0f)
 {
-    // Default: 30° elevation, looking down at target from above-behind.
-    XMVECTOR q = XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0), XMConvertToRadians(-30.0f));
+    // Default: 30° elevation above target, looking down.
+    XMVECTOR q = XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0), XMConvertToRadians(30.0f));
     XMStoreFloat4(&_orientation, XMQuaternionNormalize(q));
 }
 

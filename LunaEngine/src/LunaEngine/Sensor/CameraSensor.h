@@ -13,9 +13,16 @@ class CameraSensor : public ISensor
 public:
     CameraSensorConfig config;
 
-    // Output buffers (CPU readback, populated by backend in Phase 2)
+    // Output buffers (CPU readback, populated by backend in S2)
     std::vector<uint8_t>  rgbOutput;     // RGBA8, width*height*4
-    std::vector<float>    depthOutput;   // linear meters, width*height
+    std::vector<float>    depthOutput;   // linear depth in meters, width*height
+
+    // S2: set to true each time a new frame has been written to rgbOutput/depthOutput
+    bool hasNewFrame = false;
+
+    // S2: GPU descriptor handle for ImGui::Image() — set by DX12Backend after resources init
+    // Cast to ImTextureID: ImGui::Image((ImTextureID)cam->gpuTextureHandle, size)
+    uint64_t gpuTextureHandle = 0;
 
     CameraSensor(const std::string& name = "Camera0")
         : ISensor(SensorType::Camera, name) {}
@@ -42,7 +49,9 @@ public:
             XMConvertToRadians(config.fovDeg), aspect, config.nearZ, config.farZ);
         XMStoreFloat4x4(&_projMatrix, proj);
 
-        // TODO Phase 2: dispatch offscreen render via IRenderBackend::RenderOffscreen()
+        // S2: GPU offscreen render dispatched by DX12Backend::RenderCameraSensors()
+        // (called once per display frame; this Simulate() just updates matrices + tick flag)
+        hasNewFrame = false; // backend sets this after readback
     }
 
     const DirectX::XMFLOAT4X4& GetViewMatrix()  const { return _viewMatrix; }

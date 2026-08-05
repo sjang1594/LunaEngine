@@ -79,6 +79,46 @@ class IRenderBackend
     };
     virtual void SetPointLights(const std::vector<PointLightDesc>& /*lights*/) {}
 
+    /* Phase 29: Volumetric fog parameters */
+    struct VolumetricFogParams {
+        bool  enabled       = false;
+        float density       = 0.02f;
+        float heightFalloff = 0.15f;
+        float baseHeight    = -2.0f;
+        float scattering    = 0.8f;
+        float extinction    = 1.0f;
+        float phaseG        = 0.3f;
+    };
+    virtual void SetVolumetricFogParams(const VolumetricFogParams& /*p*/) {}
+
+    /* Phase 30: Global Illumination parameters */
+    struct GIParams {
+        float probeGridOrigin[3]  = {-8.0f, 0.0f, -8.0f};
+        float probeGridSpacing[3] = { 2.0f, 2.0f,  2.0f};
+        float temporalAlpha       = 0.1f;
+        int   numSSGIRays         = 8;
+        float maxRayDist          = 5.0f;
+    };
+    virtual void SetGIParams(const GIParams& /*p*/) {}
+
+    // Calibration range scene — procedural geometry (ground + obstacles at known positions)
+    virtual std::vector<std::shared_ptr<Mesh>> LoadCalibrationScene() { return {}; }
+
+    // Generic procedural box scene: creates ONE unit-box mesh, sets up GPU-driven rendering,
+    // and builds a TLAS with the supplied per-instance world transforms.
+    // Returns the shared Mesh (nullptr on failure). instanceTransforms must not be empty.
+    virtual std::shared_ptr<Mesh> CreateProceduralBoxScene(
+        const std::vector<DirectX::XMFLOAT4X4>& instanceTransforms) { return nullptr; }
+
+    // S2: render all active camera sensors into their per-camera offscreen RTs
+    virtual void RenderCameraSensors() {}
+
+    // S3: dispatch LiDAR GPU raycasting for all active LiDAR sensors
+    virtual void RenderLiDARSensors() {}
+    // S3: overlay LiDAR point clouds onto the viewport (call after RenderLiDARSensors)
+    virtual void RenderLiDARPointClouds() {}
+
     virtual const char *GetBackendName() const = 0;
+    virtual DirectX::XMFLOAT4X4 GetCurrentVP() const { return {}; }
 };
 } // namespace Luna

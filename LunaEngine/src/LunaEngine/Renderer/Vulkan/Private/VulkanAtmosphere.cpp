@@ -81,13 +81,14 @@ bool VulkanAtmosphere::Create(const CreateInfo& info)
 
     SetSunElevationAzimuth(45.0f, 180.0f);
 
-    if (!CreateLUTImages())             { LUNA_LOG_ERROR("VK Atmo: LUT image creation failed"); return false; }
-    if (!CreateSampler())               { LUNA_LOG_ERROR("VK Atmo: sampler creation failed"); return false; }
-    if (!CreateUBO())                   { LUNA_LOG_ERROR("VK Atmo: UBO creation failed"); return false; }
-    if (!CreateDescriptors())           { LUNA_LOG_ERROR("VK Atmo: descriptor creation failed"); return false; }
-    if (!CreateComputePipelines())      { LUNA_LOG_ERROR("VK Atmo: compute pipeline creation failed"); return false; }
-    if (!CreateAtmosphereRenderPass())  { LUNA_LOG_ERROR("VK Atmo: atmosphere render pass creation failed"); return false; }
-    if (!CreateCompositePipeline())     { LUNA_LOG_ERROR("VK Atmo: composite pipeline creation failed"); return false; }
+    auto fail = [&](const char* msg) { LUNA_LOG_ERROR("%s", msg); Destroy(); return false; };
+    if (!CreateLUTImages())             return fail("VK Atmo: LUT image creation failed");
+    if (!CreateSampler())               return fail("VK Atmo: sampler creation failed");
+    if (!CreateUBO())                   return fail("VK Atmo: UBO creation failed");
+    if (!CreateDescriptors())           return fail("VK Atmo: descriptor creation failed");
+    if (!CreateComputePipelines())      return fail("VK Atmo: compute pipeline creation failed");
+    if (!CreateAtmosphereRenderPass())  return fail("VK Atmo: atmosphere render pass creation failed");
+    if (!CreateCompositePipeline())     return fail("VK Atmo: composite pipeline creation failed");
 
     VkCommandBuffer cmd = _core->BeginSingleTimeCommands();
     Precompute(cmd);
@@ -104,7 +105,7 @@ void VulkanAtmosphere::Destroy()
 {
     if (!_core) return;
     VkDevice dev = _core->GetDevice();
-    vkDeviceWaitIdle(dev);
+    if (dev) vkDeviceWaitIdle(dev);
 
     auto destroyImg = [&](VkImage& i, VkDeviceMemory& m, VkImageView& v) {
         if (v) { vkDestroyImageView(dev, v, nullptr); v = VK_NULL_HANDLE; }
@@ -146,6 +147,8 @@ void VulkanAtmosphere::Destroy()
 
     _ready = false;
     _precomputed = false;
+    _skyViewReady = false;
+    _core = nullptr;
 }
 
 void VulkanAtmosphere::SetSunElevationAzimuth(float elevDeg, float azimDeg)

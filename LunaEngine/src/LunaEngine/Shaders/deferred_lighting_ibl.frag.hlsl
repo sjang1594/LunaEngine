@@ -127,7 +127,7 @@ float3 ReconstructWorldPos(float2 uv, float depth)
     return worldPos.xyz / worldPos.w;
 }
 
-float SampleCSMShadow(float3 posWS, float viewSpaceZ)
+float SampleCSMShadow(float3 posWS, float viewSpaceZ, float3 normalWS, float3 lightDir)
 {
     uint cascade = 3u;
     if      (viewSpaceZ < cascadeSplits.x) cascade = 0u;
@@ -145,7 +145,12 @@ float SampleCSMShadow(float3 posWS, float viewSpaceZ)
     if (any(shadowUV < 0.0f) || any(shadowUV > 1.0f) || shadowDepth < 0.0f || shadowDepth > 1.0f)
         return 1.0f;
 
-    float bias      = 0.005f;
+    // Slope-scaled bias: larger on surfaces nearly parallel to the light (high tan(theta)).
+    // Each cascade covers a larger area → needs proportionally larger bias.
+    float cosTheta  = saturate(dot(normalWS, lightDir));
+    float tanTheta  = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta)) / max(cosTheta, 0.01f);
+    float cascadeScale = (float)(1u << cascade);  // 1, 2, 4, 8 for cascades 0-3
+    float bias      = clamp(0.003f * tanTheta, 0.002f, 0.03f) * cascadeScale * 0.01f;
     float texelSize = 1.0f / 2048.0f;
     float shadow    = 0.0f;
     float cascadeF  = (float)cascade;
@@ -213,7 +218,7 @@ float4 main(PSInput input) : SV_Target0
 
     float4 posVS = mul(float4(posWS, 1.0f), viewMatrix);
     float  viewZ = posVS.z;
-    float  shadow = SampleCSMShadow(posWS, viewZ);
+    float  shadow = SampleCSMShadow(posWS, viewZ, N, L);
     float  ao = ssaoBlurTex.Sample(bilinearClamp, input.uv);
 
     float3 Lo = (diffuseDirect + specularDirect) * radiance * NdL * shadow;

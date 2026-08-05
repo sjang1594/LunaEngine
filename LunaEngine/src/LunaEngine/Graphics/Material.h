@@ -36,7 +36,8 @@ struct Material
     void*                     cbMapped  = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbGPUAddr = 0;
 
-    UINT srvTableStart = 0;  // index of first of 3 consecutive SRV heap slots
+    UINT  srvTableStart = 0;    // index of first of 3 consecutive SRV heap slots
+    float alpha         = 1.0f; // Phase 31: OIT — <1.0 routes mesh to transparent pass
 
     Material()                           = default;
     ~Material()                          = default;

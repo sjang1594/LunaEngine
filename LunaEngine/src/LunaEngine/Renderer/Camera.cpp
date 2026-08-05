@@ -10,10 +10,9 @@ Camera::Camera(float fovDeg, float aspect, float nearZ, float farZ)
     , _nearZ(nearZ)
     , _farZ(farZ)
 {
-    // Default view: slightly above and behind the target (30° elevation).
-    // ComputeEye rotates (0, 0, -radius) by q → eye offset from target.
-    // -30° around X rotates -Z toward +Y → eye above target, looking down.
-    XMVECTOR q = XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0), XMConvertToRadians(-30.0f));
+    // Default view: 30° elevation above target, looking down.
+    // +30° around X rotates (0,0,-radius) toward +Y → eye above target.
+    XMVECTOR q = XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0), XMConvertToRadians(30.0f));
     XMStoreFloat4(&_orientation, XMQuaternionNormalize(q));
 }
 

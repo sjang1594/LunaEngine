@@ -112,7 +112,7 @@ bool DX12Pipeline::Initialize(const ComPtr<ID3D12Device> &device, const std::wst
     {
         ComPtr<IDxcBlob> csBlob;
         std::wstring csFullPath = GetShaderFullPath(vsPath); // reuse vsPath for CS path
-        if (!loadShader(csFullPath, L"cs_6_0", csBlob)) return false;
+        if (!loadShader(csFullPath, desc.csTarget, csBlob)) return false;
         if (!CreateRootSignature(device)) return false;
 
         D3D12_COMPUTE_PIPELINE_STATE_DESC csoDesc = {};
@@ -362,8 +362,8 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
     // rootSigDesc.Init() stores pointers to these, so they must persist until
     // D3D12SerializeRootSignature is called after the if-else chain.
     // Zero-initialize to avoid garbage in unused slots.
-    CD3DX12_ROOT_PARAMETER      rootParams[10] = {};  // max: DeferredLightingIBL uses 10
-    CD3DX12_DESCRIPTOR_RANGE    descRanges[8] = {};   // max: DeferredLightingIBL uses 8
+    CD3DX12_ROOT_PARAMETER      rootParams[12] = {};  // max: DeferredLightingGI uses 12
+    CD3DX12_DESCRIPTOR_RANGE    descRanges[10] = {};  // max: DeferredLightingGI uses 10
     D3D12_STATIC_SAMPLER_DESC   staticSamplers[3] = {}; // max: 3 samplers
 
     if (_desc.rootLayout == RootSignatureLayout::PBR)
@@ -937,6 +937,416 @@ bool DX12Pipeline::CreateRootSignature(const ComPtr<ID3D12Device> &device)
 
         rootSigDesc.Init(10, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     }
+    else if (_desc.rootLayout == RootSignatureLayout::VolInject)
+    {
+        // Phase 29: Volumetric fog inject compute
+        //   params[0] b0 — VolumetricParams CBV
+        //   params[1] u0 — RWTexture3D froxelVolume
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootSigDesc.Init(2, rootParams, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::VolScatter)
+    {
+        // Phase 29: Volumetric fog scattering accumulation compute
+        //   params[0] b0  — VolumetricParams CBV
+        //   params[1] t0  — Texture3D froxelInject SRV
+        //   params[2] t1  — Texture2DArray csmShadow SRV
+        //   params[3] u0  — RWTexture3D froxelAccum UAV
+        //   s0 = shadow comparison sampler (LESS_EQUAL, clamp)
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 froxelInject
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1 csmShadow
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0 froxelAccum
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[0].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rootSigDesc.Init(4, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::VolApply)
+    {
+        // Phase 29: Volumetric fog apply — fullscreen, additive blend
+        //   params[0] b0 — 4 root consts (nearZ, farZ, pad×2)
+        //   params[1] t0 — Texture2D depthTex
+        //   params[2] t1 — Texture3D froxelAccum
+        //   s0 = point-clamp, s1 = bilinear-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 depth
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1 froxelAccum
+        rootParams[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        staticSamplers[1] = {};
+        staticSamplers[1].Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[1].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[1].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[1].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[1].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[1].ShaderRegister   = 1;
+        staticSamplers[1].RegisterSpace    = 0;
+        staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rootSigDesc.Init(3, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::SSGICompute)
+    {
+        // Phase 30: SSGI compute
+        //   params[0] b0 — SSGIConstants CBV (256B)
+        //   params[1]    — SRV t0: depthTex
+        //   params[2]    — SRV t1: gbuffer0 albedo
+        //   params[3]    — SRV t2: gbuffer1 normal
+        //   params[4]    — SRV t3: hdrRT
+        //   params[5]    — SRV t4: Hi-Z full pyramid
+        //   params[6]    — SRV t5: ssgiHistory
+        //   params[7]    — UAV u0: ssgiOutput
+        //   s0=point-clamp, s1=linear-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3
+        descRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4); // t4
+        descRanges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5
+        descRanges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[4], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[6].InitAsDescriptorTable(1, &descRanges[5], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[7].InitAsDescriptorTable(1, &descRanges[6], D3D12_SHADER_VISIBILITY_ALL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[1].ShaderRegister = 1;
+
+        rootSigDesc.Init(8, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::ProbeUpdate)
+    {
+        // Phase 30: Probe update compute
+        //   params[0] b0 — ProbeConstants CBV
+        //   params[1]    — SRV t0: ssgiTex
+        //   params[2]    — SRV t1: irrCubemap
+        //   params[3]    — SRV t2: depthTex
+        //   params[4]    — UAV u0: probeIrrArray
+        //   s0=bilinear-clamp, s1=trilinear-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_ALL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[1].ShaderRegister = 1;
+
+        rootSigDesc.Init(5, rootParams, 2, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::DeferredLightingGI)
+    {
+        // Phase 30: Deferred Lighting with GI (extends DeferredLightingIBL by 2 params)
+        //   params[0..9]  = same as DeferredLightingIBL
+        //   params[10]    — SRV t12: ssgiTex
+        //   params[11]    — SRV t13: probeIrrArray (Texture2DArray)
+        //   s0=point-clamp, s1=bilinear-clamp, s2=trilinear-clamp (same as IBL)
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);  // t0-t4
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5);  // t5
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);  // t6
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);  // t7
+        descRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8);  // t8
+        descRanges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9);  // t9
+        descRanges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 10); // t10
+        descRanges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 11); // t11
+        descRanges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 12); // t12 ssgi
+        descRanges[9].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 13); // t13 probe
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[6].InitAsDescriptorTable(1, &descRanges[4], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[7].InitAsDescriptorTable(1, &descRanges[5], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[8].InitAsDescriptorTable(1, &descRanges[6], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[9].InitAsDescriptorTable(1, &descRanges[7], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[10].InitAsDescriptorTable(1, &descRanges[8], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[11].InitAsDescriptorTable(1, &descRanges[9], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].MaxAnisotropy    = 1;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSamplers[0].MinLOD           = 0.0f;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        staticSamplers[1].ShaderRegister = 1;
+
+        staticSamplers[2]                = staticSamplers[0];
+        staticSamplers[2].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[2].ShaderRegister = 2;
+
+        rootSigDesc.Init(12, rootParams, 3, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::OITForward)
+    {
+        // Phase 31: OIT forward pass — transparent geometry → accum + revealage MRT
+        //   params[0] b0 — OITTransform CBV, ALL_VISIBLE (model/view/proj 192B + alpha 4B + pad)
+        //   params[1] b1 — SceneConstants CBV, PS_ONLY (lightDir, lightColor)
+        //   params[2]    — SRV t0: albedoTex, PS_ONLY
+        //   s0 = linear-clamp, PS_ONLY
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 albedo
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers,
+                         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::OITComposite)
+    {
+        // Phase 31: OIT composite — fullscreen blend of accum+revealage onto HDR
+        //   params[0]    — SRV t0: accumTex (RGBA16F)
+        //   params[1]    — SRV t1: revealageTex (R8)
+        //   s0 = point-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 accum
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // t1 revealage
+        rootParams[0].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        rootSigDesc.Init(2, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::VisibilityBuffer)
+    {
+        // Phase 32: Visibility buffer pass — compatible with Phase 12 ExecuteIndirect command sig
+        //   params[0] b0 — ViewProj CBV (view+proj, 128B), ALL_VISIBLE
+        //   params[1] b1 — materialCB CBV (set by indirect; unused in vis pass), ALL_VISIBLE
+        //   params[2] b2 — materialIndex root const (1 DWORD, set by indirect; unused), ALL_VISIBLE
+        //   params[3] b3 — objectIndex   root const (1 DWORD, set by indirect), ALL_VISIBLE
+        //   params[4]    — SRV t0 space0: GPUObjectData StructuredBuffer, VS_ONLY
+        // Compatible with Phase 12 ExecuteIndirect command sig (sets params[1][2][3])
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);   // b0 ViewProj
+        rootParams[1].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_ALL);   // b1 materialCB (set by indirect)
+        rootParams[2].InitAsConstants(1, 2, 0, D3D12_SHADER_VISIBILITY_ALL);          // b2 materialIndex
+        rootParams[3].InitAsConstants(1, 3, 0, D3D12_SHADER_VISIBILITY_ALL);          // b3 objectIndex
+        rootParams[4].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX); // t0 GPUObjectData (root SRV)
+
+        rootSigDesc.Init(5, rootParams, 0, nullptr,
+                         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::VisibilityShade)
+    {
+        // Phase 32: Visibility shade compute — root descriptors for buffers, tables for tex/UAVs
+        //   params[0] b0 — VisShadeConstants CBV (root descriptor)
+        //   params[1]    — SRV t0: visBuf Texture2D<uint> (descriptor table, 1 slot)
+        //   params[2]    — SRV t1: mergedVB StructuredBuffer (root descriptor, GPU VA)
+        //   params[3]    — SRV t2: mergedIB ByteAddressBuffer (root descriptor, GPU VA)
+        //   params[4]    — SRV t3: GPUObjectData (root descriptor, GPU VA)
+        //   params[5]    — SRV t4: MeshDrawInfo (root descriptor, GPU VA)
+        //   params[6]    — UAV u0-u2: G-buffer UAVs (descriptor table, 3 consecutive slots)
+        //   params[7]    — SRV t0+ space1: bindless textures (descriptor table, unbounded)
+        //   s0           — anisotropic wrap sampler
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,      0, 0); // t0 visBuf
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3,      0, 0); // u0-u2 G-buffers
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1); // t0+ space1 bindless
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);  // t1 VB
+        rootParams[3].InitAsShaderResourceView(2, 0, D3D12_SHADER_VISIBILITY_ALL);  // t2 IB
+        rootParams[4].InitAsShaderResourceView(3, 0, D3D12_SHADER_VISIBILITY_ALL);  // t3 objects
+        rootParams[5].InitAsShaderResourceView(4, 0, D3D12_SHADER_VISIBILITY_ALL);  // t4 meshInfos
+        rootParams[6].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[7].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_ALL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter           = D3D12_FILTER_ANISOTROPIC;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                             = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        staticSamplers[0].MaxAnisotropy    = 8;
+        staticSamplers[0].ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].MaxLOD           = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister   = 0;
+        staticSamplers[0].RegisterSpace    = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        rootSigDesc.Init(8, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::SensorLighting)
+    {
+        // S2: sensor lighting (fullscreen, IBL-only deferred — no shadow/SSAO/GI)
+        //   params[0] b0 — SceneConstants CBV
+        //   params[1]    — SRV table t0-t2: GB0, GB1, GB2 (3 slots)
+        //   params[2]    — SRV t3: depth (1 slot)
+        //   params[3]    — SRV t4: irrMap (1 slot)
+        //   params[4]    — SRV t5: prefilterMap (1 slot)
+        //   params[5]    — SRV t6: brdfLUT (1 slot)
+        //   s0 = point-clamp, s1 = bilinear-clamp, s2 = trilinear-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0); // t0-t2 G-buffer
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0); // t3 depth
+        descRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4, 0); // t4 irradiance
+        descRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5, 0); // t5 prefilter
+        descRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6, 0); // t6 brdfLUT
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[3].InitAsDescriptorTable(1, &descRanges[2], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[4].InitAsDescriptorTable(1, &descRanges[3], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParams[5].InitAsDescriptorTable(1, &descRanges[4], D3D12_SHADER_VISIBILITY_PIXEL);
+
+        // s0: point-clamp
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter         = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                                   = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].MaxLOD         = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // s1: bilinear-clamp
+        staticSamplers[1]                = staticSamplers[0];
+        staticSamplers[1].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[1].ShaderRegister = 1;
+
+        // s2: trilinear-clamp (IBL cubemap mip sampling)
+        staticSamplers[2]                = staticSamplers[1];
+        staticSamplers[2].ShaderRegister = 2;
+
+        rootSigDesc.Init(6, rootParams, 3, staticSamplers,
+                         D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::LiDARRaycast)
+    {
+        // S3: LiDAR raycasting — all root descriptors (no descriptor tables, no sampler)
+        //   params[0] b0 — LiDARSensorCB (root CBV)
+        //   params[1] t0 — TLAS (root SRV, GPU VA)
+        //   params[2] t1 — rayDirBuffer (root SRV, GPU VA)
+        //   params[3] t2 — GPUObjectData (root SRV, GPU VA)
+        //   params[4] t3 — mergedVB ByteAddressBuffer (root SRV, GPU VA)
+        //   params[5] t4 — mergedIB ByteAddressBuffer (root SRV, GPU VA)
+        //   params[6] u0 — outputBuffer (root UAV, GPU VA)
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsShaderResourceView(0, 0, D3D12_SHADER_VISIBILITY_ALL);  // t0 TLAS
+        rootParams[2].InitAsShaderResourceView(1, 0, D3D12_SHADER_VISIBILITY_ALL);  // t1 rayDirs
+        rootParams[3].InitAsShaderResourceView(2, 0, D3D12_SHADER_VISIBILITY_ALL);  // t2 objects
+        rootParams[4].InitAsShaderResourceView(3, 0, D3D12_SHADER_VISIBILITY_ALL);  // t3 VB
+        rootParams[5].InitAsShaderResourceView(4, 0, D3D12_SHADER_VISIBILITY_ALL);  // t4 IB
+        rootParams[6].InitAsUnorderedAccessView(0, 0, D3D12_SHADER_VISIBILITY_ALL); // u0 output
+        rootSigDesc.Init(7, rootParams, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::CameraDistort)
+    {
+        // S2: camera distortion compute
+        //   params[0] b0 — DistortConstants CBV
+        //   params[1]    — SRV t0: litRT (1 slot)
+        //   params[2]    — UAV u0: distortRT (1 slot)
+        //   s0 = bilinear-clamp
+        descRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0); // t0 litRT
+        descRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0); // u0 distortRT
+
+        rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[1].InitAsDescriptorTable(1, &descRanges[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParams[2].InitAsDescriptorTable(1, &descRanges[1], D3D12_SHADER_VISIBILITY_ALL);
+
+        staticSamplers[0] = {};
+        staticSamplers[0].Filter         = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[0].AddressU = staticSamplers[0].AddressV = staticSamplers[0].AddressW
+                                   = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        staticSamplers[0].MaxLOD         = D3D12_FLOAT32_MAX;
+        staticSamplers[0].ShaderRegister = 0;
+        staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        rootSigDesc.Init(3, rootParams, 1, staticSamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    }
+    else if (_desc.rootLayout == RootSignatureLayout::PointCloud)
+    {
+        // S3: LiDAR point cloud overlay
+        //   params[0] b0 — 16 root constants (row-major VP matrix, 4×4 = 16 DWORDs)
+        rootParams[0].InitAsConstants(16, 0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+        rootSigDesc.Init(1, rootParams, 0, nullptr,
+                         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    }
     else
     {
         // Default MVP-only root signature
@@ -986,6 +1396,12 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
         {"TANGENT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 
+    // PointCloud: { pos(12) + intensity(4) } — stride 16 B
+    D3D12_INPUT_ELEMENT_DESC pointCloudLayout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT,        0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.pRootSignature     = _rootSignature.Get();
     // IDxcBlob satisfies GetBufferPointer/GetBufferSize — compatible with D3D12_SHADER_BYTECODE
@@ -994,10 +1410,15 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
     psoDesc.PS = ps ? D3D12_SHADER_BYTECODE{ps->GetBufferPointer(), ps->GetBufferSize()}
                     : D3D12_SHADER_BYTECODE{nullptr, 0};
     psoDesc.RasterizerState    = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    // MakeUnitBox / glTF meshes use CCW winding for outward normals (OpenGL/math convention).
+    // DX12 default is CW=front which would cull outer faces → flip to CCW=front.
+    psoDesc.RasterizerState.FrontCounterClockwise = TRUE;
     psoDesc.BlendState         = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState  = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
     psoDesc.SampleMask         = UINT_MAX;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.PrimitiveTopologyType = _desc.pointTopology
+        ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     psoDesc.SampleDesc.Count   = 1;
     psoDesc.NodeMask           = 0;
     psoDesc.Flags              = D3D12_PIPELINE_STATE_FLAG_NONE;
@@ -1013,6 +1434,11 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
     {
         psoDesc.InputLayout = {pbrLayout, _countof(pbrLayout)};
     }
+    else if (_desc.vertexLayout == VertexLayout::PointCloud)
+    {
+        psoDesc.InputLayout = {pointCloudLayout, _countof(pointCloudLayout)};
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
     else
     {
         psoDesc.InputLayout = {triangleLayout, _countof(triangleLayout)};
@@ -1026,10 +1452,11 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
         psoDesc.DSVFormat        = (_desc.dsvFormat != DXGI_FORMAT_UNKNOWN)
                                    ? _desc.dsvFormat : DXGI_FORMAT_D32_FLOAT;
 
-        // Depth bias reduces shadow acne (self-shadowing artifacts)
-        psoDesc.RasterizerState.DepthBias            = 100;
-        psoDesc.RasterizerState.DepthBiasClamp       = 0.0f;
-        psoDesc.RasterizerState.SlopeScaledDepthBias = 2.0f;
+        // D32_FLOAT depth bias: r ≈ depth * 2^-23 ≈ 5.96e-8 at depth=0.5
+        // DepthBias=100 gives ~6e-6 which is negligible. Use 100000 → ~0.006 offset.
+        psoDesc.RasterizerState.DepthBias            = 100000;
+        psoDesc.RasterizerState.DepthBiasClamp       = 0.01f;
+        psoDesc.RasterizerState.SlopeScaledDepthBias = 3.0f;
         // Front-face culling: caster back-faces project into shadow map, reducing acne
         psoDesc.RasterizerState.CullMode             = D3D12_CULL_MODE_FRONT;
 
@@ -1057,9 +1484,10 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
             psoDesc.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
             psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         }
-        else if (_desc.rootLayout == RootSignatureLayout::SSRBlend)
+        else if (_desc.rootLayout == RootSignatureLayout::SSRBlend ||
+                 _desc.rootLayout == RootSignatureLayout::VolApply)
         {
-            // Phase 16B: Additive blend SSR onto _hdrRT; no depth test/write
+            // Phase 16B / 29: Additive blend pass onto _hdrRT; no depth test/write
             psoDesc.DepthStencilState.DepthEnable = FALSE;
             auto& rt = psoDesc.BlendState.RenderTarget[0];
             rt.BlendEnable           = TRUE;
@@ -1071,6 +1499,65 @@ bool DX12Pipeline::CreatePipelineState(const ComPtr<ID3D12Device>& device,
             rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
             rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
             psoDesc.DSVFormat        = DXGI_FORMAT_UNKNOWN;
+        }
+        else if (_desc.rootLayout == RootSignatureLayout::OITForward)
+        {
+            // Phase 31: OIT Forward MRT — RT0 accum (ONE+ONE), RT1 revealage (ZERO+SRC_COLOR)
+            // Depth: test ON, write OFF (transparent objects occluded by opaque geometry)
+            psoDesc.DepthStencilState.DepthEnable    = TRUE;
+            psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            psoDesc.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            psoDesc.DSVFormat                        = DXGI_FORMAT_D32_FLOAT;
+
+            // RT0: accum (RGBA16F) — additive accumulation
+            auto& rt0 = psoDesc.BlendState.RenderTarget[0];
+            rt0.BlendEnable           = TRUE;
+            rt0.SrcBlend              = D3D12_BLEND_ONE;
+            rt0.DestBlend             = D3D12_BLEND_ONE;
+            rt0.BlendOp               = D3D12_BLEND_OP_ADD;
+            rt0.SrcBlendAlpha         = D3D12_BLEND_ONE;
+            rt0.DestBlendAlpha        = D3D12_BLEND_ONE;
+            rt0.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+            rt0.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+            // RT1: revealage (R8_UNORM) — dst *= (1-alpha): ZERO + SRC_COLOR
+            auto& rt1 = psoDesc.BlendState.RenderTarget[1];
+            rt1.BlendEnable           = TRUE;
+            rt1.SrcBlend              = D3D12_BLEND_ZERO;
+            rt1.DestBlend             = D3D12_BLEND_SRC_COLOR;
+            rt1.BlendOp               = D3D12_BLEND_OP_ADD;
+            rt1.SrcBlendAlpha         = D3D12_BLEND_ZERO;
+            rt1.DestBlendAlpha        = D3D12_BLEND_SRC_ALPHA;
+            rt1.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+            rt1.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        }
+        else if (_desc.rootLayout == RootSignatureLayout::OITComposite)
+        {
+            // Phase 31: OIT Composite — blend transparent result onto opaque HDR RT
+            // revealage in alpha: src=ONE_MINUS_SRC_ALPHA, dst=SRC_ALPHA
+            psoDesc.DepthStencilState.DepthEnable = FALSE;
+            psoDesc.DSVFormat                     = DXGI_FORMAT_UNKNOWN;
+
+            auto& rt = psoDesc.BlendState.RenderTarget[0];
+            rt.BlendEnable           = TRUE;
+            rt.SrcBlend              = D3D12_BLEND_INV_SRC_ALPHA;
+            rt.DestBlend             = D3D12_BLEND_SRC_ALPHA;
+            rt.BlendOp               = D3D12_BLEND_OP_ADD;
+            rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+            rt.DestBlendAlpha        = D3D12_BLEND_ZERO;
+            rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        else if (_desc.rootLayout == RootSignatureLayout::VisibilityBuffer)
+        {
+            // Phase 32: Visibility pass — R32_UINT single RT, full depth write.
+            // No blending; standard depth test (less) writes to depth buffer so deferred
+            // passes get correct depth. Cull back-faces (same as opaque G-buffer pass).
+            psoDesc.DepthStencilState.DepthEnable    = TRUE;
+            psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            psoDesc.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+            psoDesc.DSVFormat                        = DXGI_FORMAT_D32_FLOAT;
+            psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         }
         else
         {
@@ -1154,6 +1641,7 @@ bool DX12Pipeline::CreateMeshShaderPSO(const ComPtr<ID3D12Device>& device,
     stream.PS = D3D12_SHADER_BYTECODE{ ps->GetBufferPointer(), ps->GetBufferSize() };
 
     CD3DX12_RASTERIZER_DESC raster(D3D12_DEFAULT);
+    raster.FrontCounterClockwise = TRUE;  // CCW = front face (matches MakeUnitBox / glTF convention)
     stream.RasterizerState = raster;
 
     stream.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);

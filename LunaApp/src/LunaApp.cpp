@@ -11,14 +11,21 @@
 #include <Components/GameObject.h>
 #include <Components/Transform.h>
 #include <Components/MeshRenderer.h>
+#include <LunaEngine/Renderer/Mesh.h>
 #include <Components/CameraComponent.h>
 #include <Components/LightComponent.h>
 #include <LunaEngine/Sensor/SensorComponent.h>
 #include <imgui.h>
+#include <LunaEngine/Profiler/GPUProfiler.h>
 #include "SensorLayer.h"
 
 namespace Luna
 {
+
+static bool s_showScene    = true;
+static bool s_showGraphics = true;
+static bool s_showProfiler = false;
+static Luna::GPUProfilerOverlay s_profilerOverlay;
 
 class ExampleLayer : public Layer
 {
@@ -41,28 +48,17 @@ class ExampleLayer : public Layer
         auto scene = Luna::SceneManager::GetInstance()->GetActiveScene();
         auto sceneCam = scene ? scene->GetMainCamera() : nullptr;
 
-        // Camera debug overlay
-        ImGui::Begin("Camera");
-        ImGui::Text("Left-drag: orbit | Scroll: zoom");
-        if (sceneCam)
-        {
-            XMFLOAT3 eye = sceneCam->GetEyePosition();
-            ImGui::Text("Eye: (%.2f, %.2f, %.2f)", eye.x, eye.y, eye.z);
-        }
-        ImGui::End();
-
         // 3D orientation gizmo (top-right corner)
         if (sceneCam)
             Luna::DrawViewGizmo(*sceneCam);
         else
             Luna::DrawViewGizmo(app.GetCamera());
 
-        // ── Transform Gizmo (Unreal-style: W/E/R mode switch) ─────────
+        // ── Transform Gizmo (W/E/R mode switch + 3D handle) ──────────
         static bool gizmoLocalSpace = false;
         {
             auto& sel = Luna::GetSelection();
 
-            // W/E/R mode switching (only when ImGui doesn't want keyboard)
             if (!ImGui::GetIO().WantTextInput)
             {
                 if (ImGui::IsKeyPressed(ImGuiKey_W)) Luna::SetGizmoMode(Luna::GizmoMode::Translate);
@@ -81,9 +77,14 @@ class ExampleLayer : public Layer
                         Luna::DrawTransformGizmo(app.GetCamera(), *selTransform, gizmoLocalSpace);
                 }
             }
+        }
 
-            // Gizmo toolbar
-            ImGui::Begin("Gizmo");
+        // ── Scene window ─────────────────────────────────────────────
+        if (s_showScene)
+        {
+        ImGui::Begin("Scene", &s_showScene);
+        {
+            // Gizmo toolbar (always visible above tabs)
             auto mode = Luna::GetGizmoMode();
             if (ImGui::RadioButton("Translate (W)", mode == Luna::GizmoMode::Translate))
                 Luna::SetGizmoMode(Luna::GizmoMode::Translate);
@@ -93,200 +94,287 @@ class ExampleLayer : public Layer
             ImGui::SameLine();
             if (ImGui::RadioButton("Scale (R)", mode == Luna::GizmoMode::Scale))
                 Luna::SetGizmoMode(Luna::GizmoMode::Scale);
-            ImGui::Checkbox("Local Space", &gizmoLocalSpace);
-            ImGui::End();
-        }
-
-        // ── Scene Inspector ──────────────────────────────────────────
-        ImGui::Begin("Scene Inspector");
-        if (scene)
-        {
-            const auto& objects = scene->GetGameObjects();
-            ImGui::Text("Objects: %d", (int)objects.size());
+            ImGui::SameLine();
+            ImGui::Checkbox("Local", &gizmoLocalSpace);
             ImGui::Separator();
 
-            auto& sel = Luna::GetSelection();
-            static int prevSelectedIndex = -1;
-            bool selectionChanged = (sel.selectedIndex != prevSelectedIndex);
-            prevSelectedIndex = sel.selectedIndex;
-            for (int idx = 0; idx < (int)objects.size(); ++idx)
+            if (ImGui::BeginTabBar("SceneTabs"))
             {
-                const auto& go = objects[idx];
-                if (!go) continue;
-                auto transform = go->GetTransform();
-                if (!transform) continue;
-
-                // Determine display name based on component type
-                std::string displayName;
-                auto camComp = std::dynamic_pointer_cast<Luna::CameraComponent>(
-                    go->GetComponentByType(Luna::ComponentType::CAMERA));
-                auto lightComp = std::dynamic_pointer_cast<Luna::LightComponent>(
-                    go->GetComponentByType(Luna::ComponentType::LIGHT));
-                auto mr = std::dynamic_pointer_cast<Luna::MeshRenderer>(
-                    go->GetComponentByType(Luna::ComponentType::MESH_RENDERER));
-                auto sensorComp = std::dynamic_pointer_cast<Luna::SensorComponent>(
-                    go->GetComponentByType(Luna::ComponentType::SENSOR));
-
-                if (camComp)
-                    displayName = "Main Camera";
-                else if (lightComp)
-                    displayName = "Directional Light";
-                else if (mr)
+                // ── Inspector tab ─────────────────────────────────────
+                if (ImGui::BeginTabItem("Inspector"))
                 {
-                    std::string meshName = mr->GetMeshName();
-                    displayName = meshName.empty() ? "Mesh " + std::to_string(idx) : meshName;
-                }
-                else
-                    displayName = "Object " + std::to_string(idx);
-
-                // Icon prefix
-                const char* icon = camComp ? "[Cam] " : lightComp ? "[Light] " : sensorComp ? "[Sensor] " : "[Mesh] ";
-                char label[128];
-                snprintf(label, sizeof(label), "%s%s##%d", icon, displayName.c_str(), idx);
-
-                bool isSelected = (sel.selectedIndex == idx);
-                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow;
-                if (isSelected) flags |= ImGuiTreeNodeFlags_Selected;
-
-                // Auto-expand tree node when newly selected
-                if (isSelected && selectionChanged)
-                    ImGui::SetNextItemOpen(true);
-
-                bool nodeOpen = ImGui::TreeNodeEx(label, flags);
-
-                // Selection on click
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-                {
-                    sel.selectedIndex = idx;
-                    sel.selectedObject = go;
-                }
-
-                if (nodeOpen)
-                {
-                    // World Transform — always show current values
-                    XMFLOAT3 pos, scl;
-                    XMFLOAT3 rot;
-                    if (transform->useRawMatrix)
+                    // Camera info (formerly standalone "Camera" window)
+                    if (sceneCam)
                     {
-                        XMMATRIX world = XMLoadFloat4x4(&transform->rawMatrix);
-                        XMVECTOR sv, rv, tv;
-                        XMMatrixDecompose(&sv, &rv, &tv, world);
-                        XMStoreFloat3(&pos, tv);
-                        XMStoreFloat3(&scl, sv);
-                        XMFLOAT4 q; XMStoreFloat4(&q, rv);
-                        rot = Luna::QuatToEulerDegrees(q);
+                        XMFLOAT3 eye = sceneCam->GetEyePosition();
+                        ImGui::Text("Eye: (%.2f, %.2f, %.2f)", eye.x, eye.y, eye.z);
+                        ImGui::TextDisabled("Left-drag: orbit | Scroll: zoom");
+                        ImGui::Separator();
+                    }
+
+                    if (scene)
+                    {
+                        const auto& objects = scene->GetGameObjects();
+                        ImGui::Text("Objects: %d", (int)objects.size());
+                        ImGui::Separator();
+
+                        auto& sel = Luna::GetSelection();
+                        static int prevSelectedIndex = -1;
+                        bool selectionChanged = (sel.selectedIndex != prevSelectedIndex);
+                        prevSelectedIndex = sel.selectedIndex;
+
+                        for (int idx = 0; idx < (int)objects.size(); ++idx)
+                        {
+                            const auto& go = objects[idx];
+                            if (!go) continue;
+                            auto transform = go->GetTransform();
+                            if (!transform) continue;
+
+                            auto camComp = std::dynamic_pointer_cast<Luna::CameraComponent>(
+                                go->GetComponentByType(Luna::ComponentType::CAMERA));
+                            auto lightComp = std::dynamic_pointer_cast<Luna::LightComponent>(
+                                go->GetComponentByType(Luna::ComponentType::LIGHT));
+                            auto mr = std::dynamic_pointer_cast<Luna::MeshRenderer>(
+                                go->GetComponentByType(Luna::ComponentType::MESH_RENDERER));
+                            auto sensorComp = std::dynamic_pointer_cast<Luna::SensorComponent>(
+                                go->GetComponentByType(Luna::ComponentType::SENSOR));
+
+                            std::string displayName;
+                            if (camComp)        displayName = "Main Camera";
+                            else if (lightComp) displayName = "Directional Light";
+                            else if (mr)
+                            {
+                                std::string meshName = mr->GetMeshName();
+                                displayName = meshName.empty() ? "Mesh " + std::to_string(idx) : meshName;
+                            }
+                            else displayName = "Object " + std::to_string(idx);
+
+                            const char* icon = camComp ? "[Cam] " : lightComp ? "[Light] " : sensorComp ? "[Sensor] " : "[Mesh] ";
+                            char label[128];
+                            snprintf(label, sizeof(label), "%s%s##%d", icon, displayName.c_str(), idx);
+
+                            bool isSelected = (sel.selectedIndex == idx);
+                            // Light/Camera nodes open by default so properties are immediately visible
+                            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow;
+                            if (lightComp || camComp) flags |= ImGuiTreeNodeFlags_DefaultOpen;
+                            if (isSelected) flags |= ImGuiTreeNodeFlags_Selected;
+                            if (isSelected && selectionChanged)
+                                ImGui::SetNextItemOpen(true);
+
+                            bool nodeOpen = ImGui::TreeNodeEx(label, flags);
+                            if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                            {
+                                sel.selectedIndex = idx;
+                                sel.selectedObject = go;
+                            }
+
+                            if (nodeOpen)
+                            {
+                                XMFLOAT3 pos, scl, rot;
+                                if (transform->useRawMatrix)
+                                {
+                                    XMMATRIX world = XMLoadFloat4x4(&transform->rawMatrix);
+                                    XMVECTOR sv, rv, tv;
+                                    XMMatrixDecompose(&sv, &rv, &tv, world);
+                                    XMStoreFloat3(&pos, tv);
+                                    XMStoreFloat3(&scl, sv);
+                                    XMFLOAT4 q; XMStoreFloat4(&q, rv);
+                                    rot = Luna::QuatToEulerDegrees(q);
+                                }
+                                else
+                                {
+                                    pos = transform->position;
+                                    rot = transform->rotation;
+                                    scl = transform->scale;
+                                }
+
+                                bool changed = false;
+                                changed |= ImGui::DragFloat3("Position", &pos.x, 0.01f);
+                                changed |= ImGui::DragFloat3("Rotation", &rot.x, 0.5f);
+                                changed |= ImGui::DragFloat3("Scale",    &scl.x, 0.01f);
+                                if (changed)
+                                {
+                                    transform->useRawMatrix = false;
+                                    transform->position = pos;
+                                    transform->rotation = rot;
+                                    transform->scale    = scl;
+                                }
+
+                                if (camComp)
+                                {
+                                    ImGui::Separator();
+                                    ImGui::Text("Camera Properties");
+                                    float fov = camComp->GetFovDegrees();
+                                    if (ImGui::DragFloat("FOV", &fov, 0.5f, 10.0f, 120.0f))
+                                        camComp->_fovRad = XMConvertToRadians(fov);
+                                    ImGui::DragFloat("Near", &camComp->_nearZ, 0.01f, 0.001f, 10.0f);
+                                    ImGui::DragFloat("Far",  &camComp->_farZ, 1.0f, 10.0f, 10000.0f);
+                                    ImGui::Text("Orbit Radius: %.2f", camComp->GetRadius());
+                                }
+
+                                if (lightComp)
+                                {
+                                    ImGui::Separator();
+                                    ImGui::Text("Light Properties");
+                                    XMFLOAT3 dir = lightComp->GetDirection();
+                                    if (ImGui::DragFloat3("Direction", &dir.x, 0.01f))
+                                        lightComp->SetDirection(dir);
+                                    ImGui::ColorEdit3("Color", &lightComp->color.x);
+                                    ImGui::DragFloat("Intensity", &lightComp->intensity, 0.1f, 0.0f, 50.0f);
+                                }
+
+                                // Phase 31: OIT alpha slider for mesh objects
+                                if (mr)
+                                {
+                                    auto mesh = mr->GetMesh();
+                                    if (mesh && mesh->material)
+                                    {
+                                        ImGui::Separator();
+                                        ImGui::Text("Material");
+                                        ImGui::SliderFloat("Alpha", &mesh->material->alpha, 0.0f, 1.0f, "%.2f");
+                                    }
+                                }
+
+                                ImGui::TreePop();
+                            }
+                        }
                     }
                     else
                     {
-                        pos = transform->position;
-                        rot = transform->rotation;
-                        scl = transform->scale;
+                        ImGui::TextDisabled("No active scene");
                     }
 
-                    bool changed = false;
-                    changed |= ImGui::DragFloat3("Position", &pos.x, 0.01f);
-                    changed |= ImGui::DragFloat3("Rotation", &rot.x, 0.5f);
-                    changed |= ImGui::DragFloat3("Scale",    &scl.x, 0.01f);
-                    if (changed)
-                    {
-                        transform->useRawMatrix = false;
-                        transform->position = pos;
-                        transform->rotation = rot;
-                        transform->scale    = scl;
-                    }
-
-                    // Camera-specific properties
-                    if (camComp)
-                    {
-                        ImGui::Separator();
-                        ImGui::Text("Camera Properties");
-                        float fov = camComp->GetFovDegrees();
-                        if (ImGui::DragFloat("FOV", &fov, 0.5f, 10.0f, 120.0f))
-                            camComp->_fovRad = XMConvertToRadians(fov);
-                        ImGui::DragFloat("Near", &camComp->_nearZ, 0.01f, 0.001f, 10.0f);
-                        ImGui::DragFloat("Far",  &camComp->_farZ, 1.0f, 10.0f, 10000.0f);
-                        float radius = camComp->GetRadius();
-                        ImGui::Text("Orbit Radius: %.2f", radius);
-                    }
-
-                    // Light-specific properties
-                    if (lightComp)
-                    {
-                        ImGui::Separator();
-                        ImGui::Text("Light Properties");
-                        XMFLOAT3 dir = lightComp->GetDirection();
-                        if (ImGui::DragFloat3("Direction", &dir.x, 0.01f))
-                            lightComp->SetDirection(dir);
-                        ImGui::ColorEdit3("Color", &lightComp->color.x);
-                        ImGui::DragFloat("Intensity", &lightComp->intensity, 0.1f, 0.0f, 50.0f);
-                    }
-
-                    ImGui::TreePop();
+                    ImGui::EndTabItem();
                 }
-            }
-        }
-        else
-        {
-            ImGui::TextDisabled("No active scene");
-        }
 
-        ImGui::End();
-
-        // ── Phase 24: Point Light Editor ──────────────────────────────
-        {
-            static std::vector<Luna::IRenderBackend::PointLightDesc> s_lights;
-
-            ImGui::Begin("Point Lights");
-            ImGui::Text("Lights: %d / 1024", (int)s_lights.size());
-
-            if (ImGui::Button("Add Light") && s_lights.size() < 1024)
-            {
-                Luna::IRenderBackend::PointLightDesc l{};
-                // Place at camera position
-                if (sceneCam) {
-                    XMFLOAT3 eye = sceneCam->GetEyePosition();
-                    l.position[0] = eye.x; l.position[1] = eye.y; l.position[2] = eye.z;
-                }
-                l.radius    = 10.0f;
-                l.color[0]  = 1.0f; l.color[1] = 0.9f; l.color[2] = 0.7f;
-                l.intensity = 5.0f;
-                s_lights.push_back(l);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Clear All"))
-                s_lights.clear();
-
-            ImGui::Separator();
-
-            int removeIdx = -1;
-            for (int i = 0; i < (int)s_lights.size(); i++)
-            {
-                ImGui::PushID(i);
-                auto& l = s_lights[i];
-
-                bool open = ImGui::TreeNodeEx("##light", ImGuiTreeNodeFlags_DefaultOpen, "Light %d", i);
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 20);
-                if (ImGui::SmallButton("X")) removeIdx = i;
-
-                if (open)
+                // ── Lights tab ────────────────────────────────────────
+                if (ImGui::BeginTabItem("Lights"))
                 {
-                    ImGui::DragFloat3("Position",  l.position, 0.1f);
-                    ImGui::DragFloat("Radius",     &l.radius, 0.5f, 0.1f, 100.0f);
-                    ImGui::ColorEdit3("Color",     l.color);
-                    ImGui::DragFloat("Intensity",  &l.intensity, 0.1f, 0.0f, 100.0f);
-                    ImGui::TreePop();
+                    static std::vector<Luna::IRenderBackend::PointLightDesc> s_lights;
+
+                    ImGui::Text("Lights: %d / 1024", (int)s_lights.size());
+
+                    if (ImGui::Button("Add Light") && s_lights.size() < 1024)
+                    {
+                        Luna::IRenderBackend::PointLightDesc l{};
+                        if (sceneCam) {
+                            XMFLOAT3 eye = sceneCam->GetEyePosition();
+                            l.position[0] = eye.x; l.position[1] = eye.y; l.position[2] = eye.z;
+                        }
+                        l.radius    = 10.0f;
+                        l.color[0]  = 1.0f; l.color[1] = 0.9f; l.color[2] = 0.7f;
+                        l.intensity = 5.0f;
+                        s_lights.push_back(l);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear All"))
+                        s_lights.clear();
+
+                    ImGui::Separator();
+
+                    int removeIdx = -1;
+                    for (int i = 0; i < (int)s_lights.size(); i++)
+                    {
+                        ImGui::PushID(i);
+                        auto& l = s_lights[i];
+                        bool open = ImGui::TreeNodeEx("##light", ImGuiTreeNodeFlags_DefaultOpen, "Light %d", i);
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 20);
+                        if (ImGui::SmallButton("X")) removeIdx = i;
+                        if (open)
+                        {
+                            ImGui::DragFloat3("Position",  l.position, 0.1f);
+                            ImGui::DragFloat("Radius",     &l.radius, 0.5f, 0.1f, 100.0f);
+                            ImGui::ColorEdit3("Color",     l.color);
+                            ImGui::DragFloat("Intensity",  &l.intensity, 0.1f, 0.0f, 100.0f);
+                            ImGui::TreePop();
+                        }
+                        ImGui::PopID();
+                    }
+                    if (removeIdx >= 0)
+                        s_lights.erase(s_lights.begin() + removeIdx);
+
+                    auto* backend = Luna::IRenderContext::GetBackend();
+                    if (backend)
+                        backend->SetPointLights(s_lights);
+
+                    ImGui::EndTabItem();
                 }
-                ImGui::PopID();
+
+                ImGui::EndTabBar();
             }
+        }
+        ImGui::End();
+        } // if (s_showScene)
 
-            if (removeIdx >= 0)
-                s_lights.erase(s_lights.begin() + removeIdx);
+        // ── Graphics window ───────────────────────────────────────────
+        if (s_showGraphics)
+        {
+        ImGui::Begin("Graphics", &s_showGraphics);
+        {
+            if (ImGui::BeginTabBar("GraphicsTabs"))
+            {
+                // ── Fog tab ───────────────────────────────────────────
+                if (ImGui::BeginTabItem("Fog"))
+                {
+                    static Luna::IRenderBackend::VolumetricFogParams fogParams = {
+                        false,  // enabled
+                        0.15f,  // density
+                        0.0f,   // heightFalloff
+                        0.0f,   // baseHeight
+                        1.0f,   // scattering
+                        1.0f,   // extinction
+                        0.3f    // phaseG
+                    };
 
-            // Push lights to backend
+                    ImGui::Checkbox("Enable Fog", &fogParams.enabled);
+                    ImGui::Separator();
+                    ImGui::BeginDisabled(!fogParams.enabled);
+                    ImGui::SliderFloat("Density",        &fogParams.density,       0.000f,  0.5f,  "%.4f");
+                    ImGui::SliderFloat("Height Falloff", &fogParams.heightFalloff, 0.001f,  1.0f,  "%.3f");
+                    ImGui::SliderFloat("Base Height",    &fogParams.baseHeight,   -100.0f, 50.0f, "%.1f");
+                    ImGui::SliderFloat("Scattering",     &fogParams.scattering,    0.0f,    2.0f,  "%.3f");
+                    ImGui::SliderFloat("Extinction",     &fogParams.extinction,    0.0f,    2.0f,  "%.3f");
+                    ImGui::SliderFloat("Phase G",        &fogParams.phaseG,       -0.99f,   0.99f, "%.2f");
+                    ImGui::EndDisabled();
+
+                    auto* backend = Luna::IRenderContext::GetBackend();
+                    if (backend)
+                        backend->SetVolumetricFogParams(fogParams);
+
+                    ImGui::EndTabItem();
+                }
+
+                // ── GI tab ────────────────────────────────────────────
+                if (ImGui::BeginTabItem("GI"))
+                {
+                    static Luna::IRenderBackend::GIParams giParams;
+
+                    ImGui::DragFloat3("Probe Origin",   giParams.probeGridOrigin,  0.5f, -100.0f, 100.0f, "%.1f");
+                    ImGui::DragFloat3("Probe Spacing",  giParams.probeGridSpacing, 0.1f,   0.1f,  20.0f,  "%.2f");
+                    ImGui::SliderInt("SSGI Rays",       &giParams.numSSGIRays,     1, 16);
+                    ImGui::SliderFloat("Max Ray Dist",  &giParams.maxRayDist,      0.5f, 20.0f, "%.1f");
+                    ImGui::SliderFloat("Temporal Alpha",&giParams.temporalAlpha,   0.01f, 1.0f, "%.3f");
+
+                    auto* backend = Luna::IRenderContext::GetBackend();
+                    if (backend)
+                        backend->SetGIParams(giParams);
+
+                    ImGui::EndTabItem();
+                }
+
+                ImGui::EndTabBar();
+            }
+        }
+        ImGui::End();
+        } // if (s_showGraphics)
+
+        // ── GPU Profiler window ───────────────────────────────────────
+        if (s_showProfiler)
+        {
+            ImGui::SetNextWindowSize(ImVec2(420, 320), ImGuiCond_FirstUseEver);
+            ImGui::Begin("GPU Profiler", &s_showProfiler);
             auto* backend = Luna::IRenderContext::GetBackend();
-            if (backend)
-                backend->SetPointLights(s_lights);
-
+            s_profilerOverlay.RenderContent(backend ? backend->GetGPUProfiler() : nullptr);
             ImGui::End();
         }
     }
@@ -346,11 +434,22 @@ Application *Luna::CreateApplication(int argc, char **argv)
                     "Import glTF Scene",
                     "glTF Files\0*.gltf;*.glb\0All Files\0*.*\0");
             }
+            if (ImGui::MenuItem("Load nuScenes Sample..."))
+                SensorLayer::RequestNuScenesPopup();
             ImGui::Separator();
             if (ImGui::MenuItem("Exit"))
                 app->Close();
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("View"))
+        {
+            ImGui::MenuItem("Scene",       nullptr, &Luna::s_showScene);
+            ImGui::MenuItem("Graphics",    nullptr, &Luna::s_showGraphics);
+            ImGui::Separator();
+            ImGui::MenuItem("GPU Profiler", nullptr, &Luna::s_showProfiler);
+            ImGui::EndMenu();
+        }
+
     });
     return app;
 }

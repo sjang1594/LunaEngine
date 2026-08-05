@@ -34,7 +34,7 @@ public:
     float _aspect;
     float _nearZ;
     float _farZ;
-    float _radius = 3.0f;
+    float _radius = 10.0f;
 
 private:
     XMFLOAT3 ComputeEye() const;

@@ -336,12 +336,10 @@ void Application::Run()
         // lighting, writes final color to the back buffer.
         IRenderContext::CompositeFrame();
 
-        // GPU profiler overlay (rendered as ImGui window before ImGui::Render())
-        {
-            auto* backend = IRenderContext::GetBackend();
-            if (backend)
-                _profilerOverlay.Render(backend->GetGPUProfiler());
-        }
+        // S2/S3: Render sensors (after CompositeFrame, before EndFrame — same command list).
+        IRenderContext::GetBackend()->RenderCameraSensors();
+        IRenderContext::GetBackend()->RenderLiDARSensors();
+        IRenderContext::GetBackend()->RenderLiDARPointClouds();
 
         IRenderContext::RenderImGui();
         IRenderContext::EndFrame();

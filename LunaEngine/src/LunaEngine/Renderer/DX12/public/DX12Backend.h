@@ -5,6 +5,10 @@
 #include "Renderer/Mesh.h"
 #include "Renderer/HAL/Public/IRenderBackend.h"
 #include "DX12GPUProfiler.h"
+#include <unordered_map>
+
+// Forward declarations
+namespace Luna { class CameraSensor; class LiDARSensor; }
 
 namespace Luna
 {
@@ -62,6 +66,10 @@ class DX12Backend : public IRenderBackend
     // Load all primitives from a glTF/GLB file and store them in _sceneMeshes.
     // Returns references (shared_ptrs) so callers can hand them to MeshRenderers.
     std::vector<std::shared_ptr<Mesh>> LoadMeshes(const std::string& path) override;
+    std::vector<std::shared_ptr<Mesh>> LoadCalibrationScene() override;
+    std::shared_ptr<Mesh> CreateProceduralBoxScene(
+        const std::vector<DirectX::XMFLOAT4X4>& instanceTransforms) override;
+    DirectX::XMFLOAT4X4 GetCurrentVP() const override { return _ppPrevVP; }
     std::vector<XMFLOAT4X4> GetLastLoadTransforms() const override { return _lastLoadTransforms; }
 
     const char *GetBackendName() const override { return "DirectX 12"; }
@@ -227,6 +235,10 @@ class DX12Backend : public IRenderBackend
     XMFLOAT4X4 _lastView = {};
     XMFLOAT4X4 _lastProj = {};
 
+    // Cached scene lighting — updated each frame in CompositeFrame(); used by sensor renders
+    XMFLOAT3 _cachedLightDir   = {0.447f, 0.894f, 0.447f};
+    XMFLOAT4 _cachedLightColor = {1.0f, 1.0f, 1.0f, 1.0f}; // rgb + intensity
+
     // -----------------------------------------------------------------------
     // Presentation
     // -----------------------------------------------------------------------
@@ -274,7 +286,10 @@ class DX12Backend : public IRenderBackend
     XMFLOAT4   _csmCascadeSplits = {};  // view-space Z far plane per cascade
 
     // Cached per-mesh model matrices from the last DrawMesh() pass (for CSM depth pre-pass)
-    std::vector<XMFLOAT4X4> _lastMeshModels;
+    // Per-instance cache for the CSM shadow pass: (mesh ptr, world model matrix).
+    // Populated by DrawMesh() each frame; consumed by DrawCSMPass() the following frame.
+    struct MeshInstance { const Mesh* mesh; XMFLOAT4X4 model; };
+    std::vector<MeshInstance> _lastMeshModels;
 
     // Separate RTV heap for G-buffer targets (keeps _rtvHeap clean)
     ComPtr<ID3D12DescriptorHeap> _gbufferRtvHeap;
@@ -655,6 +670,81 @@ private:
     DX12GPUProfiler _gpuProfiler;
 
     // -----------------------------------------------------------------------
+    // Phase 29: Volumetric Fog
+    // -----------------------------------------------------------------------
+    bool CreateVolumetricFogResources();
+    void DestroyVolumetricFogResources();
+    void DispatchVolumetricFog();    // inject + scatter compute
+    void DrawVolumetricFogApply();   // fullscreen additive blend into HDR
+
+    static constexpr UINT FROXEL_X = 160u;
+    static constexpr UINT FROXEL_Y = 90u;
+    static constexpr UINT FROXEL_Z = 64u;
+
+    struct VolumetricParamsCB  // 512 bytes
+    {
+        XMFLOAT4X4 invProj;                          // 64B
+        XMFLOAT4X4 invView;                          // 64B
+        XMFLOAT4X4 lightVP[4];                       // 256B
+        XMFLOAT4   cascadeSplits;                    // 16B
+        XMFLOAT3   lightDir;    float _p0;           // 16B
+        XMFLOAT3   lightColor;  float lightIntensity; // 16B
+        float nearZ;         float farZ;
+        float screenW;       float screenH;           // 16B
+        float fogDensity;    float fogHeightFalloff;
+        float fogBaseHeight; float scatteringCoeff;   // 16B
+        float extinctionCoeff; float phaseG;
+        float _pad1[2];                              // 8B → 512B total
+    };
+    static_assert(sizeof(VolumetricParamsCB) == 480, "VolumetricParamsCB must be 480 bytes");
+
+    bool _volFogReady   = false;
+    bool _volFogEnabled = false;
+
+    void SetVolumetricFogParams(const VolumetricFogParams& p) override {
+        _volFogEnabled       = p.enabled;
+        _volFogDensity       = p.density;
+        _volFogHeightFalloff = p.heightFalloff;
+        _volFogBaseHeight    = p.baseHeight;
+        _volFogScattering    = p.scattering;
+        _volFogExtinction    = p.extinction;
+        _volFogPhaseG        = p.phaseG;
+    }
+
+    float _volFogDensity       = 0.05f;
+    float _volFogHeightFalloff = 0.0f;
+    float _volFogBaseHeight    = 0.0f;
+    float _volFogScattering    = 0.8f;
+    float _volFogExtinction    = 1.0f;
+    float _volFogPhaseG        = 0.3f;
+
+private:
+    // 3D inject volume (RGBA16F, 160×90×64) — written by inject CS, read by scatter CS
+    ComPtr<ID3D12Resource>       _volFogInject;
+    D3D12MA::Allocation*         _volFogInjectAlloc    = nullptr;
+    UINT                         _volFogInjectUAVIndex = UINT_MAX;
+    UINT                         _volFogInjectSRVIndex = UINT_MAX;
+
+    // 3D accumulation volume (RGBA16F, 160×90×64) — written by scatter CS, read by apply PS
+    ComPtr<ID3D12Resource>       _volFogAccum;
+    D3D12MA::Allocation*         _volFogAccumAlloc    = nullptr;
+    UINT                         _volFogAccumUAVIndex = UINT_MAX;
+    UINT                         _volFogAccumSRVIndex = UINT_MAX;
+
+    // Non-shader-visible heap for UAV clear on 3D textures
+    ComPtr<ID3D12DescriptorHeap> _volFogNonVisUAVHeap;
+
+    // Per-frame params constant buffer (512 bytes, persistently mapped)
+    ComPtr<ID3D12Resource>  _volFogParamsCB[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _volFogParamsCBAlloc[FRAMES_IN_FLIGHT]  = {};
+    void*                   _volFogParamsCBMapped[FRAMES_IN_FLIGHT] = {};
+
+    // Pipelines
+    std::unique_ptr<class DX12Pipeline> _volInjectPipeline;
+    std::unique_ptr<class DX12Pipeline> _volScatterPipeline;
+    std::unique_ptr<class DX12Pipeline> _volApplyPipeline;
+
+    // -----------------------------------------------------------------------
     // Phase 24: Clustered Lighting
     // -----------------------------------------------------------------------
 public:
@@ -720,5 +810,261 @@ private:
 
     // Cluster assign compute pipeline
     std::unique_ptr<class DX12Pipeline> _clusterAssignPipeline;
+
+    // -----------------------------------------------------------------------
+    // Phase 30: Global Illumination (SSGI + Irradiance Probes)
+    // -----------------------------------------------------------------------
+public:
+    void SetGIParams(const GIParams& p) override;
+
+private:
+    bool CreateSSGIResources();
+    void DestroySSGIResources();
+    void DispatchSSGI();
+    void DispatchProbeUpdate();
+
+    static constexpr UINT PROBE_GRID_X   = 8u;
+    static constexpr UINT PROBE_GRID_Y   = 4u;
+    static constexpr UINT PROBE_GRID_Z   = 8u;
+    static constexpr UINT PROBE_COUNT    = 256u;   // 8*4*8
+    static constexpr UINT PROBE_TEX_SIZE = 16u;
+    static constexpr UINT PROBE_ATLAS_W  = 128u;  // 8 probes * 16
+    static constexpr UINT PROBE_ATLAS_H  = 64u;   // 4 probes * 16
+
+    bool     _ssgiReady      = false;
+    uint32_t _ssgiFrameCount = 0;
+    uint32_t _ssgiProbeIdx   = 0;
+    int      _ssgiPingPong   = 0;  // 0=write, 1=history
+
+    // Half-res RGBA16F ping-pong (2 textures)
+    ComPtr<ID3D12Resource>  _ssgiRT[2];
+    D3D12MA::Allocation*    _ssgiRTAlloc[2]    = {};
+    UINT _ssgiUAVIndex[2] = {UINT_MAX, UINT_MAX};
+    UINT _ssgiSRVIndex[2] = {UINT_MAX, UINT_MAX};
+
+    // Probe atlas: Texture2DArray 128x64, 8 slices, RGBA16F
+    ComPtr<ID3D12Resource>  _probeIrrArray;
+    D3D12MA::Allocation*    _probeIrrAlloc    = nullptr;
+    UINT _probeIrrUAVIndex = UINT_MAX;
+    UINT _probeIrrSRVIndex = UINT_MAX;
+
+    // Non-shader-visible heap for ClearUAV (3 slots: ssgi[0], ssgi[1], probeIrr)
+    ComPtr<ID3D12DescriptorHeap> _ssgiNonVisUAVHeap;
+
+    struct SSGIConstants {
+        float invViewProj[16];   // 64B
+        float prevViewProj[16];  // 64B
+        float view[16];          // 64B
+        float screenSize[2];     //  8B
+        float halfResSize[2];    //  8B
+        uint32_t frameCount;     //  4B
+        uint32_t numRays;        //  4B
+        float maxRayDist;        //  4B
+        float temporalAlpha;     //  4B
+        float _pad[8];           // 32B -> 256B
+    };
+    static_assert(sizeof(SSGIConstants) == 256, "SSGIConstants must be 256B");
+
+    struct ProbeConstants {
+        float    origin[3];   float _p0;        // 16B
+        float    spacing[3];  float _p1;        // 16B
+        uint32_t dims[3];     uint32_t _p2;     // 16B
+        float    screenSize[2]; float _p3[2];   // 16B
+        float    invViewProj[16];               // 64B
+        uint32_t probeIndex;  uint32_t _pp[3];  // 16B
+        float    _pad[28];                      // 112B -> 256B total
+    };
+    static_assert(sizeof(ProbeConstants) == 256, "ProbeConstants must be 256B");
+
+    ComPtr<ID3D12Resource>  _ssgiCB[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _ssgiCBAlloc[FRAMES_IN_FLIGHT]  = {};
+    void*                   _ssgiCBMapped[FRAMES_IN_FLIGHT] = {};
+
+    ComPtr<ID3D12Resource>  _probeCB[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _probeCBAlloc[FRAMES_IN_FLIGHT]  = {};
+    void*                   _probeCBMapped[FRAMES_IN_FLIGHT] = {};
+
+    std::unique_ptr<class DX12Pipeline> _ssgiComputePipeline;
+    std::unique_ptr<class DX12Pipeline> _probeUpdatePipeline;
+    std::unique_ptr<class DX12Pipeline> _lightingPipelineGI;
+
+    XMFLOAT3 _probeGridOrigin  = {-8.0f, 0.0f, -8.0f};
+    XMFLOAT3 _probeGridSpacing = { 2.0f, 2.0f,  2.0f};
+
+    float _giTemporalAlpha = 0.1f;
+    int   _giNumRays       = 8;
+    float _giMaxRayDist    = 5.0f;
+
+    // -----------------------------------------------------------------------
+    // Phase 31: Order-Independent Transparency (WBOIT)
+    // -----------------------------------------------------------------------
+private:
+    bool CreateOITResources();
+    void DestroyOITResources();
+    void DrawOITForwardPass();
+    void DrawOITCompositePass();
+
+    static constexpr UINT MAX_OIT_MESHES = 256;
+
+    struct OITMeshDraw
+    {
+        const Mesh* mesh;
+        XMFLOAT4X4  model;
+        float        alpha;
+    };
+
+    bool                     _oitReady = false;
+    std::vector<OITMeshDraw> _oitMeshes;  // filled by DrawMesh, consumed by DrawOITForwardPass
+
+    // Accum RT (RGBA16F, full-res) — additive blend ONE+ONE
+    ComPtr<ID3D12Resource>       _oitAccumRT;
+    D3D12MA::Allocation*         _oitAccumRTAlloc   = nullptr;
+    UINT                         _oitAccumSRVIndex  = UINT_MAX;
+
+    // Revealage RT (R8_UNORM, full-res) — multiplicative blend ZERO+SRC_COLOR
+    ComPtr<ID3D12Resource>       _oitRevealRT;
+    D3D12MA::Allocation*         _oitRevealRTAlloc  = nullptr;
+    UINT                         _oitRevealSRVIndex = UINT_MAX;
+
+    // 2-slot RTV heap dedicated to OIT targets
+    ComPtr<ID3D12DescriptorHeap> _oitRtvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE  _oitAccumRTV  = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE  _oitRevealRTV = {};
+
+    // Per-frame alpha CB pool: MAX_OIT_MESHES slots × 256B (one slot per transparent draw)
+    ComPtr<ID3D12Resource>  _oitAlphaCBPool[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _oitAlphaCBPoolAlloc[FRAMES_IN_FLIGHT]  = {};
+    void*                   _oitAlphaCBPoolMapped[FRAMES_IN_FLIGHT] = {};
+
+    std::unique_ptr<class DX12Pipeline> _oitForwardPipeline;
+    std::unique_ptr<class DX12Pipeline> _oitCompositePipeline;
+
+    // ── Phase 32: Visibility Buffer ───────────────────────────────────────────────
+    bool _visBufferReady = false;
+    bool _visBufferMode  = false;  // toggle: true = visibility path, false = G-buffer path
+
+    // Visibility RT (R32_UINT, full-res)
+    ComPtr<ID3D12Resource>       _visRT;
+    D3D12MA::Allocation*         _visRTAlloc    = nullptr;
+    UINT                         _visRTSRVIndex = UINT_MAX;  // SRV for shade compute
+    ComPtr<ID3D12DescriptorHeap> _visRtvHeap;                // non-shader-visible RTV heap (1 slot)
+    D3D12_CPU_DESCRIPTOR_HANDLE  _visRTV = {};
+
+    // Non-shader-visible UAV heap for ClearUnorderedAccessViewUint on vis RT
+    ComPtr<ID3D12DescriptorHeap> _visNonVisUAVHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE  _visNonVisUAV = {};
+
+    // G-buffer UAVs for shade compute output (reuse existing G-buffer resources as UAV)
+    UINT _visGB0UAVIndex = UINT_MAX;
+    UINT _visGB1UAVIndex = UINT_MAX;
+    UINT _visGB2UAVIndex = UINT_MAX;
+
+    // Merged VB/IB SRV slots for shade compute
+    UINT _visMergedVBSRVIndex = UINT_MAX;
+    UINT _visMergedIBSRVIndex = UINT_MAX;
+
+    // Per-frame shade constants CB (VisShadeConstants: viewProj + screenSize)
+    ComPtr<ID3D12Resource>  _visShadeCB[FRAMES_IN_FLIGHT];
+    D3D12MA::Allocation*    _visShadeCBAlloc[FRAMES_IN_FLIGHT]  = {};
+    void*                   _visShadeCBMapped[FRAMES_IN_FLIGHT] = {};
+
+    std::unique_ptr<class DX12Pipeline> _visibilityPipeline;   // VS+PS: geometry → vis RT
+    std::unique_ptr<class DX12Pipeline> _visShadePipeline;     // CS: vis RT → G-buffer UAVs
+    ComPtr<ID3D12CommandSignature>       _visibilityCmdSignature; // per-draw overrides using VisibilityBuffer root sig
+
+    bool CreateVisibilityResources();
+    void DestroyVisibilityResources();
+    void DrawVisibilityPass();       // replaces G-buffer fill in vis mode
+    void DispatchVisibilityShade();  // replaces G-buffer as SRVs; outputs same G-buffer slots
+
+    // ── S2: Camera Sensor Offscreen Rendering ────────────────────────────────────
+    // Per-camera GPU resources (G-buffer, lighting RT, distortion RT, readback, cull buffers)
+    struct DX12CameraResources
+    {
+        // G-buffer + depth (camera viewpoint)
+        ComPtr<ID3D12Resource>       gbuffer[3];
+        D3D12MA::Allocation*         gbAlloc[3]  = {};
+        ComPtr<ID3D12Resource>       depth;
+        D3D12MA::Allocation*         depthAlloc  = nullptr;
+        // Lit HDR output (IBL-only deferred)
+        ComPtr<ID3D12Resource>       litRT;
+        D3D12MA::Allocation*         litAlloc    = nullptr;
+        // Distorted + noise + sRGB output
+        ComPtr<ID3D12Resource>       distortRT;
+        D3D12MA::Allocation*         distortAlloc = nullptr;
+        // CPU readback buffers
+        ComPtr<ID3D12Resource>       readbackRGB;
+        ComPtr<ID3D12Resource>       readbackDepth;
+        // Descriptor heaps
+        ComPtr<ID3D12DescriptorHeap> rtvHeap;  // 4 slots: GB0,1,2 + litRT
+        ComPtr<ID3D12DescriptorHeap> dsvHeap;  // 1 slot: depth
+        // SRV/UAV indices in _imGuiSrvHeap
+        UINT gbSRVIndex[3]   = {UINT_MAX, UINT_MAX, UINT_MAX};
+        UINT depthSRVIndex   = UINT_MAX;
+        UINT litSRVIndex     = UINT_MAX;
+        UINT distortSRVIndex = UINT_MAX;  // GPU handle for ImGui::Image()
+        UINT distortUAVIndex = UINT_MAX;
+        // Per-frame distortion constants CBV (double-buffered)
+        ComPtr<ID3D12Resource>       distortCB[2];
+        D3D12MA::Allocation*         distortCBAlloc[2] = {};
+        void*                        distortCBMapped[2] = {};
+        // GPU frustum cull resources
+        ComPtr<ID3D12Resource>       sensorArgBuffer;   // indirect draw args
+        D3D12MA::Allocation*         sensorArgAlloc    = nullptr;
+        ComPtr<ID3D12Resource>       sensorDrawCount;   // UINT draw count
+        D3D12MA::Allocation*         sensorDrawAlloc   = nullptr;
+        ComPtr<ID3D12Resource>       sensorCullCB[2];  // CullConstants CBV
+        D3D12MA::Allocation*         sensorCullCBAlloc[2] = {};
+        void*                        sensorCullCBMapped[2] = {};
+        // Tracking
+        uint32_t width       = 0;
+        uint32_t height      = 0;
+        bool     ready       = false;
+        bool     firstRender = true;  // true until first RenderCameraSensorInternal completes
+    };
+
+    std::unordered_map<class CameraSensor*, DX12CameraResources> _cameraRTs;
+
+    std::unique_ptr<class DX12Pipeline> _sensorLightingPipeline;
+    std::unique_ptr<class DX12Pipeline> _cameraDistortPipeline;
+
+    bool InitCameraResources(class CameraSensor* cam);
+    void DestroyCameraResources(class CameraSensor* cam);
+    void RenderCameraSensorInternal(class CameraSensor* cam);
+    void RenderCameraSensors() override;
+
+    // ── S3: LiDAR Sensor GPU Raycasting ──────────────────────────────────────
+    struct DX12LiDARResources
+    {
+        // Sensor-space ray directions (uploaded once at init)
+        ComPtr<ID3D12Resource>   rayDirBuffer;
+        D3D12MA::Allocation*     rayDirAlloc  = nullptr;
+        // Per-frame sensor CB (world matrix + params)
+        ComPtr<ID3D12Resource>   sensorCB[2];
+        D3D12MA::Allocation*     sensorCBAlloc[2] = {};
+        void*                    sensorCBMapped[2] = {};
+        // GPU output (UAV)
+        ComPtr<ID3D12Resource>   outputBuffer;
+        D3D12MA::Allocation*     outputAlloc  = nullptr;
+        // CPU readback
+        ComPtr<ID3D12Resource>   readbackBuffer;
+        // Point cloud viewport VB (UPLOAD, persistently mapped, updated from pointCloud each frame)
+        ComPtr<ID3D12Resource>   pointCloudVB;
+        void*                    pointCloudVBMapped = nullptr;
+        // Tracking
+        uint32_t rayCount   = 0;
+        bool     ready      = false;
+        bool     firstRender = true;
+    };
+
+    std::unordered_map<class LiDARSensor*, DX12LiDARResources> _lidarRTs;
+    std::unique_ptr<class DX12Pipeline> _lidarRaycastPipeline;
+    std::unique_ptr<class DX12Pipeline> _pointCloudPipeline;
+
+    bool InitLiDARResources(class LiDARSensor* sensor);
+    void DestroyLiDARResources(class LiDARSensor* sensor);
+    void RenderLiDARSensorInternal(class LiDARSensor* sensor);
+    void RenderLiDARSensors() override;
+    void RenderLiDARPointClouds() override;
 };
 } // namespace Luna

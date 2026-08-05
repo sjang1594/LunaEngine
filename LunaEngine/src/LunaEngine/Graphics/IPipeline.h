@@ -6,8 +6,9 @@ namespace Luna
 
 enum class VertexLayout
 {
-    Triangle,  // POSITION(RGB32F) + COLOR(RGBA32F)              — stride 28 B
-    PBR,       // POSITION + NORMAL(RGB32F) + TEXCOORD(RG32F) + TANGENT(RGBA32F) — stride 48 B
+    Triangle,   // POSITION(RGB32F) + COLOR(RGBA32F)              — stride 28 B
+    PBR,        // POSITION + NORMAL(RGB32F) + TEXCOORD(RG32F) + TANGENT(RGBA32F) — stride 48 B
+    PointCloud, // POSITION(RGB32F) + TEXCOORD0(R32F intensity)   — stride 16 B
 };
 
 // Phase 5B+7+8+9: root signature layout
@@ -45,6 +46,26 @@ enum class RootSignatureLayout
     ClusterAssign,       // compute: b0=ClusterParams CBV; t0=lights SSBO; u0=clusterCounts; u1=clusterIndices
     // Phase 25: Mesh Shader G-buffer fill
     MeshShaderGBuffer,   // AS+MS+PS: b0=MeshShaderConstants CBV; b1=MaterialConstants CBV; b2=materialIndex root const; t0-t5 space0=object/meshlet/vertex buffers; t0+ space1=bindless SRV; s0=anisotropic
+    // Phase 29: Volumetric Fog
+    VolInject,           // compute: b0=VolumetricParams CBV; u0=RWTexture3D froxelVolume
+    VolScatter,          // compute: b0=VolumetricParams CBV; t0=Texture3D froxelInject; t1=Texture2DArray csmShadow; u0=RWTexture3D froxelAccum; s0=comp-clamp
+    VolApply,            // vs+ps: b0=4 root consts (nearZ,farZ,pad×2); t0=depthTex; t1=Texture3D froxelAccum; s0=point-clamp; s1=bilinear-clamp; additive blend; noInputLayout
+    // Phase 30: Global Illumination
+    SSGICompute,        // compute: b0=SSGIConstants; t0-t5 SRVs; u0=ssgiOut; s0-s1
+    ProbeUpdate,        // compute: b0=ProbeConstants; t0-t2 SRVs; u0=probeIrrArray; s0-s1
+    DeferredLightingGI, // vs+ps: DeferredLightingIBL params[0..9] + params[10]=ssgiTex + params[11]=probeIrrArray
+    // Phase 31: Order-Independent Transparency (WBOIT)
+    OITForward,         // vs+ps: b0=SceneConstants CBV; b1=alpha root const; t0=albedoTex; s0=linear-clamp; MRT 2 (RGBA16F+R8); depth read-only
+    OITComposite,       // vs+ps (fullscreen): t0=accumTex; t1=revealageTex; s0=point-clamp; blend ONE_MINUS_SRC_ALPHA+SRC_ALPHA
+    // Phase 32: Visibility Buffer
+    VisibilityBuffer,   // vs+ps: b0=ViewProj CBV; b1=materialCB CBV; b2=materialIndex const; b3=objectIndex const; t0 space0=GPUObjectData; R32_UINT RT; depth-write; PBR vertex layout
+    VisibilityShade,    // compute: b0=VisShadeConstants CBV; t0=visBuf; t1=mergedVB; t2=mergedIB; t3=objects; t4=meshInfos; u0-u2=G-buffer UAVs; t0+ space1=bindless SRVs; s0=anisotropic
+    // S2: Camera Sensor
+    SensorLighting,     // vs+ps (fullscreen): b0=SceneConstants; t0-t2=GB0/1/2; t3=depth; t4=irrMap; t5=prefilterMap; t6=brdfLUT; s0=point-clamp; s1=bilinear-clamp; s2=trilinear-clamp
+    CameraDistort,      // compute: b0=DistortConstants; t0=litRT; u0=distortRT; s0=bilinear-clamp
+    // S3: LiDAR Sensor
+    LiDARRaycast,       // compute: b0=LiDARSensorCB; t0=TLAS; t1=rayDirs; t2=GPUObjectData; t3=mergedVB; t4=mergedIB; u0=output — all root descriptors (GPU VAs)
+    PointCloud,         // vs+ps: b0=16 root consts (row-major VP 4x4); POSITION+TEXCOORD0 VB; POINT topology; depth-test, no depth-write
 };
 
 struct PipelineStateDesc
@@ -59,7 +80,9 @@ struct PipelineStateDesc
     bool                depthOnlyPass   = false;  // Phase 8: NumRenderTargets=0, no PS bytecode
     DXGI_FORMAT         dsvFormat       = DXGI_FORMAT_UNKNOWN; // Phase 8: explicit DSV format override
     bool                computeShader   = false;  // Phase 12: compute pipeline (only CS, no VS/PS)
+    const wchar_t*      csTarget        = L"cs_6_0"; // compute shader target (override to L"cs_6_5" for RayQuery)
     bool                meshShaderPipeline = false; // Phase 25: mesh shader pipeline (AS+MS+PS, no VS/IA)
+    bool                pointTopology      = false; // S3: use POINT_LIST topology (LiDAR point cloud)
 };
 
 class IPipeline

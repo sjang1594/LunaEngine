@@ -9,6 +9,15 @@ namespace Luna
 // DX12AccelStructure — builds and stores DXR BLAS (per mesh) + TLAS (scene).
 // Requires ID3D12Device5 (DXR Tier 1.0+).
 // ---------------------------------------------------------------------------
+
+// One entry in the TLAS: which BLAS (by index into the BLASes built so far)
+// and its world-space transform.
+struct TLASInstanceDesc
+{
+    UINT                      blasIndex;
+    DirectX::XMFLOAT4X4       worldTransform;
+};
+
 class DX12AccelStructure
 {
   public:
@@ -20,9 +29,10 @@ class DX12AccelStructure
                    ID3D12GraphicsCommandList4* cmdList,
                    const Mesh&                 mesh);
 
-    // Build a TLAS from all previously built BLASes.
-    bool BuildTLAS(ID3D12Device5*              device,
-                   ID3D12GraphicsCommandList4* cmdList);
+    // Build a TLAS from the provided instance list (blasIndex + world transform).
+    bool BuildTLAS(ID3D12Device5*                         device,
+                   ID3D12GraphicsCommandList4*             cmdList,
+                   const std::vector<TLASInstanceDesc>&   instances);
 
     D3D12_GPU_VIRTUAL_ADDRESS GetTLASAddress() const
     {

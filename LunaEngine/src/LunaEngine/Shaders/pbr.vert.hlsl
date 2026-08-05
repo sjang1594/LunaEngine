@@ -34,14 +34,22 @@ VSOutput main(VSInput input)
     output.posCS        = mul(mul(worldPos, viewMatrix), projectionMatrix);
     output.posWS        = worldPos.xyz;
 
-    // Transform normals by the model matrix (upper 3x3).
-    // mul(v, M) is the row-vector convention matching DirectXMath storage.
-    // For uniform-scale models, the rotation part works directly for normals.
-    float3x3 normalMatrix = (float3x3)modelMatrix;
-    output.normalWS  = normalize(mul(input.normal,       normalMatrix));
+    // Normal transform: use adjugate of upper 3x3 (= det * inverse).
+    // This correctly handles non-uniform scaling (e.g. annotation boxes: 2x1.5x4.5 m).
+    // After normalization, adjugate gives the same direction as inverse-transpose.
+    // Columns of modelMatrix upper 3x3:
+    float3x3 m = (float3x3)modelMatrix;
+    float3 mc0 = float3(m[0][0], m[1][0], m[2][0]);
+    float3 mc1 = float3(m[0][1], m[1][1], m[2][1]);
+    float3 mc2 = float3(m[0][2], m[1][2], m[2][2]);
+    float3x3 normalMatrix;
+    normalMatrix[0] = cross(mc1, mc2);
+    normalMatrix[1] = cross(mc2, mc0);
+    normalMatrix[2] = cross(mc0, mc1);
+    output.normalWS  = normalize(mul(input.normal, normalMatrix));
 
-    output.tangentWS = normalize(mul(input.tangent.xyz,  normalMatrix));
-    // Bitangent = cross(N, T) * tangent.w (w encodes handedness)
+    // Tangent/bitangent are vectors (not normals) — standard model matrix is correct.
+    output.tangentWS = normalize(mul(input.tangent.xyz, m));
     output.bitanWS   = normalize(cross(output.normalWS, output.tangentWS) * input.tangent.w);
 
     output.uv = input.uv;

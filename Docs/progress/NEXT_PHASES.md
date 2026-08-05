@@ -1,7 +1,7 @@
 # LunaEngine — Next Phases Plan
 
-**Last updated:** 2026-04-27
-**Current state:** 25 phases complete (DX12 + Vulkan dual-backend, deferred PBR, DXR/VK RT shadows, GPU-driven indirect, render graph, full PP stack, IBL, multi-mesh scene support, GPU profiler, Hi-Z occlusion culling, Vulkan async compute, clustered lighting, DX12 mesh shaders)
+**Last updated:** 2026-04-30
+**Current state:** 30 phases complete (DX12 + Vulkan dual-backend, deferred PBR, DXR/VK RT shadows, GPU-driven indirect, render graph, full PP stack, IBL, multi-mesh scene support, GPU profiler, Hi-Z occlusion culling, Vulkan async compute, clustered lighting, DX12 mesh shaders, atmosphere, volumetric fog, GI/SSGI+probes)
 
 ---
 
@@ -21,7 +21,7 @@ Simulation phases S2–S3 depend on rendering infrastructure (offscreen render t
 ## Execution Order (Rendering Track)
 
 ```
-Phase 21 ✅ → 22 ✅ → 23 ✅ → 20 ✅ → 24 ✅ → 25 ✅ → 26 ✅ → 27 ✅ → 28 ✅ → 29+
+Phase 21 ✅ → 22 ✅ → 23 ✅ → 20 ✅ → 24 ✅ → 25 ✅ → 26 ✅ → 27 ✅ → 28 ✅ → 29 ✅ → 30 ✅ → 31+
 ```
 
 ---
@@ -360,33 +360,47 @@ Hillaire's "A Scalable and Production Ready Sky and Atmosphere Rendering Techniq
 
 ---
 
-## Phase 29 — Volumetric Lighting / Fog
+## Phase 29 — Volumetric Lighting / Fog ✅ COMPLETE
 
 **Priority:** ★★☆ | **Effort:** Medium | **Dependencies:** Phase 28 (atmosphere), Phase 8 (CSM), Phase 24 (clustered lights)
 
-Froxel-based volumetric fog (à la Frostbite) with ray-marched light scattering. Adds cinematic depth and is essential for sensor simulation (fog/rain conditions affect LiDAR/camera). Reuses clustered lighting grid for point light volumetric contribution.
+Froxel-based volumetric fog (à la Frostbite) with ray-marched light scattering. Adds cinematic depth and is essential for sensor simulation (fog/rain conditions affect LiDAR/camera).
 
-### Key Technical Elements
-- Froxel grid (160×90×64, exponential depth, RGBA16F 3D texture)
-- Material injection compute pass (density + albedo from noise/height-based fog)
-- Scattering compute pass (ray-march, CSM shadow lookup + cluster data reuse)
-- Temporal reprojection (per-froxel jitter + history blend)
-- Both backends; async compute candidate
+### What Was Implemented
+
+1. **Froxel grid** (160×90×64, exponential depth, RGBA16F 3D textures) — inject volume + accum volume, ~7MB each
+2. **Material injection compute** (`vol_inject.comp.hlsl` / `vol_inject_vk.comp.glsl`) — height-based exponential fog density × scattering coefficient per froxel. Dispatch (20×12×16)
+3. **Scattering accumulation compute** (`vol_scatter.comp.hlsl` / `vol_scatter_vk.comp.glsl`) — marches along Z column, Beer-Lambert transmittance + Henyey-Greenstein phase function, CSM shadow lookup per froxel. Dispatch (20×12×1)
+4. **Apply pass** (`vol_apply.frag.hlsl` / `vol_apply_vk.frag.glsl`) — fullscreen quad with additive blend (SRC=ONE, DST=ONE) onto HDR render target. Reads froxel accumulation volume at pixel depth → outputs in-scattering RGB
+5. **DX12 integration** — `CreateVolumetricFogResources()`, `DispatchVolumetricFog()`, `DrawVolumetricFogApply()` in `DX12Backend.cpp`. Inserted after deferred lighting render graph, before SSR/motion blur
+6. **Vulkan integration** — `VulkanVolumetricFog` subsystem (`VulkanVolumetricFog.h/cpp`), added as render graph passes "Vol Fog Compute" + "Vol Fog Apply" after atmosphere
+7. **ImGui UI** — "Volumetric Fog" panel with sliders for density, height falloff, base height, scattering, extinction, phase G
+8. **IRenderBackend interface** — `SetVolumetricFogParams(VolumetricFogParams)` virtual method for backend-agnostic control
+
+### Success Criteria
+
+- [x] Froxel volumes created (DX12 + Vulkan)
+- [x] Inject + scatter compute dispatch
+- [x] Additive apply pass on HDR
+- [x] CSM shadow lookup in scatter
+- [x] ImGui parameter controls
+- [x] Both backends
+- [ ] Temporal reprojection (deferred to v2)
+- [ ] Point light volumetric contribution via cluster data (deferred to v2)
 
 ---
 
-## Phase 30 — Global Illumination (Screen-Space + Probe Hybrid)
+## Phase 30 — Global Illumination (Screen-Space + Probe Hybrid) ✅ COMPLETE
 
 **Priority:** ★★☆ | **Effort:** High | **Dependencies:** Phase 18D (VK RT), Phase 4C (DXR), Phase 23 (Hi-Z)
 
-Two-tier GI: screen-space radiance cascades for near-field bounce light plus sparse irradiance probes (DDGI-lite) for off-screen/far-field. Central to every AAA title shipping today.
+Two-tier GI: SSGI for near-field bounce light + sparse irradiance probes (DDGI-lite) for off-screen/far-field. Both backends complete.
 
-### Key Technical Elements
-- SSGI: Hi-Z traced short rays in screen space, importance-sampled from GGX lobe, half-res
-- Irradiance probes: 8×4×8 world-space grid, octahedral irradiance + depth maps
-- Probe update: 1 probe/frame via RT RayQuery compute shader
-- Temporal accumulation + hysteresis
-- Fallback: SSAO-only ambient (current behaviour)
+### What Was Implemented
+- **SSGI compute** (both backends): half-res RGBA16F ping-pong temporal accumulation; cosine-weighted ray marching via Hi-Z pyramid (16-step max); Hammersley sampling; temporal reprojection via prevViewProj; blended with `temporalAlpha` hysteresis
+- **Irradiance probe atlas**: 8×4×8 world-space grid, octahedral encoding, 16×16 texels per probe, 128×64×8 R16G16B16A16_FLOAT atlas; `probe_update.comp` accumulates cosine-weighted sky samples per probe
+- **DX12 deferred GI pipeline**: `deferred_lighting_gi.frag.hlsl` (t12=ssgiTex, t13=probeIrrArray, ProbeGridConstants CB); adds `ssgiRadiance + probeRadiance × 0.3` to IBL ambient; DeferredLightingGI root sig (12 params)
+- **Vulkan GI wiring**: `VulkanGI` subsystem (Create/Dispatch/Destroy); `CreateGIDeferredResources()` (set=3 layout: SAMPLED_IMAGE×2 + SAMPLER + UBO; 4-set pipeline layout; `deferred_lighting_gi_vk.frag.glsl`; per-frame ProbeGridUBO host-mapped); all images stay `VK_IMAGE_LAYOUT_GENERAL` throughout; GI pipeline selected in `CompositeFrame()` when `_gi.IsReady() && _clusterLightDescSet`; `DestroyGIDeferredResources()` called from `DestroyDeferredPipeline()`
 
 ---
 
@@ -447,8 +461,8 @@ Rendering Track:
            Phase 26 — VK transient aliasing                 ✅
   Next:    Phase 27 — VK mesh shaders                     ✅
            Phase 28 — Atmosphere / sky                     ✅
-           Phase 29 — Volumetric fog
-           Phase 30 — Global illumination
+           Phase 29 — Volumetric fog                       ✅
+           Phase 30 — Global illumination          ✅
            Phase 31 — OIT
            Phase 32 — Visibility buffer
            Phase 33 — Variable rate shading

@@ -82,7 +82,7 @@ float3 ReconstructWorldPos(float2 uv, float depth)
 // ---------------------------------------------------------------------------
 // Phase 8: CSM shadow factor with 5-tap manual PCF
 // ---------------------------------------------------------------------------
-float SampleCSMShadow(float3 posWS, float viewSpaceZ)
+float SampleCSMShadow(float3 posWS, float viewSpaceZ, float NdotL)
 {
     uint cascade = 3u;
     if      (viewSpaceZ < cascadeSplits.x) cascade = 0u;
@@ -100,25 +100,26 @@ float SampleCSMShadow(float3 posWS, float viewSpaceZ)
     if (any(shadowUV < 0.0) || any(shadowUV > 1.0) || shadowDepth < 0.0 || shadowDepth > 1.0)
         return 1.0;
 
-    float bias      = 0.005;
+    // Slope-scaled bias: larger bias at grazing angles (small NdotL) to prevent acne.
+    float tanTheta  = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.001);
+    float bias      = clamp(0.0015 * tanTheta, 0.0005, 0.005);
     float texelSize = 1.0 / 2048.0;
-    float shadow    = 0.0;
     float cascadeF  = (float)cascade;
+    float shadow    = 0.0;
 
+    // 3×3 PCF (9 taps) for smoother shadow edges
     [unroll]
-    for (int dx = -1; dx <= 1; dx += 2)
+    for (int dx = -1; dx <= 1; ++dx)
     {
         [unroll]
-        for (int dy = -1; dy <= 1; dy += 2)
+        for (int dy = -1; dy <= 1; ++dy)
         {
             float2 offset = float2(dx, dy) * texelSize;
             float  stored = csmShadowMap.Sample(pointClamp, float3(shadowUV + offset, cascadeF));
             shadow += (stored >= shadowDepth - bias) ? 1.0 : 0.0;
         }
     }
-    float centreDepth = csmShadowMap.Sample(pointClamp, float3(shadowUV, cascadeF));
-    shadow += (centreDepth >= shadowDepth - bias) ? 1.0 : 0.0;
-    shadow /= 5.0;
+    shadow /= 9.0;
 
     return shadow;
 }
@@ -181,10 +182,10 @@ float4 main(PSInput input) : SV_Target0
     float  NdL      = max(dot(N, L), 0.0);
     float3 radiance = lightColor.rgb * lightColor.w;
 
-    // CSM shadow
+    // CSM shadow — pass NdotL for slope-based bias
     float4 posVS  = mul(float4(posWS, 1.0), viewMatrix);
     float  viewZ  = posVS.z;
-    float  shadow = SampleCSMShadow(posWS, viewZ);
+    float  shadow = SampleCSMShadow(posWS, viewZ, NdL);
 
     float3 Lo = (diffuse + specular) * radiance * NdL * shadow;
 

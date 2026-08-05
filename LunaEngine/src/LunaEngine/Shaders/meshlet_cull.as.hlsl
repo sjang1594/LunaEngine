@@ -107,12 +107,15 @@ void main(uint gtid : SV_GroupThreadID, uint gid : SV_GroupID)
         s_payload.meshletIndices[visibleIndex] = globalMeshletIdx;
     }
 
-    // First thread writes shared payload fields and dispatches
+    // First thread writes per-object payload fields
     if (gtid == 0)
     {
         s_payload.objectIndex   = objectIndex;
         s_payload.materialIndex = gObjectData[objectIndex].materialIndex;
     }
+
+    // Ensure all groupshared payload writes are visible before DispatchMesh reads them
+    GroupMemoryBarrierWithGroupSync();
 
     DispatchMesh(visibleCount, 1, 1, s_payload);
 }
