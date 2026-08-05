@@ -10,11 +10,6 @@ project "LunaEngine"
    pchheader "LunaPCH.h"
    pchsource "src/LunaEngine/LunaPCH.cpp"
 
-   local shader_dir = path.getabsolute("../LunaEngine/src/LunaEngine/Shaders"):gsub("\\", "/")
-   defines {
-      'SHADER_ROOT_PATH="' .. shader_dir .. '"'
-   }
-
    files {
       "src/**.h",
       "src/**.cpp",

@@ -34,10 +34,38 @@ inline fs::path GetAssetPath(const std::string& relativePath)
     return exeRelative; // return exe-relative even if missing (so error messages make sense)
 }
 
+// Walks up from the exe directory looking for the repo root (identified by
+// LunaEngine.sln or LunaEngine/LunaEngine.vcxproj). Returns empty on failure.
+inline fs::path FindProjectRoot()
+{
+    fs::path dir = GetExeDir();
+    for (int i = 0; i < 16; ++i)
+    {
+        if (fs::exists(dir / "LunaEngine.sln") ||
+            fs::exists(dir / "LunaEngine" / "LunaEngine.vcxproj"))
+            return dir;
+        if (!dir.has_parent_path() || dir.parent_path() == dir)
+            break;
+        dir = dir.parent_path();
+    }
+    return {};
+}
+
+inline const fs::path& GetShaderRoot()
+{
+    static const fs::path cached = []() -> fs::path {
+        fs::path root = FindProjectRoot();
+        if (!root.empty())
+            return root / "LunaEngine" / "src" / "LunaEngine" / "Shaders";
+        std::cerr << "[Shader Loader] Could not locate project root from exe dir" << std::endl;
+        return {};
+    }();
+    return cached;
+}
+
 inline fs::path GetShaderFullPath(const std::wstring& filename)
 {
-    fs::path shaderRoot = fs::u8path(SHADER_ROOT_PATH);
-    fs::path fullPath = shaderRoot / filename;
+    fs::path fullPath = GetShaderRoot() / filename;
 
     fullPath = fs::weakly_canonical(fullPath);
     if (!fs::exists(fullPath)) {
