@@ -7325,7 +7325,15 @@ bool DX12Backend::InitLiDARResources(LiDARSensor* sensor)
     if (!sensor || !_d3d12maAllocator || !_lidarRaycastPipeline) return false;
     if (!_accelStructure || !_accelStructure->IsValid())
     {
-        LUNA_LOG_WARN("S3 LiDAR: TLAS not ready — skipping sensor '%s'", sensor->GetName().c_str());
+        // Only the raycast path needs a TLAS. Warn once per sensor instead of every
+        // frame — this used to emit a line per frame and drowned out every other log.
+        DX12LiDARResources& pc = _lidarRTs[sensor];
+        if (!pc.tlasWarned)
+        {
+            pc.tlasWarned = true;
+            LUNA_LOG_WARN("S3 LiDAR: TLAS not ready — simulated raycast disabled for '%s' "
+                          "(recorded point clouds still render)", sensor->GetName().c_str());
+        }
         return false;
     }
 
@@ -7429,21 +7437,59 @@ bool DX12Backend::InitLiDARResources(LiDARSensor* sensor)
         { LUNA_LOG_ERROR("S3 LiDAR: readbackBuffer failed"); return false; }
     }
 
-    // ── 5. Point cloud viewport VB (UPLOAD, max numRays points, persistently mapped) ──
-    {
-        const UINT64 vbSize = numRays * 16ull;  // { float3 pos, float intensity } = 16 B
-        D3D12_HEAP_PROPERTIES up = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-        D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
-        if (FAILED(_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &rd,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r.pointCloudVB))))
-        { LUNA_LOG_ERROR("S3 LiDAR: pointCloudVB failed"); return false; }
-        r.pointCloudVB->Map(0, nullptr, &r.pointCloudVBMapped);
-    }
+    // ── 5. Point cloud viewport VB ────────────────────────────────────────────
+    // Sized for the raycast output here; RenderLiDARPointClouds() grows it on demand
+    // when a recorded scan carries more points than the sensor emits rays.
+    if (!EnsureLiDARPointCloudVB(sensor, numRays)) return false;
 
     r.ready      = true;
     r.firstRender = true;
     sensor->gpuResourceHandle = 1; // non-zero = initialized
     LUNA_LOG_INFO("S3: LiDAR '%s' ready (%u rays)", sensor->GetName().c_str(), numRays);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// EnsureLiDARPointCloudVB — display-path buffer only.
+//
+// Deliberately independent of the acceleration structure. A recorded scan
+// (nuScenes .pcd.bin) is just a list of points to rasterise; requiring a TLAS
+// for that meant an empty scene silently swallowed real sensor data.
+// Grows the buffer when the incoming point count exceeds the current capacity.
+// ---------------------------------------------------------------------------
+bool DX12Backend::EnsureLiDARPointCloudVB(LiDARSensor* sensor, uint32_t pointCount)
+{
+    if (!sensor || !_device || pointCount == 0) return false;
+
+    DX12LiDARResources& r = _lidarRTs[sensor];
+    if (r.pointCloudReady && r.pointCloudCapacity >= pointCount) return true;
+
+    // Release the undersized buffer before reallocating.
+    if (r.pointCloudVBMapped && r.pointCloudVB)
+    {
+        r.pointCloudVB->Unmap(0, nullptr);
+        r.pointCloudVBMapped = nullptr;
+    }
+    r.pointCloudVB.Reset();
+    r.pointCloudReady = false;
+
+    // Round up so a slowly growing scan does not reallocate every frame.
+    const uint32_t capacity = (pointCount + 8191u) & ~8191u;
+    const UINT64   vbSize   = (UINT64)capacity * 16ull;  // { float3 pos, float intensity }
+
+    D3D12_HEAP_PROPERTIES up = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC   rd = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
+    if (FAILED(_device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r.pointCloudVB))))
+    {
+        LUNA_LOG_ERROR("S3 LiDAR: pointCloudVB alloc failed (%u points)", capacity);
+        return false;
+    }
+    r.pointCloudVB->Map(0, nullptr, &r.pointCloudVBMapped);
+    r.pointCloudCapacity = capacity;
+    r.pointCloudReady    = true;
+    LUNA_LOG_INFO("S3: LiDAR '%s' point-cloud VB ready (%u points)",
+                  sensor->GetName().c_str(), capacity);
     return true;
 }
 
@@ -7463,6 +7509,8 @@ void DX12Backend::DestroyLiDARResources(LiDARSensor* sensor)
     if (r.outputAlloc)  { r.outputAlloc->Release();  r.outputAlloc  = nullptr; }
     if (r.pointCloudVBMapped && r.pointCloudVB) { r.pointCloudVB->Unmap(0, nullptr); r.pointCloudVBMapped = nullptr; }
     r.rayDirBuffer.Reset(); r.outputBuffer.Reset(); r.readbackBuffer.Reset(); r.pointCloudVB.Reset();
+    r.pointCloudCapacity = 0;
+    r.pointCloudReady    = false;
     r.ready = false;
     sensor->gpuResourceHandle = 0;
     _lidarRTs.erase(it);
@@ -7628,13 +7676,19 @@ void DX12Backend::RenderLiDARPointClouds()
             auto* lidar = static_cast<LiDARSensor*>(sensor.get());
             if (!lidar->enabled || lidar->pointCloud.empty()) continue;
 
+            // Display path only — no acceleration structure required. Allocate (or grow)
+            // the vertex buffer on demand so a recorded scan renders even when the scene
+            // has no geometry to raycast against.
+            const UINT ptCount = (UINT)lidar->pointCloud.size();
+            if (!EnsureLiDARPointCloudVB(lidar, ptCount)) continue;
+
             auto it = _lidarRTs.find(lidar);
-            if (it == _lidarRTs.end() || !it->second.ready || !it->second.pointCloudVBMapped) continue;
+            if (it == _lidarRTs.end() || !it->second.pointCloudReady || !it->second.pointCloudVBMapped) continue;
             DX12LiDARResources& r = it->second;
+            if (ptCount > r.pointCloudCapacity) continue;  // never write past the mapped range
 
             // Upload point cloud to persistently-mapped VB
             struct PointVertex { float x, y, z, intensity; };
-            const UINT ptCount = (UINT)lidar->pointCloud.size();
             PointVertex* dst = reinterpret_cast<PointVertex*>(r.pointCloudVBMapped);
             for (UINT i = 0; i < ptCount; ++i)
             {

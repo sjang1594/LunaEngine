@@ -561,7 +561,12 @@ void SensorLayer::DrawAnnotationBoxes()
     XMFLOAT4X4 vpF = backend->GetCurrentVP();
     XMMATRIX    VP  = XMLoadFloat4x4(&vpF);
 
-    ImVec2 scr = ImGui::GetMainViewport()->Size;
+    // With ImGuiConfigFlags_ViewportsEnable the main viewport's Pos is the window's
+    // desktop position, not (0,0), and GetBackgroundDrawList() expects absolute
+    // viewport coordinates. Omitting Pos offsets every box by the window position.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 scrOrigin  = vp->Pos;
+    const ImVec2 scr        = vp->Size;
     if (scr.x < 1 || scr.y < 1) return;
 
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
@@ -600,8 +605,8 @@ void SensorLayer::DrawAnnotationBoxes()
         float ny = XMVectorGetY(clip) / w;
         float nz = XMVectorGetZ(clip) / w;
         if (nz < 0.0f || nz > 1.0f) return {-9999, -9999}; // behind camera or beyond far plane
-        return { (nx * 0.5f + 0.5f) * scr.x,
-                 (1.0f - (ny * 0.5f + 0.5f)) * scr.y };
+        return { scrOrigin.x + (nx * 0.5f + 0.5f) * scr.x,
+                 scrOrigin.y + (1.0f - (ny * 0.5f + 0.5f)) * scr.y };
     };
 
     for (const auto& box : sample.annotations)

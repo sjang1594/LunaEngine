@@ -1048,13 +1048,18 @@ private:
         D3D12MA::Allocation*     outputAlloc  = nullptr;
         // CPU readback
         ComPtr<ID3D12Resource>   readbackBuffer;
-        // Point cloud viewport VB (UPLOAD, persistently mapped, updated from pointCloud each frame)
+        // Point cloud viewport VB (UPLOAD, persistently mapped, updated from pointCloud each frame).
+        // Independent of the raycast path: recorded scans (e.g. nuScenes .pcd.bin) only need
+        // this buffer, so it must not be gated on the acceleration structure.
         ComPtr<ID3D12Resource>   pointCloudVB;
         void*                    pointCloudVBMapped = nullptr;
+        uint32_t                 pointCloudCapacity = 0;      // in points, not bytes
+        bool                     pointCloudReady    = false;  // display path
         // Tracking
         uint32_t rayCount   = 0;
-        bool     ready      = false;
+        bool     ready      = false;   // raycast path — requires a valid TLAS
         bool     firstRender = true;
+        bool     tlasWarned  = false;  // rate-limits the "TLAS not ready" warning
     };
 
     std::unordered_map<class LiDARSensor*, DX12LiDARResources> _lidarRTs;
@@ -1062,6 +1067,9 @@ private:
     std::unique_ptr<class DX12Pipeline> _pointCloudPipeline;
 
     bool InitLiDARResources(class LiDARSensor* sensor);
+    // Creates or grows the point-cloud vertex buffer only. No acceleration structure
+    // required — recorded scans render through this path with no raycasting involved.
+    bool EnsureLiDARPointCloudVB(class LiDARSensor* sensor, uint32_t pointCount);
     void DestroyLiDARResources(class LiDARSensor* sensor);
     void RenderLiDARSensorInternal(class LiDARSensor* sensor);
     void RenderLiDARSensors() override;

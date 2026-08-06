@@ -215,6 +215,30 @@ void SceneManager::LoadNuScenesScene(const std::string& dataRoot,
         lidar->tickIntervalSec   = 1.0f / 10.0f;
         lidar->UpdateExtrinsicFromPosRot();
         lidar->Simulate(identity, lidar->tickIntervalSec + 0.001f);
+
+        // Feed the recorded scan into the sensor's point cloud.
+        //
+        // Without this the 34k points loaded from the .pcd.bin stayed in _nsSample and
+        // never reached the renderer: LiDARSensor::pointCloud is otherwise only filled by
+        // the GPU raycast readback, which needs a TLAS. An empty scene therefore swallowed
+        // real sensor data. Recorded points are measurements, not simulation output — they
+        // must render regardless of whether there is any geometry to raycast against.
+        if (_nsSample.lidarLoaded && !_nsSample.lidarPoints.empty())
+        {
+            lidar->pointCloud.clear();
+            lidar->pointCloud.reserve(_nsSample.lidarPoints.size());
+            for (const auto& src : _nsSample.lidarPoints)
+            {
+                LiDARPoint p{};
+                p.position    = src.position;
+                p.intensity   = src.intensity;
+                p.returnIndex = 0;          // recorded scan carries no multi-return index
+                lidar->pointCloud.push_back(p);
+            }
+            LUNA_LOG_INFO("LoadNuScenesScene: bound %zu recorded points to '%s'",
+                          lidar->pointCloud.size(), lidar->GetName().c_str());
+        }
+
         sensorComp->AddSensor(lidar);
 
         scene->AddGameObject(rigGO);
