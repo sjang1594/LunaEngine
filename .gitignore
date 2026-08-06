@@ -1,3 +1,17 @@
+### Third-party datasets — DO NOT COMMIT ###
+# nuScenes © Motional, licensed CC BY-NC-SA 4.0.
+# Non-commercial use only; redistribution of the dataset is not permitted.
+# Obtain it yourself from https://www.nuscenes.org/ and point the SensorLayer
+# "data root" at the folder containing scene.json / sample_data.json / ...
+/data/
+**/v1.0-mini/
+**/v1.0-trainval/
+**/v1.0-test/
+*.pcd.bin
+
+# ImGui runtime window layout (per-machine state, not source)
+imgui.ini
+
 # Directories
 .vs/
 bin/
