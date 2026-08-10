@@ -358,6 +358,10 @@ bool VulkanBackend::Init(void* windowHandler, uint32_t width, uint32_t height)
     if (!CreateSensorDistortPipeline())
         LUNA_LOG_WARN("S2b: sensor distort pipeline failed — camera sensor rendering disabled");
 
+    // S3: LiDAR point-cloud overlay (recorded scans; no acceleration structure needed)
+    if (!CreatePointCloudPipeline())
+        LUNA_LOG_WARN("S3: point cloud pipeline failed — LiDAR point clouds will not render");
+
     // GPU Profiler
     _gpuProfiler.Init(_device->GetDevice(), _device->GetPhysicalDevice(), _device->GetGraphicsQueue());
 
@@ -1087,7 +1091,7 @@ void VulkanBackend::CompositeFrame()
     }
 
     // ── Phase 28: Atmosphere sky-view LUT update + sky composite ──
-    if (_atmosphere.IsReady())
+    if (_skyEnabled && _atmosphere.IsReady())
     {
         // Pass 4.5: Sky-view LUT compute (reads transmittance+multiscatter, writes skyView)
         rg.AddPass("Atmo SkyView LUT")
@@ -9016,6 +9020,266 @@ void VulkanBackend::RenderVKCameraSensorInternal(CameraSensor* cam, VkCommandBuf
 
     cam->hasNewFrame = true;
     r.firstRender    = false;
+}
+
+// ===========================================================================
+// S3: LiDAR point-cloud overlay (Vulkan)
+//
+// Draws LiDARSensor::pointCloud as a POINT_LIST into the swapchain pass that
+// CompositeFrame() leaves open. Recorded scans are measurements, so this path is
+// deliberately free of any acceleration-structure dependency — it renders whatever
+// points the sensor holds, whether they came from a .pcd.bin or a GPU raycast.
+// ===========================================================================
+bool VulkanBackend::CreatePointCloudPipeline()
+{
+    VkDevice dev = _device->GetDevice();
+
+    std::vector<uint32_t> vsS, fsS;
+    if (!CompileGLSLtoSPIRV(GetShaderFullPath(L"point_cloud_vk.vert.glsl").wstring(), vsS) ||
+        !CompileGLSLtoSPIRV(GetShaderFullPath(L"point_cloud_vk.frag.glsl").wstring(), fsS))
+    {
+        LUNA_LOG_ERROR("S3: point cloud shader compile failed");
+        return false;
+    }
+
+    auto makeModule = [&](const std::vector<uint32_t>& code) -> VkShaderModule {
+        VkShaderModuleCreateInfo ci{};
+        ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = code.size() * sizeof(uint32_t);
+        ci.pCode    = code.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        vkCreateShaderModule(dev, &ci, nullptr, &m);
+        return m;
+    };
+    VkShaderModule vs = makeModule(vsS);
+    VkShaderModule fs = makeModule(fsS);
+    if (!vs || !fs)
+    {
+        if (vs) vkDestroyShaderModule(dev, vs, nullptr);
+        if (fs) vkDestroyShaderModule(dev, fs, nullptr);
+        LUNA_LOG_ERROR("S3: point cloud shader module creation failed");
+        return false;
+    }
+
+    // Push constants: row-major view-projection (64 B, inside the 128 B guarantee)
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.offset     = 0;
+    pcr.size       = sizeof(float) * 16;
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcr;
+    if (vkCreatePipelineLayout(dev, &plci, nullptr, &_vkPointCloudPipeLayout) != VK_SUCCESS)
+    {
+        vkDestroyShaderModule(dev, vs, nullptr);
+        vkDestroyShaderModule(dev, fs, nullptr);
+        LUNA_LOG_ERROR("S3: point cloud pipeline layout failed");
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs; stages[0].pName = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs; stages[1].pName = "main";
+
+    // Vertex layout matches the DX12 upload exactly: { vec3 pos, float intensity }
+    VkVertexInputBindingDescription bind{};
+    bind.binding = 0; bind.stride = 16; bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrs[2]{};
+    attrs[0].location = 0; attrs[0].binding = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0;
+    attrs[1].location = 1; attrs[1].binding = 0; attrs[1].format = VK_FORMAT_R32_SFLOAT;       attrs[1].offset = 12;
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1;  vi.pVertexBindingDescriptions   = &bind;
+    vi.vertexAttributeDescriptionCount = 2;  vi.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;   // points have no winding
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // The overlay pass clears depth on entry, so testing against it would be
+    // meaningless. Draw the points as a pure overlay.
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_ALWAYS;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cba.blendEnable    = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+    VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2; dyn.pDynamicStates = dynStates;
+
+    VkGraphicsPipelineCreateInfo gpi{};
+    gpi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpi.stageCount          = 2;   gpi.pStages             = stages;
+    gpi.pVertexInputState   = &vi; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState      = &vp; gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState   = &ms; gpi.pDepthStencilState  = &ds;
+    gpi.pColorBlendState    = &cb; gpi.pDynamicState       = &dyn;
+    gpi.layout              = _vkPointCloudPipeLayout;
+    gpi.renderPass          = _vkSwapchain.GetRenderPass();  // the overlay pass left open by CompositeFrame
+    gpi.subpass             = 0;
+
+    VkResult res = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &_vkPointCloudPipeline);
+    vkDestroyShaderModule(dev, vs, nullptr);
+    vkDestroyShaderModule(dev, fs, nullptr);
+
+    if (res != VK_SUCCESS)
+    {
+        LUNA_LOG_ERROR("S3: point cloud pipeline creation failed (%d)", (int)res);
+        return false;
+    }
+    LUNA_LOG_INFO("S3: Vulkan point cloud overlay pipeline ready");
+    return true;
+}
+
+bool VulkanBackend::EnsureVKPointCloudVB(LiDARSensor* sensor, uint32_t pointCount)
+{
+    if (!sensor || pointCount == 0) return false;
+
+    VkDevice dev = _device->GetDevice();
+    auto& r = _vkLidarPCs[sensor];
+    if (r.vb != VK_NULL_HANDLE && r.capacity >= pointCount) return true;
+
+    // Grow: the previous buffer may still be referenced by in-flight frames.
+    if (r.vb != VK_NULL_HANDLE)
+    {
+        vkDeviceWaitIdle(dev);
+        if (r.mapped) { vkUnmapMemory(dev, r.mem); r.mapped = nullptr; }
+        vkDestroyBuffer(dev, r.vb, nullptr);
+        vkFreeMemory(dev, r.mem, nullptr);
+        r.vb = VK_NULL_HANDLE; r.mem = VK_NULL_HANDLE;
+    }
+
+    // Round up so a slowly growing scan does not reallocate every frame.
+    const uint32_t     capacity = (pointCount + 8191u) & ~8191u;
+    const VkDeviceSize bytes    = (VkDeviceSize)capacity * 16ull;
+
+    if (!CreateBuffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      r.vb, r.mem))
+    {
+        LUNA_LOG_ERROR("S3: Vulkan point cloud VB alloc failed (%u points)", capacity);
+        _vkLidarPCs.erase(sensor);
+        return false;
+    }
+    vkMapMemory(dev, r.mem, 0, bytes, 0, &r.mapped);
+    r.capacity = capacity;
+    LUNA_LOG_INFO("S3: Vulkan LiDAR '%s' point-cloud VB ready (%u points)",
+                  sensor->GetName().c_str(), capacity);
+    return true;
+}
+
+void VulkanBackend::DestroyPointCloudResources()
+{
+    VkDevice dev = _device ? _device->GetDevice() : VK_NULL_HANDLE;
+    if (dev == VK_NULL_HANDLE) return;
+
+    for (auto& [sensor, r] : _vkLidarPCs)
+    {
+        if (r.mapped) { vkUnmapMemory(dev, r.mem); r.mapped = nullptr; }
+        if (r.vb)  vkDestroyBuffer(dev, r.vb, nullptr);
+        if (r.mem) vkFreeMemory(dev, r.mem, nullptr);
+    }
+    _vkLidarPCs.clear();
+
+    if (_vkPointCloudPipeline)   { vkDestroyPipeline(dev, _vkPointCloudPipeline, nullptr);         _vkPointCloudPipeline   = VK_NULL_HANDLE; }
+    if (_vkPointCloudPipeLayout) { vkDestroyPipelineLayout(dev, _vkPointCloudPipeLayout, nullptr); _vkPointCloudPipeLayout = VK_NULL_HANDLE; }
+}
+
+void VulkanBackend::RenderLiDARPointClouds()
+{
+    if (!_vkPointCloudPipeline || _deviceLost) return;
+
+    auto* sceneMgr = SceneManager::GetInstance();
+    if (!sceneMgr) return;
+    auto activeScene = sceneMgr->GetActiveScene();
+    if (!activeScene) return;
+
+    VkCommandBuffer cmd = _frames[_frameIndex].cmdBuffer;
+    bool pipelineBound  = false;
+
+    for (auto& go : activeScene->GetGameObjects())
+    {
+        if (!go) continue;
+        auto comp = go->GetComponentByType(ComponentType::SENSOR);
+        auto* sc  = comp ? static_cast<SensorComponent*>(comp.get()) : nullptr;
+        if (!sc) continue;
+
+        for (auto& sensor : sc->GetSensors())
+        {
+            if (!sensor || sensor->GetType() != SensorType::LiDAR) continue;
+            auto* lidar = static_cast<LiDARSensor*>(sensor.get());
+            if (!lidar->enabled || lidar->pointCloud.empty()) continue;
+
+            const uint32_t ptCount = (uint32_t)lidar->pointCloud.size();
+            if (!EnsureVKPointCloudVB(lidar, ptCount)) continue;
+
+            auto it = _vkLidarPCs.find(lidar);
+            if (it == _vkLidarPCs.end() || !it->second.mapped) continue;
+            auto& r = it->second;
+            if (ptCount > r.capacity) continue;   // never write past the mapped range
+
+            struct PointVertex { float x, y, z, intensity; };
+            auto* dst = reinterpret_cast<PointVertex*>(r.mapped);
+            for (uint32_t i = 0; i < ptCount; ++i)
+            {
+                dst[i].x         = lidar->pointCloud[i].position.x;
+                dst[i].y         = lidar->pointCloud[i].position.y;
+                dst[i].z         = lidar->pointCloud[i].position.z;
+                dst[i].intensity = lidar->pointCloud[i].intensity;
+            }
+
+            if (!pipelineBound)
+            {
+                VkExtent2D ext = _vkSwapchain.GetExtent();
+                VkViewport vpt{ 0.0f, 0.0f, (float)ext.width, (float)ext.height, 0.0f, 1.0f };
+                VkRect2D   sci{ {0, 0}, ext };
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _vkPointCloudPipeline);
+                vkCmdSetViewport(cmd, 0, 1, &vpt);
+                vkCmdSetScissor(cmd, 0, 1, &sci);
+                vkCmdPushConstants(cmd, _vkPointCloudPipeLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   0, sizeof(float) * 16, _vkUnjitteredVP);
+                pipelineBound = true;
+            }
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &r.vb, &offset);
+            vkCmdDraw(cmd, ptCount, 1, 0, 0);
+        }
+    }
 }
 
 void VulkanBackend::RenderCameraSensors()

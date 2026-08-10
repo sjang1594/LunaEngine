@@ -90,10 +90,10 @@ void DX12Backend::Shutdown()
         _fenceEvent = nullptr;
     }
 
-    // Phase 22: Shutdown GPU profiler
+    // Shutdown GPU profiler
     _gpuProfiler.Shutdown();
 
-    // Phase 13: clean up async compute
+    // clean up async compute
     if (_computeFenceEvent)
     {
         CloseHandle(_computeFenceEvent);
@@ -116,26 +116,25 @@ void DX12Backend::Shutdown()
         for (auto* k : lidarKeys) DestroyLiDARResources(k);
         _lidarRaycastPipeline.reset();
     }
-    // Phase 12: release GPU-driven rendering resources before D3D12MA allocator
+    //release GPU-driven rendering resources before D3D12MA allocator
     DestroyIndirectResources();
-    // Phase 30: release GI resources
+    //release GI resources
     DestroySSGIResources();
-    // Phase 29: release volumetric fog resources
+    // release volumetric fog resources
     DestroyVolumetricFogResources();
-    // Phase 25: release mesh shader resources
+    //release mesh shader resources
     DestroyMeshShaderResources();
-    // Phase 24: release clustered lighting resources
+    //release clustered lighting resources
     DestroyClusteredLightingResources();
-    // Phase 23: release Hi-Z resources
+    //release Hi-Z resources
     DestroyHiZResources();
-    // Phase 14: release IBL resources before D3D12MA allocator
+    //release IBL resources before D3D12MA allocator
     DestroyIBLResources();
-    // Phase 9: release SSAO resources before CSM / G-buffer (all before D3D12MA allocator)
-    DestroyPostProcessResources();  // Phase 10: must be before D3D12MA allocator
+    DestroyPostProcessResources(); 
     DestroySSAOResources();
-    // Phase 8: release CSM resources before G-buffer (both before D3D12MA allocator)
+    // release CSM resources before G-buffer (both before D3D12MA allocator)
     DestroyCSMResources();
-    // Phase 7: release G-buffer before D3D12MA allocator is destroyed
+    // release G-buffer before D3D12MA allocator is destroyed
     DestroyGBuffer();
 
     // Release D3D12MA allocations before destroying the allocator.

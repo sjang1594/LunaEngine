@@ -197,8 +197,28 @@ void Application::Init()
 void Application::Run()
 {
     _running = true;
+
+    // CPU-side phase timing. std::chrono rather than GetTime() because the phases are
+    // sub-millisecond and the float seconds from glfwGetTime() lose too much precision.
+    using Clock = std::chrono::steady_clock;
+    auto  markT = Clock::now();
+    auto  frameStartT = Clock::now();
+    auto  elapsedMs = [](Clock::time_point& mark) {
+        auto now = Clock::now();
+        float ms = std::chrono::duration<float, std::milli>(now - mark).count();
+        mark = now;
+        return ms;
+    };
+
     while (ShouldContinueRunning())
     {
+        {
+            auto now = Clock::now();
+            _cpuStats.totalMs = std::chrono::duration<float, std::milli>(now - frameStartT).count();
+            frameStartT = now;
+            markT       = now;
+        }
+
         glfwPollEvents();
 
         float time   = GetTime();
@@ -231,6 +251,8 @@ void Application::Run()
 
             IRenderContext::UpdateMVP(modelF, viewF, projF);
         }
+
+        _cpuStats.updateMs = elapsedMs(markT);
 
         IRenderContext::BeginFrame();
         IRenderContext::StartImGuiFrame();
@@ -318,6 +340,8 @@ void Application::Run()
             layer->OnUIRender();
 
 
+        _cpuStats.uiMs = elapsedMs(markT);
+
         // DrawFrame() sets up G-buffer RTVs and clears them; command list stays open.
         IRenderContext::DrawFrame();
 
@@ -341,8 +365,23 @@ void Application::Run()
         IRenderContext::GetBackend()->RenderLiDARSensors();
         IRenderContext::GetBackend()->RenderLiDARPointClouds();
 
+        _cpuStats.submitMs = elapsedMs(markT);
+
         IRenderContext::RenderImGui();
         IRenderContext::EndFrame();
+
+        // EndFrame submits and presents. On a GPU-bound frame the CPU blocks here
+        // waiting for a free swapchain image / frame fence, so this is the number
+        // that separates "GPU is the limiter" from "CPU is the limiter".
+        _cpuStats.presentMs = elapsedMs(markT);
+
+        // Exponential moving average — per-frame values jitter too much to read live.
+        auto smooth = [](float& avg, float v) { avg += 0.05f * (v - avg); };
+        smooth(_cpuStatsAvg.totalMs,   _cpuStats.totalMs);
+        smooth(_cpuStatsAvg.updateMs,  _cpuStats.updateMs);
+        smooth(_cpuStatsAvg.uiMs,      _cpuStats.uiMs);
+        smooth(_cpuStatsAvg.submitMs,  _cpuStats.submitMs);
+        smooth(_cpuStatsAvg.presentMs, _cpuStats.presentMs);
     }
 }
 

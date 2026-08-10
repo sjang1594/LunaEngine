@@ -605,6 +605,7 @@ class VulkanBackend : public IRenderBackend
     float    _vkPrevJitter[2]         = {};
     float    _vkPrevVP[16]            = {};  // legacy (kept for compat)
     float    _vkUnjitteredVP[16]      = {};  // current frame unjittered VP
+    bool     _skyEnabled              = true; // Phase 28 atmosphere on/off (View menu)
     float    _vkPrevUnjitteredVP[16]  = {};  // previous frame unjittered VP (for TAA reprojection)
 
     // HDR intermediate (R16G16B16A16_SFLOAT, full-res)
@@ -1064,6 +1065,45 @@ private:
     void DestroyVKCameraResources(CameraSensor* cam);
     void RenderVKCameraSensorInternal(CameraSensor* cam, VkCommandBuffer cmd, uint32_t fi);
     void RenderCameraSensors() override;
+
+    // ── S3: LiDAR point-cloud overlay ───────────────────────────────────────
+    // Display path only. Recorded scans (nuScenes .pcd.bin) are measurements, not
+    // simulation output, so this deliberately has no dependency on an acceleration
+    // structure — it just rasterises whatever is in LiDARSensor::pointCloud.
+    struct VulkanLiDARPointCloud
+    {
+        VkBuffer       vb       = VK_NULL_HANDLE;
+        VkDeviceMemory mem      = VK_NULL_HANDLE;
+        void*          mapped   = nullptr;   // persistently mapped HOST_VISIBLE
+        uint32_t       capacity = 0;         // in points, not bytes
+    };
+    std::unordered_map<class LiDARSensor*, VulkanLiDARPointCloud> _vkLidarPCs;
+    VkPipeline       _vkPointCloudPipeline   = VK_NULL_HANDLE;
+    VkPipelineLayout _vkPointCloudPipeLayout = VK_NULL_HANDLE;
+
+    bool CreatePointCloudPipeline();
+    bool EnsureVKPointCloudVB(class LiDARSensor* sensor, uint32_t pointCount);
+    void DestroyPointCloudResources();
+    void RenderLiDARPointClouds() override;
+
+public:
+    // Phase 28 atmosphere toggle. Useful for sensor work: the physically based sky
+    // is blue, and so are low-intensity LiDAR points, so the scan is hard to read
+    // against it.
+    void SetSkyEnabled(bool on) override { _skyEnabled = on; }
+    bool IsSkyEnabled() const override   { return _skyEnabled; }
+    bool HasSky() const override         { return true; }
+
+    // Same semantics as the DX12 backend: the current frame's unjittered view-projection.
+    // The annotation-box overlay projects on the CPU and needs this; without an override
+    // the base class returns a zero matrix and nothing is drawn.
+    DirectX::XMFLOAT4X4 GetCurrentVP() const override
+    {
+        DirectX::XMFLOAT4X4 m;
+        memcpy(&m, _vkUnjitteredVP, sizeof(m));
+        return m;
+    }
+private:
 };
 
 } // namespace Luna

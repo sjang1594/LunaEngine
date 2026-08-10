@@ -118,6 +118,12 @@ class IRenderBackend
     // S3: overlay LiDAR point clouds onto the viewport (call after RenderLiDARSensors)
     virtual void RenderLiDARPointClouds() {}
 
+    // Sky / atmosphere toggle. Only implemented where an atmosphere model exists
+    // (Vulkan); backends without one report false and ignore the setter.
+    virtual void SetSkyEnabled(bool) {}
+    virtual bool IsSkyEnabled() const { return false; }
+    virtual bool HasSky() const { return false; }
+
     virtual const char *GetBackendName() const = 0;
     virtual DirectX::XMFLOAT4X4 GetCurrentVP() const { return {}; }
 };

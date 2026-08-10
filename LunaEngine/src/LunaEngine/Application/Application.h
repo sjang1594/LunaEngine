@@ -44,6 +44,21 @@ public:
     float GetTime() const;
     void SetMenubarCallback(const std::function<void()> &menubarCallback);
 
+    // ── CPU-side frame breakdown ────────────────────────────────────────────
+    // GPU timestamps alone cannot tell you which side of the pipeline is the
+    // limiter. The decisive signal is `present`: a large present time means the
+    // CPU is blocked waiting on the GPU (GPU-bound), while present ~0 with
+    // ui+submit filling the frame means the CPU is the limiter.
+    struct CPUFrameStats
+    {
+        float totalMs   = 0.0f;  // wall clock, frame start to frame start
+        float updateMs  = 0.0f;  // input poll + camera/MVP update
+        float uiMs      = 0.0f;  // ImGui layer build (CPU only)
+        float submitMs  = 0.0f;  // FlushDraws + CompositeFrame + sensor passes
+        float presentMs = 0.0f;  // EndFrame: submit + present + swapchain wait
+    };
+    const CPUFrameStats& GetCPUFrameStats() const { return _cpuStatsAvg; }
+
     template<typename T>
     void PushLayer();
     void PushLayer(const std::shared_ptr<Layer> &layer);
@@ -70,6 +85,9 @@ private:
     float _timeStep      = 0.0f;
     float _frameTime     = 0.0f;
     float _lastFrameTime = 0.0f;
+
+    CPUFrameStats _cpuStats;      // this frame, raw
+    CPUFrameStats _cpuStatsAvg;   // exponential moving average — raw values are too noisy to read
 
     bool _running          = false;
     bool _titleBarHovered  = false;

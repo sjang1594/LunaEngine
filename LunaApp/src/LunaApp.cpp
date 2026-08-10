@@ -223,7 +223,6 @@ class ExampleLayer : public Layer
                                     ImGui::DragFloat("Intensity", &lightComp->intensity, 0.1f, 0.0f, 50.0f);
                                 }
 
-                                // Phase 31: OIT alpha slider for mesh objects
                                 if (mr)
                                 {
                                     auto mesh = mr->GetMesh();
@@ -307,74 +306,107 @@ class ExampleLayer : public Layer
         } // if (s_showScene)
 
         // ── Graphics window ───────────────────────────────────────────
-        if (s_showGraphics)
-        {
-        ImGui::Begin("Graphics", &s_showGraphics);
-        {
-            if (ImGui::BeginTabBar("GraphicsTabs"))
+        if (s_showGraphics) {
+        
+            ImGui::Begin("Graphics", &s_showGraphics);
             {
-                // ── Fog tab ───────────────────────────────────────────
-                if (ImGui::BeginTabItem("Fog"))
+                if (ImGui::BeginTabBar("GraphicsTabs"))
                 {
-                    static Luna::IRenderBackend::VolumetricFogParams fogParams = {
-                        false,  // enabled
-                        0.15f,  // density
-                        0.0f,   // heightFalloff
-                        0.0f,   // baseHeight
-                        1.0f,   // scattering
-                        1.0f,   // extinction
-                        0.3f    // phaseG
-                    };
+                    // ── Fog tab 
+                    if (ImGui::BeginTabItem("Fog"))
+                    {
+                        static Luna::IRenderBackend::VolumetricFogParams fogParams = {
+                            false,  // enabled
+                            0.15f,  // density
+                            0.0f,   // heightFalloff
+                            0.0f,   // baseHeight
+                            1.0f,   // scattering
+                            1.0f,   // extinction
+                            0.3f    //
+                        };
 
-                    ImGui::Checkbox("Enable Fog", &fogParams.enabled);
-                    ImGui::Separator();
-                    ImGui::BeginDisabled(!fogParams.enabled);
-                    ImGui::SliderFloat("Density",        &fogParams.density,       0.000f,  0.5f,  "%.4f");
-                    ImGui::SliderFloat("Height Falloff", &fogParams.heightFalloff, 0.001f,  1.0f,  "%.3f");
-                    ImGui::SliderFloat("Base Height",    &fogParams.baseHeight,   -100.0f, 50.0f, "%.1f");
-                    ImGui::SliderFloat("Scattering",     &fogParams.scattering,    0.0f,    2.0f,  "%.3f");
-                    ImGui::SliderFloat("Extinction",     &fogParams.extinction,    0.0f,    2.0f,  "%.3f");
-                    ImGui::SliderFloat("Phase G",        &fogParams.phaseG,       -0.99f,   0.99f, "%.2f");
-                    ImGui::EndDisabled();
+                        ImGui::Checkbox("Enable Fog", &fogParams.enabled);
+                        ImGui::Separator();
+                        ImGui::BeginDisabled(!fogParams.enabled);
+                        ImGui::SliderFloat("Density",        &fogParams.density,       0.000f,  0.5f,  "%.4f");
+                        ImGui::SliderFloat("Height Falloff", &fogParams.heightFalloff, 0.001f,  1.0f,  "%.3f");
+                        ImGui::SliderFloat("Base Height",    &fogParams.baseHeight,   -100.0f, 50.0f, "%.1f");
+                        ImGui::SliderFloat("Scattering",     &fogParams.scattering,    0.0f,    2.0f,  "%.3f");
+                        ImGui::SliderFloat("Extinction",     &fogParams.extinction,    0.0f,    2.0f,  "%.3f");
+                        ImGui::SliderFloat("Phase G",        &fogParams.phaseG,       -0.99f,   0.99f, "%.2f");
+                        ImGui::EndDisabled();
 
-                    auto* backend = Luna::IRenderContext::GetBackend();
-                    if (backend)
-                        backend->SetVolumetricFogParams(fogParams);
+                        auto* backend = Luna::IRenderContext::GetBackend();
+                        if (backend)
+                            backend->SetVolumetricFogParams(fogParams);
 
-                    ImGui::EndTabItem();
+                        ImGui::EndTabItem();
+                    }
+
+                    // ── GI tab ────────────────────────────────────────────
+                    if (ImGui::BeginTabItem("GI"))
+                    {
+                        static Luna::IRenderBackend::GIParams giParams;
+
+                        ImGui::DragFloat3("Probe Origin",   giParams.probeGridOrigin,  0.5f, -100.0f, 100.0f, "%.1f");
+                        ImGui::DragFloat3("Probe Spacing",  giParams.probeGridSpacing, 0.1f,   0.1f,  20.0f,  "%.2f");
+                        ImGui::SliderInt("SSGI Rays",       &giParams.numSSGIRays,     1, 16);
+                        ImGui::SliderFloat("Max Ray Dist",  &giParams.maxRayDist,      0.5f, 20.0f, "%.1f");
+                        ImGui::SliderFloat("Temporal Alpha",&giParams.temporalAlpha,   0.01f, 1.0f, "%.3f");
+
+                        auto* backend = Luna::IRenderContext::GetBackend();
+                        if (backend)
+                            backend->SetGIParams(giParams);
+
+                        ImGui::EndTabItem();
+                    }
+
+                    ImGui::EndTabBar();
                 }
-
-                // ── GI tab ────────────────────────────────────────────
-                if (ImGui::BeginTabItem("GI"))
-                {
-                    static Luna::IRenderBackend::GIParams giParams;
-
-                    ImGui::DragFloat3("Probe Origin",   giParams.probeGridOrigin,  0.5f, -100.0f, 100.0f, "%.1f");
-                    ImGui::DragFloat3("Probe Spacing",  giParams.probeGridSpacing, 0.1f,   0.1f,  20.0f,  "%.2f");
-                    ImGui::SliderInt("SSGI Rays",       &giParams.numSSGIRays,     1, 16);
-                    ImGui::SliderFloat("Max Ray Dist",  &giParams.maxRayDist,      0.5f, 20.0f, "%.1f");
-                    ImGui::SliderFloat("Temporal Alpha",&giParams.temporalAlpha,   0.01f, 1.0f, "%.3f");
-
-                    auto* backend = Luna::IRenderContext::GetBackend();
-                    if (backend)
-                        backend->SetGIParams(giParams);
-
-                    ImGui::EndTabItem();
-                }
-
-                ImGui::EndTabBar();
             }
-        }
-        ImGui::End();
-        } // if (s_showGraphics)
+        
+            ImGui::End();
+        } 
 
         // ── GPU Profiler window ───────────────────────────────────────
         if (s_showProfiler)
         {
-            ImGui::SetNextWindowSize(ImVec2(420, 320), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(420, 440), ImGuiCond_FirstUseEver);
             ImGui::Begin("GPU Profiler", &s_showProfiler);
-            auto* backend = Luna::IRenderContext::GetBackend();
-            s_profilerOverlay.RenderContent(backend ? backend->GetGPUProfiler() : nullptr);
+            auto* backend  = Luna::IRenderContext::GetBackend();
+            auto* profiler = backend ? backend->GetGPUProfiler() : nullptr;
+
+            // ── CPU frame breakdown + which side is the limiter ──────────
+            // GPU timestamps say where GPU time goes but not whether the GPU is even
+            // the bottleneck. Present time is the discriminator: it is the CPU
+            // blocking on the GPU, so a large present with a small CPU workload means
+            // GPU-bound, and the reverse means the CPU is gating the frame.
+            const auto& cpu = Luna::Application::Get().GetCPUFrameStats();
+            const float cpuWork = cpu.updateMs + cpu.uiMs + cpu.submitMs;
+            const float gpuMs   = profiler ? profiler->GetTotalGpuTimeMs() : 0.0f;
+
+            ImGui::SeparatorText("Frame (CPU)");
+            ImGui::Text("total    %6.2f ms  (%.0f FPS)", cpu.totalMs,
+                        cpu.totalMs > 0.0f ? 1000.0f / cpu.totalMs : 0.0f);
+            ImGui::Text("  update %6.2f ms", cpu.updateMs);
+            ImGui::Text("  ui     %6.2f ms", cpu.uiMs);
+            ImGui::Text("  submit %6.2f ms", cpu.submitMs);
+            ImGui::Text("  present%6.2f ms   <- CPU waiting on GPU", cpu.presentMs);
+            ImGui::Text("CPU work %6.2f ms  |  GPU %6.2f ms", cpuWork, gpuMs);
+
+            if (cpu.totalMs > 0.01f)
+            {
+                const char* verdict;
+                ImVec4      col;
+                if (cpu.presentMs > cpuWork * 1.5f)      { verdict = "GPU-bound (CPU is waiting)";        col = {1.0f, 0.6f, 0.2f, 1.0f}; }
+                else if (cpuWork > cpu.presentMs * 1.5f) { verdict = "CPU-bound (GPU is starved)";        col = {0.4f, 0.8f, 1.0f, 1.0f}; }
+                else                                     { verdict = "balanced / near vsync";            col = {0.6f, 0.6f, 0.6f, 1.0f}; }
+                ImGui::TextColored(col, "=> %s", verdict);
+            }
+            ImGui::TextDisabled("Halve the window to confirm: if GPU time drops, it is pixel bound.");
+
+            ImGui::SeparatorText("Passes (GPU)");
+            s_profilerOverlay.RenderContent(profiler);
             ImGui::End();
         }
     }
@@ -447,6 +479,18 @@ Application *Luna::CreateApplication(int argc, char **argv)
             ImGui::MenuItem("Graphics",    nullptr, &Luna::s_showGraphics);
             ImGui::Separator();
             ImGui::MenuItem("GPU Profiler", nullptr, &Luna::s_showProfiler);
+
+            // Sky toggle 
+            if (auto* backend = Luna::IRenderContext::GetBackend())
+            {
+                if (backend->HasSky())
+                {
+                    ImGui::Separator();
+                    bool sky = backend->IsSkyEnabled();
+                    if (ImGui::MenuItem("Sky / Atmosphere", nullptr, &sky))
+                        backend->SetSkyEnabled(sky);
+                }
+            }
             ImGui::EndMenu();
         }
 

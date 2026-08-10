@@ -19,7 +19,17 @@ layout(push_constant) uniform PC {
 
 void main()
 {
-    gl_Position = pc.viewProj * vec4(inPosition, 1.0);
+    // The push constant carries the engine's DirectXMath view-projection, which is
+    // built for ROW-vector maths (clip = pos * VP) — the same convention the DX12
+    // shader uses via mul(float4(pos,1), gVP). Multiplying the other way round
+    // (VP * pos) applies the transpose and collapses the cloud onto a line.
+    gl_Position = vec4(inPosition, 1.0) * pc.viewProj;
+
+    // The engine uses positive-height viewports everywhere and relies on DXC's
+    // -fvk-invert-y to reconcile D3D clip space with Vulkan's flipped Y. That flag
+    // only applies to HLSL, so a hand-written GLSL shader fed the same D3D-convention
+    // view-projection has to do the flip itself or it renders upside down.
+    gl_Position.y = -gl_Position.y;
 
     // Vulkan has no fixed-function point size: unlike D3D it must be written by the
     // vertex shader, otherwise the point is undefined (and typically invisible).
